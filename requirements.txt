@@ -23,10 +23,7 @@ lightgbm>=4.3          # optional alternative to XGBoost per spec Section 4.2
 mlflow>=2.12
 
 # --- LLM / agentic layer (Module 4) ---
-# Gemini: reasoning tasks — 4B Adversarial Strategist, 4C Analyst Assistant
-google-genai>=1.0
-# Cerebras: high-speed inference — 4A Narrative Generator (high volume, low complexity)
-cerebras-cloud-sdk>=1.0
+litellm>=1.40         # unified API for Gemini/Cerebras/OpenAI
 pydantic>=2.6
 jinja2>=3.1
 tenacity>=8.2          # retry/backoff for LLM calls
