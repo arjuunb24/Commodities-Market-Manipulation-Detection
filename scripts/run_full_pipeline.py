@@ -125,7 +125,7 @@ def main():
                 if args.persona.lower() == "all" else [args.persona]
             )
 
-            for persona in personas_to_mutate:
+            for i, persona in enumerate(personas_to_mutate):
                 logger.info(f"\nRound {round_num}: Launching Adversarial Strategist for '{persona}'...")
                 try:
                     result = strategist.run_strategist_round(
@@ -138,6 +138,12 @@ def main():
                         logger.warning(f"LLM mutation failed for {persona}: {result}. Using existing config.")
                 except Exception as e:
                     logger.error(f"Strategist failed for {persona}: {e}. Continuing with current config.")
+                
+                # Add a delay between LLM calls to prevent API Quota failures (especially on Gemini Free Tier)
+                if i < len(personas_to_mutate) - 1:
+                    logger.info("Sleeping for 15 seconds to avoid API rate limits...")
+                    import time
+                    time.sleep(15)
 
         # --- Step 2: Run the simulation + detector for this round ---
         logger.info(f"\nRound {round_num}: Running simulation + detection...")
