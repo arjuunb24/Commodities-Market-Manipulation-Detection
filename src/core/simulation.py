@@ -289,7 +289,6 @@ def _build_agents(
                 n_coordinated_accounts=config.pnd_n_accounts,
                 burst_duration_ticks=config.pnd_burst_duration,
                 dump_delay_ticks=config.pnd_dump_delay,
-                accumulation_size=config.pnd_accumulation_size,
                 start_tick=start,
                 end_tick=end,
             )

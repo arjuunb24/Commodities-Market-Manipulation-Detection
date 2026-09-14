@@ -80,7 +80,7 @@ class WashBuyer(Agent):
             trader_id=self.trader_id,
             side=Side.BUY,
             price=buy_price,
-            quantity=int(self.rng.integers(10, 50)),
+            quantity=int(self.rng.integers(100, 500)),
             tick=tick,
             order_type="limit",
         )
@@ -126,7 +126,7 @@ class WashSeller(Agent):
             trader_id=self.trader_id,
             side=Side.SELL,
             price=sell_price,
-            quantity=int(self.rng.integers(10, 50)),
+            quantity=int(self.rng.integers(100, 500)),
             tick=tick,
             order_type="limit",
         )

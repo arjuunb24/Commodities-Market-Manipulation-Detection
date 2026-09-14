@@ -62,18 +62,26 @@ class PumpDumpAccount(Agent):
         self,
         trader_id: str,
         rng: np.random.Generator,
+        coalition_id: str,
         *,
-        accumulation_size: int = 150,
-        dump_order_size: int = 30,
+        trade_frequency: float = 0.3,
+        price_aggression: float = 0.005,
         start_tick: int = 0,
+        dump_delay_ticks: int = 50,
         end_tick: int = 10000,
     ) -> None:
         super().__init__(trader_id, rng)
-        self.accumulation_size = accumulation_size
-        self.dump_order_size = dump_order_size
+        self.coalition_id = coalition_id
+        self.trade_frequency = trade_frequency
+        self.price_aggression = price_aggression
         self.start_tick = start_tick
+        
+        # When to transition from ACCUMULATE to DUMP
+        self.dump_tick = start_tick + dump_delay_ticks
         self.end_tick = end_tick
-
+        
+        # Target total inventory to accumulate before stopping
+        self.accumulation_size = int(self.rng.integers(50000, 100000))
         self.phase = PumpPhase.HOLD
         self.net_inventory: int = 0
 
@@ -100,11 +108,12 @@ class PumpDumpAccount(Agent):
             if self.net_inventory >= self.accumulation_size:
                 return None  # already fully accumulated
 
+            # Buy aggressively, pushing the price up
+            buy_price = round(ref_price * (1 + self.price_aggression), 4)
             buy_qty = min(
-                int(self.rng.integers(20, 50)),
+                int(self.rng.integers(500, 1000)),
                 self.accumulation_size - self.net_inventory,
             )
-            buy_price = round(ref_price * 1.003, 4)  # aggressive buy
 
             return Order(
                 order_id=str(uuid.uuid4()),
@@ -120,8 +129,12 @@ class PumpDumpAccount(Agent):
             if self.net_inventory <= 0:
                 return None  # nothing left to sell
 
-            sell_qty = min(self.dump_order_size, self.net_inventory)
-            sell_price = round(ref_price * 0.997, 4)  # slightly aggressive sell
+            # Sell aggressively to lock in profits
+            sell_price = round(ref_price * (1 - self.price_aggression), 4)
+            sell_qty = min(
+                int(self.rng.integers(1000, 5000)),
+                self.net_inventory,
+            )
 
             return Order(
                 order_id=str(uuid.uuid4()),
@@ -178,19 +191,18 @@ class PumpDumpCoalition:
         n_coordinated_accounts: int = 3,
         burst_duration_ticks: int = 200,
         dump_delay_ticks: int = 300,
-        accumulation_size: int = 150,
-        dump_order_size: int = 30,
         start_tick: int = 5000,
         end_tick: int = 7000,
     ) -> "PumpDumpCoalition":
         child_rngs = rng.spawn(n_coordinated_accounts)
+        coalition_id = f"pd_coalition_{str(uuid.uuid4())[:8]}"
         accounts = [
             PumpDumpAccount(
                 f"pumpdump_acct_{i}",
                 child_rngs[i],
-                accumulation_size=accumulation_size,
-                dump_order_size=dump_order_size,
+                coalition_id,
                 start_tick=start_tick,
+                dump_delay_ticks=dump_delay_ticks,
                 end_tick=end_tick,
             )
             for i in range(n_coordinated_accounts)
@@ -199,8 +211,6 @@ class PumpDumpCoalition:
             "n_coordinated_accounts": n_coordinated_accounts,
             "burst_duration_ticks": burst_duration_ticks,
             "dump_delay_ticks": dump_delay_ticks,
-            "accumulation_size": accumulation_size,
-            "dump_order_size": dump_order_size,
         }
         return cls(accounts, start_tick, end_tick, burst_duration_ticks, dump_delay_ticks, params)
 
@@ -220,11 +230,16 @@ class PumpDumpCoalition:
 
     def log_activity(self) -> dict:
         """Return a manipulation_events row for this coalition."""
+        # FIX: The manipulation is only active during ACCUMULATE and DUMP phases.
+        # It ends after dump_delay_ticks + a few ticks to offload the inventory.
+        # We should NOT label the rest of the episode (which could be thousands of ticks of inactivity).
+        actual_end_tick = min(self.end_tick, self.start_tick + self.dump_delay_ticks + 50)
+        
         return {
             "event_id": str(uuid.uuid4()),
             "persona": self.PERSONA,
             "start_tick": self.start_tick,
-            "end_tick": self.end_tick,
+            "end_tick": actual_end_tick,
             "trader_ids": [a.trader_id for a in self.accounts],
             "parameters": self.parameters,
         }

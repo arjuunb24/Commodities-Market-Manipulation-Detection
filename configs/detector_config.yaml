@@ -21,9 +21,16 @@ isolation_forest:
 xgboost:
   n_estimators: 300
   max_depth: 5
+  min_child_weight: 1
+  n_estimators_small: 50
+  max_depth_small: 2
+  min_child_weight_small: 3
   learning_rate: 0.05
   subsample: 0.8
   colsample_bytree: 0.8
+  gamma: 0.5
+  reg_alpha: 0.1
+  reg_lambda: 2.0
   eval_metric: "logloss"
   use_label_encoder: false
   random_state: 42

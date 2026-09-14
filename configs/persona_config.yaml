@@ -29,7 +29,3 @@ round_0:
     price_deviation_from_mid: 0.001
     start_tick: 1000
     trade_frequency: 0.5
-spoofing:
-  cancellation_delay_ticks: 8
-  order_distance_ticks: 3
-  spoof_size_ratio: 2

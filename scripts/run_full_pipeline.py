@@ -125,25 +125,20 @@ def main():
                 if args.persona.lower() == "all" else [args.persona]
             )
 
-            for i, persona in enumerate(personas_to_mutate):
-                logger.info(f"\nRound {round_num}: Launching Adversarial Strategist for '{persona}'...")
-                try:
-                    result = strategist.run_strategist_round(
-                        round_num=round_num - 1,  # Strategist reads the PREVIOUS round's metrics
-                        persona=persona,
-                    )
-                    if result.get("status") == "success":
-                        logger.info(f"LLM mutation applied for {persona} in Round {round_num}!")
-                    else:
-                        logger.warning(f"LLM mutation failed for {persona}: {result}. Using existing config.")
-                except Exception as e:
-                    logger.error(f"Strategist failed for {persona}: {e}. Continuing with current config.")
-                
-                # Add a delay between LLM calls to prevent API Quota failures (especially on Gemini Free Tier)
-                if i < len(personas_to_mutate) - 1:
-                    logger.info("Sleeping for 15 seconds to avoid API rate limits...")
-                    import time
-                    time.sleep(15)
+            logger.info(f"\nRound {round_num}: Launching Adversarial Strategist for personas: {personas_to_mutate}...")
+            try:
+                result = strategist.run_strategist_round(
+                    round_num=round_num - 1,  # Strategist reads the PREVIOUS round's metrics
+                    personas=personas_to_mutate,
+                )
+                if result.get("status") == "success":
+                    logger.info(f"LLM mutation applied for {personas_to_mutate} in Round {round_num}!")
+                elif result.get("status") == "partial_success":
+                    logger.warning(f"LLM mutation partially applied for: {result.get('mutated')}. Using existing config for the rest.")
+                else:
+                    logger.warning(f"LLM mutation failed: {result}. Using existing config.")
+            except Exception as e:
+                logger.error(f"Strategist failed: {e}. Continuing with current config.")
 
         # --- Step 2: Run the simulation + detector for this round ---
         logger.info(f"\nRound {round_num}: Running simulation + detection...")
