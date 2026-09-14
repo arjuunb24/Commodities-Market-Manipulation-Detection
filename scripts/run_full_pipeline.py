@@ -60,7 +60,7 @@ def main():
     parser.add_argument("--ticks",     type=int, default=5000,            help="Simulation ticks per round")
     parser.add_argument("--seed",      type=int, default=42,              help="Random seed for simulation")
     parser.add_argument("--commodity", type=str, default="crude_oil_wti", help="Commodity to simulate")
-    parser.add_argument("--persona",   type=str, default="spoofing",      help="Persona to target for adversarial mutation")
+    parser.add_argument("--persona",   type=str, default="spoofing",      help="Persona to target for adversarial mutation (or 'all' for all enabled personas)")
     args = parser.parse_args()
 
     # ----------------------------------------------------------------
@@ -120,18 +120,24 @@ def main():
     for round_num in range(args.rounds):
         # --- Step 1: LLM Mutation (skip for Round 0 — it's the baseline) ---
         if round_num > 0:
-            logger.info(f"\nRound {round_num}: Launching Adversarial Strategist for '{args.persona}'...")
-            try:
-                result = strategist.run_strategist_round(
-                    round_num=round_num - 1,  # Strategist reads the PREVIOUS round's metrics
-                    persona=args.persona,
-                )
-                if result.get("status") == "success":
-                    logger.info(f"LLM mutation applied for Round {round_num}!")
-                else:
-                    logger.warning(f"LLM mutation failed: {result}. Using existing persona_config.yaml.")
-            except Exception as e:
-                logger.error(f"Strategist failed: {e}. Continuing with current persona config.")
+            personas_to_mutate = (
+                detector_config.get("personas", ["spoofing", "wash_trading", "pump_and_dump"]) 
+                if args.persona.lower() == "all" else [args.persona]
+            )
+
+            for persona in personas_to_mutate:
+                logger.info(f"\nRound {round_num}: Launching Adversarial Strategist for '{persona}'...")
+                try:
+                    result = strategist.run_strategist_round(
+                        round_num=round_num - 1,  # Strategist reads the PREVIOUS round's metrics
+                        persona=persona,
+                    )
+                    if result.get("status") == "success":
+                        logger.info(f"LLM mutation applied for {persona} in Round {round_num}!")
+                    else:
+                        logger.warning(f"LLM mutation failed for {persona}: {result}. Using existing config.")
+                except Exception as e:
+                    logger.error(f"Strategist failed for {persona}: {e}. Continuing with current config.")
 
         # --- Step 2: Run the simulation + detector for this round ---
         logger.info(f"\nRound {round_num}: Running simulation + detection...")
