@@ -1,0 +1,36 @@
+round_0:
+  layering:
+    cancellation_delay_ticks: 3
+    enabled: false
+    end_tick: 5000
+    layer_spacing: 0.002
+    n_layers: 4
+    start_tick: 3000
+  pump_and_dump:
+    accumulation_size: 150
+    burst_duration_ticks: 200
+    dump_delay_ticks: 100
+    enabled: true
+    end_tick: 7000
+    n_coordinated_accounts: 3
+    start_tick: 5000
+  spoofing:
+    cancellation_delay_ticks: 5
+    enabled: true
+    end_tick: 4000
+    frequency: 0.4
+    order_size_multiplier: 8.0
+    price_aggressiveness: 0.003
+    start_tick: 2000
+  wash_trading:
+    enabled: true
+    end_tick: 3000
+    n_colluding_pairs: 1
+    price_deviation_from_mid: 0.001
+    start_tick: 1000
+    trade_frequency: 0.5
+spoofing:
+  cancel_rate: 0.78
+  cancellation_delay_ticks: 15
+  distance_from_bid_ask: 4
+  order_size_multiplier: 2.5

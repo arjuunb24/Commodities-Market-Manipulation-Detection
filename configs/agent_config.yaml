@@ -1,0 +1,60 @@
+calibration:
+  source: yfinance
+  commodity: gold
+  ou_params:
+    mean_reversion_speed: 0.05
+    long_run_mean: 1.0
+    volatility: 0.0094
+    drift: 0.0001
+  volume_params:
+    mean_daily_volume: 5000
+    volume_cv: 0.4
+  fallback_reason: 'yfinance fetch failed. Using pre-calibrated constants from published
+    historical statistics (Erb & Harvey 2006, Geman 2005, Deaton & Laroque 1996).
+    Fetch errors: [''crude_oil_wti (CL=F): The truth value of a Series is ambiguous.
+    Use a.empty, a.bool(), a.item(), a.any() or a.all().'', ''brent_crude (BZ=F):
+    The truth value of a Series is ambiguous. Use a.empty, a.bool(), a.item(), a.any()
+    or a.all().'', ''gold (GC=F): The truth value of a Series is ambiguous. Use a.empty,
+    a.bool(), a.item(), a.any() or a.all().'', ''silver (SI=F): The truth value of
+    a Series is ambiguous. Use a.empty, a.bool(), a.item(), a.any() or a.all().'',
+    ''natural_gas (NG=F): The truth value of a Series is ambiguous. Use a.empty, a.bool(),
+    a.item(), a.any() or a.all().'', ''copper (HG=F): The truth value of a Series
+    is ambiguous. Use a.empty, a.bool(), a.item(), a.any() or a.all().'', ''wheat
+    (ZW=F): The truth value of a Series is ambiguous. Use a.empty, a.bool(), a.item(),
+    a.any() or a.all().'', ''corn (ZC=F): The truth value of a Series is ambiguous.
+    Use a.empty, a.bool(), a.item(), a.any() or a.all().'']'
+  note: Fetched ['crude_oil_wti', 'brent_crude', 'gold', 'silver', 'natural_gas',
+    'copper', 'wheat', 'corn']. Run src/core/calibration.py to update OU parameters
+    from this data.
+simulation:
+  n_ticks: 10000
+  ticks_per_bar: 100
+  fundamental_value_initial: 100.0
+  fundamental_value_drift: 0.0001
+  fundamental_value_vol: 0.002
+agents:
+  noise_trader:
+    count: 20
+    arrival_rate_lambda: 0.6
+    order_size_min: 1
+    order_size_max: 50
+    price_offset_ticks: 5.0
+  momentum_trader:
+    count: 8
+    arrival_rate_lambda: 0.3
+    lookback_ticks: 20
+    momentum_threshold: 0.002
+    order_size_base: 30
+    order_size_scale: 5.0
+  mean_reversion_trader:
+    count: 6
+    arrival_rate_lambda: 0.25
+    reversion_threshold: 0.01
+    order_size_base: 40
+  market_maker:
+    count: 1
+    arrival_rate_lambda: 0.95
+    spread_ticks: 1.0
+    inventory_skew_factor: 0.1
+    max_inventory: 500
+    order_size: 20

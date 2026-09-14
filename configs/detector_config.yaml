@@ -1,0 +1,45 @@
+# =============================================================================
+# configs/detector_config.yaml
+#
+# Hyperparameters for the two-layer manipulation detector (Module 2).
+# =============================================================================
+
+# --- Feature Engine ---
+feature_engine:
+  window: "5min"           # rolling window size (in simulated time units)
+  step: "1min"             # stride between windows
+  top_k_traders: 5         # volume concentration: top-k most active traders
+
+# --- Unsupervised Layer: Isolation Forest ---
+isolation_forest:
+  contamination: 0.05      # default; swept 0.01–0.10 for sensitivity analysis
+  n_estimators: 200
+  max_samples: "auto"
+  random_state: 42         # deterministic
+
+# --- Supervised Layer: XGBoost (per-persona binary classifiers) ---
+xgboost:
+  n_estimators: 300
+  max_depth: 5
+  learning_rate: 0.05
+  subsample: 0.8
+  colsample_bytree: 0.8
+  eval_metric: "logloss"
+  use_label_encoder: false
+  random_state: 42
+  # scale_pos_weight: computed dynamically = n_negative / n_positive per fold
+
+# --- Ensemble Scorer ---
+ensemble:
+  # Combination rule: "or" | "weighted"
+  # "or" = flag if either layer fires (spec Section 4.4)
+  combination_rule: "or"
+  iso_weight: 0.4          # used only if combination_rule = "weighted"
+  supervised_weight: 0.6   # used only if combination_rule = "weighted"
+  supervised_threshold: 0.5  # probability threshold for binary classification
+
+# --- Personas to train classifiers for ---
+personas:
+  - spoofing
+  - wash_trading
+  - pump_and_dump

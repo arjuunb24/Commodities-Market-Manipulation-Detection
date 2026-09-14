@@ -1,0 +1,54 @@
+# =============================================================================
+# configs/llm_config.yaml
+#
+# Model configuration for Module 4 — LLM & Agentic Intelligence Layer.
+#
+# Two providers:
+#   - Gemini (Google): 4B Adversarial Strategist + 4C Analyst Assistant
+#     Strong reasoning + native tool-calling. Used for multi-step agentic tasks.
+#   - Cerebras: 4A Narrative Generator
+#     Extremely high-throughput inference (1000+ tok/s). Used for batch
+#     narrative generation (up to ~150 flags per round). Cost-efficient
+#     for high-volume, low-complexity phrasing tasks.
+# =============================================================================
+
+# --- 4A: Narrative Generator (Fallback to Gemini for testing) ---
+narrative_generator:
+  provider: "gemini"
+  model: "gemini-3.6-flash"
+  temperature: 0.0            # deterministic for reproducible compliance artifacts
+  max_tokens: 300             # 2-4 sentence narrative
+  max_retries: 3
+  timeout_seconds: 15
+  # Cost note: ~150 narratives/round × ~400 in + 150 out tokens ≈ very low cost
+
+# --- 4B: Adversarial Strategist (Gemini — reasoning + tool-use) ---
+adversarial_strategist:
+  provider: "gemini"
+  model: "gemini-3.6-flash"   # Strong reasoning, native tool-calling
+  temperature: 0.0
+  max_tokens: 1024
+  max_tool_calls: 6           # hard cap per round (spec Section 7.3)
+  max_retries: 3
+  timeout_seconds: 60
+  # Fallback: mutation_library.py if proposal fails validation twice
+
+# --- 4C: Analyst Assistant (Gemini — reasoning + function-calling) ---
+analyst_assistant:
+  provider: "gemini"
+  model: "gemini-3.6-flash"
+  temperature: 0.0
+  max_tokens: 800
+  max_retries: 3
+  timeout_seconds: 30
+
+# --- LLM Call Logging ---
+logging:
+  output_file: "llm_calls.jsonl"  # relative to data/runs/<run_id>/
+  log_prompts: true               # log full prompt for auditability
+  log_responses: true
+
+# --- Demo Mode Cache ---
+demo_cache:
+  enabled_env_var: "DEMO_MODE"    # reads from environment
+  cache_dir: "data/llm_cache"     # keyed by SHA256(input_json)

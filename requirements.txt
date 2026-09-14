@@ -1,0 +1,57 @@
+# =============================================================================
+# Veridex — Commodities Market Manipulation Detection
+# requirements.txt  (pin major versions; let patch versions float)
+# Python 3.11 required (3.10–3.12 acceptable)
+# =============================================================================
+
+# --- core simulation ---
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11
+
+# --- calibration data ---
+yfinance>=0.2.40
+requests>=2.31
+
+# --- detector ---
+scikit-learn>=1.4
+xgboost>=2.0
+shap>=0.45
+lightgbm>=4.3          # optional alternative to XGBoost per spec Section 4.2
+
+# --- adversarial orchestration / experiment tracking ---
+mlflow>=2.12
+
+# --- LLM / agentic layer (Module 4) ---
+# Gemini: reasoning tasks — 4B Adversarial Strategist, 4C Analyst Assistant
+google-genai>=1.0
+# Cerebras: high-speed inference — 4A Narrative Generator (high volume, low complexity)
+cerebras-cloud-sdk>=1.0
+pydantic>=2.6
+jinja2>=3.1
+tenacity>=8.2          # retry/backoff for LLM calls
+
+# --- dashboard ---
+streamlit>=1.35
+plotly>=5.22
+altair>=5.3
+
+# --- storage / schema validation ---
+pyarrow>=15.0
+pandera>=0.19
+
+# --- testing ---
+pytest>=8.0
+pytest-cov>=5.0
+hypothesis>=6.100      # property-based testing
+
+# --- dev quality ---
+black>=24.0
+ruff>=0.4
+mypy>=1.10
+python-dotenv>=1.0
+
+# --- optional Phase 2 (RL stretch goal, spec Section 8) ---
+# stable-baselines3>=2.3
+# torch>=2.2
+# gymnasium>=0.29
