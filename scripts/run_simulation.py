@@ -76,7 +76,43 @@ def main() -> None:
             overwrite=True,
             write_to_disk=False  # Do not write to disk yet
         )
-        
+
+        # Apply LLM mutations from persona_config.yaml if they exist
+        persona_config_path = Path(__file__).parent.parent / "configs" / "persona_config.yaml"
+        if persona_config_path.exists():
+            with open(persona_config_path) as f:
+                p_cfg = yaml.safe_load(f) or {}
+
+            # Spoofing mutations
+            if "spoofing" in p_cfg:
+                sp_cfg = p_cfg["spoofing"]
+                if "cancellation_delay_ticks" in sp_cfg: config.spoof_cancel_delay = sp_cfg["cancellation_delay_ticks"]
+                if "order_size_multiplier" in sp_cfg: config.spoof_size_multiplier = float(sp_cfg["order_size_multiplier"])
+                if "frequency" in sp_cfg: config.spoof_frequency = float(sp_cfg["frequency"])
+                if "price_aggressiveness" in sp_cfg: config.spoof_aggressiveness = float(sp_cfg["price_aggressiveness"])
+
+            # Wash trading mutations
+            if "wash_trading" in p_cfg:
+                wt_cfg = p_cfg["wash_trading"]
+                if "trade_frequency" in wt_cfg: config.wash_frequency = float(wt_cfg["trade_frequency"])
+                if "price_deviation_from_mid" in wt_cfg: config.wash_price_deviation = float(wt_cfg["price_deviation_from_mid"])
+                if "n_colluding_pairs" in wt_cfg: config.wash_n_pairs = int(wt_cfg["n_colluding_pairs"])
+
+            # Pump and dump mutations
+            if "pump_and_dump" in p_cfg:
+                pnd_cfg = p_cfg["pump_and_dump"]
+                if "burst_duration_ticks" in pnd_cfg: config.pnd_burst_duration = int(pnd_cfg["burst_duration_ticks"])
+                if "n_coordinated_accounts" in pnd_cfg: config.pnd_n_accounts = int(pnd_cfg["n_coordinated_accounts"])
+                if "dump_delay_ticks" in pnd_cfg: config.pnd_dump_delay = int(pnd_cfg["dump_delay_ticks"])
+                if "accumulation_size" in pnd_cfg: config.pnd_accumulation_size = int(pnd_cfg["accumulation_size"])
+
+            # Layering mutations
+            if "layering" in p_cfg:
+                ly_cfg = p_cfg["layering"]
+                if "n_layers" in ly_cfg: config.layer_n_layers = int(ly_cfg["n_layers"])
+                if "layer_spacing" in ly_cfg: config.layer_spacing = float(ly_cfg["layer_spacing"])
+                if "cancellation_delay_ticks" in ly_cfg: config.layer_cancel_delay = int(ly_cfg["cancellation_delay_ticks"])
+
         output = run_simulation(config, args.seed)
         all_trade_logs.append(output.trade_log)
         all_order_logs.append(output.order_log)

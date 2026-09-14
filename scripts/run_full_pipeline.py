@@ -87,8 +87,20 @@ def main():
         llm_config = yaml.safe_load(f)
     strategist_config = llm_config.get("adversarial_strategist", {})
 
+    # Reset persona_config.yaml to baseline (remove top-level mutations)
+    persona_config_path = REPO_ROOT / "configs" / "persona_config.yaml"
+    if persona_config_path.exists():
+        with open(persona_config_path) as f:
+            p_cfg = yaml.safe_load(f) or {}
+        # Keep only round_0 baseline
+        baseline = {"round_0": p_cfg.get("round_0", {})}
+        with open(persona_config_path, "w") as f:
+            yaml.dump(baseline, f, default_flow_style=False)
+        logger.info("Reset persona_config.yaml to baseline for Round 0.")
+
     # Initialise orchestrator (runs the simulation + detector each round)
     orchestrator = RoundOrchestrator(
+
         master_run_dir=master_run_dir,
         detector_config=detector_config,
         sim_ticks=args.ticks,
