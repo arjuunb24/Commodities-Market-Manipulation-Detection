@@ -85,6 +85,13 @@ class LLMClient:
         
         with open(self.log_file, "a") as f:
             f.write(json.dumps(log_entry) + "\n")
+            
+        # Also log to YAML for easier human reading
+        yaml_log = self.log_file.with_suffix('.yaml')
+        import yaml
+        with open(yaml_log, "a") as f:
+            f.write("---\n")
+            yaml.dump(log_entry, f, sort_keys=False)
 
     def complete(
         self, 

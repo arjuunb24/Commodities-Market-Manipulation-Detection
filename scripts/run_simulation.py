@@ -34,6 +34,55 @@ COMMODITIES = [
 ]
 
 
+def simulate_commodity_worker(com: str, seed: int, ticks: int, outdir: str, p_cfg: dict) -> tuple:
+    from src.core.calibration import CalibrationEngine
+    from src.core.simulation import SimConfig, run_simulation
+    from pathlib import Path
+    
+    engine = CalibrationEngine()
+    ou_target, _ = engine.get_fallback(com)
+
+    config = SimConfig(
+        commodity=com,
+        fundamental_value_drift=ou_target.drift,
+        fundamental_value_vol=ou_target.volatility,
+        n_ticks=ticks,
+        data_dir=Path(outdir),
+        overwrite=True,
+        write_to_disk=False  # Do not write to disk yet
+    )
+
+    # Apply LLM mutations
+    if "spoofing" in p_cfg:
+        sp_cfg = p_cfg["spoofing"]
+        if "cancellation_delay_ticks" in sp_cfg: config.spoof_cancel_delay = sp_cfg["cancellation_delay_ticks"]
+        if "order_size_multiplier" in sp_cfg: config.spoof_size_multiplier = float(sp_cfg["order_size_multiplier"])
+        if "frequency" in sp_cfg: config.spoof_frequency = float(sp_cfg["frequency"])
+        if "price_aggressiveness" in sp_cfg: config.spoof_aggressiveness = float(sp_cfg["price_aggressiveness"])
+
+    if "wash_trading" in p_cfg:
+        wt_cfg = p_cfg["wash_trading"]
+        if "trade_frequency" in wt_cfg: config.wash_frequency = float(wt_cfg["trade_frequency"])
+        if "price_deviation_from_mid" in wt_cfg: config.wash_price_deviation = float(wt_cfg["price_deviation_from_mid"])
+        if "n_colluding_pairs" in wt_cfg: config.wash_n_pairs = int(wt_cfg["n_colluding_pairs"])
+
+    if "pump_and_dump" in p_cfg:
+        pnd_cfg = p_cfg["pump_and_dump"]
+        if "burst_duration_ticks" in pnd_cfg: config.pnd_burst_duration = int(pnd_cfg["burst_duration_ticks"])
+        if "n_coordinated_accounts" in pnd_cfg: config.pnd_n_accounts = int(pnd_cfg["n_coordinated_accounts"])
+        if "dump_delay_ticks" in pnd_cfg: config.pnd_dump_delay = int(pnd_cfg["dump_delay_ticks"])
+        if "accumulation_size" in pnd_cfg: config.pnd_accumulation_size = int(pnd_cfg["accumulation_size"])
+
+    if "layering" in p_cfg:
+        ly_cfg = p_cfg["layering"]
+        if "n_layers" in ly_cfg: config.layer_n_layers = int(ly_cfg["n_layers"])
+        if "layer_spacing" in ly_cfg: config.layer_spacing = float(ly_cfg["layer_spacing"])
+        if "cancellation_delay_ticks" in ly_cfg: config.layer_cancel_delay = int(ly_cfg["cancellation_delay_ticks"])
+
+    output = run_simulation(config, seed)
+    return (com, output.trade_log, output.order_log, output.manipulation_events, output.ohlcv_bars)
+
+
 def main() -> None:
     setup_logging()
 
@@ -63,61 +112,30 @@ def main() -> None:
     run_id = f"{ts}_{args.seed}"
     run_dir = io_utils.ensure_run_dir(Path(args.outdir), run_id, overwrite=True)
 
-    for com in coms_to_run:
-        print(f" -> Simulating {com}...")
-        ou_target, _ = engine.get_fallback(com)
+    persona_config_path = Path(__file__).parent.parent / "configs" / "persona_config.yaml"
+    p_cfg = {}
+    if persona_config_path.exists():
+        with open(persona_config_path) as f:
+            p_cfg = yaml.safe_load(f) or {}
 
-        config = SimConfig(
-            commodity=com,
-            fundamental_value_drift=ou_target.drift,
-            fundamental_value_vol=ou_target.volatility,
-            n_ticks=args.ticks,
-            data_dir=Path(args.outdir),
-            overwrite=True,
-            write_to_disk=False  # Do not write to disk yet
-        )
-
-        # Apply LLM mutations from persona_config.yaml if they exist
-        persona_config_path = Path(__file__).parent.parent / "configs" / "persona_config.yaml"
-        if persona_config_path.exists():
-            with open(persona_config_path) as f:
-                p_cfg = yaml.safe_load(f) or {}
-
-            # Spoofing mutations
-            if "spoofing" in p_cfg:
-                sp_cfg = p_cfg["spoofing"]
-                if "cancellation_delay_ticks" in sp_cfg: config.spoof_cancel_delay = sp_cfg["cancellation_delay_ticks"]
-                if "order_size_multiplier" in sp_cfg: config.spoof_size_multiplier = float(sp_cfg["order_size_multiplier"])
-                if "frequency" in sp_cfg: config.spoof_frequency = float(sp_cfg["frequency"])
-                if "price_aggressiveness" in sp_cfg: config.spoof_aggressiveness = float(sp_cfg["price_aggressiveness"])
-
-            # Wash trading mutations
-            if "wash_trading" in p_cfg:
-                wt_cfg = p_cfg["wash_trading"]
-                if "trade_frequency" in wt_cfg: config.wash_frequency = float(wt_cfg["trade_frequency"])
-                if "price_deviation_from_mid" in wt_cfg: config.wash_price_deviation = float(wt_cfg["price_deviation_from_mid"])
-                if "n_colluding_pairs" in wt_cfg: config.wash_n_pairs = int(wt_cfg["n_colluding_pairs"])
-
-            # Pump and dump mutations
-            if "pump_and_dump" in p_cfg:
-                pnd_cfg = p_cfg["pump_and_dump"]
-                if "burst_duration_ticks" in pnd_cfg: config.pnd_burst_duration = int(pnd_cfg["burst_duration_ticks"])
-                if "n_coordinated_accounts" in pnd_cfg: config.pnd_n_accounts = int(pnd_cfg["n_coordinated_accounts"])
-                if "dump_delay_ticks" in pnd_cfg: config.pnd_dump_delay = int(pnd_cfg["dump_delay_ticks"])
-                if "accumulation_size" in pnd_cfg: config.pnd_accumulation_size = int(pnd_cfg["accumulation_size"])
-
-            # Layering mutations
-            if "layering" in p_cfg:
-                ly_cfg = p_cfg["layering"]
-                if "n_layers" in ly_cfg: config.layer_n_layers = int(ly_cfg["n_layers"])
-                if "layer_spacing" in ly_cfg: config.layer_spacing = float(ly_cfg["layer_spacing"])
-                if "cancellation_delay_ticks" in ly_cfg: config.layer_cancel_delay = int(ly_cfg["cancellation_delay_ticks"])
-
-        output = run_simulation(config, args.seed)
-        all_trade_logs.append(output.trade_log)
-        all_order_logs.append(output.order_log)
-        all_manip_logs.append(output.manipulation_events)
-        all_bars_logs.append(output.ohlcv_bars)
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    with ProcessPoolExecutor() as executor:
+        futures = {
+            executor.submit(simulate_commodity_worker, com, args.seed, args.ticks, args.outdir, p_cfg): com
+            for com in coms_to_run
+        }
+        
+        for future in as_completed(futures):
+            com = futures[future]
+            try:
+                _, trade_log, order_log, manip_log, bars_log = future.result()
+                print(f" -> Finished {com}")
+                all_trade_logs.append(trade_log)
+                all_order_logs.append(order_log)
+                all_manip_logs.append(manip_log)
+                all_bars_logs.append(bars_log)
+            except Exception as e:
+                print(f" -> Error simulating {com}: {e}")
 
     print("\nMerging datasets...")
     final_trade_df = pd.concat(all_trade_logs, ignore_index=True)

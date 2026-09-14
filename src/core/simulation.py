@@ -342,32 +342,26 @@ def _resample_to_bars(trade_log_df: pd.DataFrame, ticks_per_bar: int) -> pd.Data
     max_tick = int(trade_log_df["tick"].max())
     bar_starts = range(0, max_tick + ticks_per_bar, ticks_per_bar)
 
-    rows = []
-    for bs in bar_starts:
-        be = bs + ticks_per_bar
-        mask = (trade_log_df["tick"] >= bs) & (trade_log_df["tick"] < be)
-        window = trade_log_df[mask]
+    # Vectorized groupby instead of O(N^2) boolean masking
+    # Create an independent series to group by, so we don't mutate trade_log_df
+    bar_start_series = (trade_log_df["tick"] // ticks_per_bar) * ticks_per_bar
+    bar_start_series.name = "bar_start"
+    
+    aggs = trade_log_df.groupby(bar_start_series).agg(
+        open=("price", "first"),
+        high=("price", "max"),
+        low=("price", "min"),
+        close=("price", "last"),
+        volume=("quantity", "sum")
+    ).reset_index()
 
-        if window.empty:
-            rows.append({
-                "bar_start": bs,
-                "open": float("nan"),
-                "high": float("nan"),
-                "low": float("nan"),
-                "close": float("nan"),
-                "volume": 0,
-            })
-        else:
-            rows.append({
-                "bar_start": bs,
-                "open": float(window.iloc[0]["price"]),
-                "high": float(window["price"].max()),
-                "low": float(window["price"].min()),
-                "close": float(window.iloc[-1]["price"]),
-                "volume": int(window["quantity"].sum()),
-            })
+    # Reindex to ensure we have empty bars for periods with no trades (FR-1.7)
+    aggs = aggs.set_index("bar_start").reindex(bar_starts).reset_index()
+    
+    aggs["volume"] = aggs["volume"].fillna(0).astype("int64")
+    # NaN for OHLC is already handled by pandas reindex
 
-    return pd.DataFrame(rows)
+    return aggs
 
 
 # ===========================================================================
@@ -428,6 +422,9 @@ def run_simulation(
     spoofing_agents = [c for c in controllers if isinstance(c, SpoofingAgent)]
     layering_agents = [c for c in controllers if isinstance(c, LayeringAgent)]
     pnd_coalitions = [c for c in controllers if isinstance(c, PumpDumpCoalition)]
+
+    # Pre-filter regular agents to avoid isinstance in the hot tick loop
+    regular_agents = [a for a in agents if not isinstance(a, (MarketMaker, LayeringAgent))]
 
     # --- Order book ---
     book = OrderBook(initial_price=config.fundamental_value_initial)
@@ -491,10 +488,7 @@ def run_simulation(
                 _collect(trades, events, all_trades, all_order_events, layerer, momentum_traders)
 
         # --- All other agents (one order per tick) ---
-        for agent in agents:
-            if isinstance(agent, (MarketMaker, LayeringAgent)):
-                continue  # already handled above
-
+        for agent in regular_agents:
             order = agent.decide(state, tick)
             if order is None:
                 continue
@@ -546,6 +540,8 @@ def run_simulation(
 # ===========================================================================
 
 
+from src.core.order_book import Side
+
 def _collect(
     trades: list[Trade],
     events: list,
@@ -562,7 +558,6 @@ def _collect(
             mt.update_price(trade.price)
         # Update market maker inventory if it was involved
         if isinstance(agent, MarketMaker):
-            from src.core.order_book import Side
             if trade.buyer_trader_id == agent.trader_id:
                 agent.update_inventory(Side.BUY, trade.quantity)
             elif trade.seller_trader_id == agent.trader_id:

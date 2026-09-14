@@ -10,23 +10,23 @@ import logging
 from typing import Any
 
 from src.agentic.llm_client import LLMClient
-from src.agentic.tools import STRATEGIST_TOOLS, ToolRegistry
+from src.agentic.tools import STRATEGIST_TOOLS, ToolRegistry, PROPOSE_MUTATION_SCHEMA
 
 logger = logging.getLogger(__name__)
 
 STRATEGIST_SYSTEM_PROMPT = """You are an Adversarial Strategist agent. Your goal is to mutate a 
 manipulation persona's parameters so that it evades our ML detection model in the next simulation round.
-You have access to tools to read the round metrics, check the SHAP drift, and read enforcement notes.
-You MUST call `propose_mutation` to lock in your final config change.
-Do not guess the parameters. Use your tools to read the baseline performance first, then mutate based on SHAP vulnerabilities.
+You will be provided with the current round metrics, SHAP drift analysis, and enforcement notes.
+You MUST call `propose_mutation` to lock in your final config change based on this provided context.
 """
 
 class AdversarialStrategist:
     def __init__(self, config: dict[str, Any], run_dir=None):
         self.config = config
         self.client = LLMClient(config, run_dir=run_dir)
-        self.tools = ToolRegistry(run_dir=run_dir)
+        self.tools = ToolRegistry(run_dir=run_dir)  # ← real disk reads when run_dir is set
         self.max_tool_calls = config.get("max_tool_calls", 6)
+
 
     def _execute_tool_call(self, tool_call: dict) -> dict:
         """Dispatches a tool call to the ToolRegistry."""
@@ -55,8 +55,27 @@ class AdversarialStrategist:
         """
         logger.info(f"Starting Adversarial Strategist round {round_num} for persona '{persona}'")
         
+        # Pre-fetch context to save API calls
+        current_metrics = self.tools.get_round_metrics(round_num)
+        shap_drift = self.tools.get_shap_drift(persona=persona, round_a=max(0, round_num-1), round_b=round_num)
+        notes = self.tools.get_enforcement_notes(persona)
+        
+        context = f"""We are on round {round_num}. Please mutate the '{persona}' persona.
+
+Here is the context you need:
+1. Current Metrics for Round {round_num}:
+{json.dumps(current_metrics, indent=2)}
+
+2. SHAP Drift for '{persona}' (Round {max(0, round_num-1)} vs {round_num}):
+{json.dumps(shap_drift, indent=2)}
+
+3. Enforcement Notes for '{persona}':
+{notes}
+
+Based on this, propose new parameters using the `propose_mutation` tool."""
+
         messages = [
-            {"role": "user", "content": f"We are on round {round_num}. Please mutate the '{persona}' persona."}
+            {"role": "user", "content": context}
         ]
         
         for i in range(self.max_tool_calls):
@@ -65,7 +84,7 @@ class AdversarialStrategist:
             response = self.client.complete(
                 system=STRATEGIST_SYSTEM_PROMPT,
                 messages=messages,
-                tools=STRATEGIST_TOOLS
+                tools=[PROPOSE_MUTATION_SCHEMA]
             )
             
             choice = response["choices"][0]["message"]

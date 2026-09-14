@@ -30,7 +30,6 @@ round_0:
     start_tick: 1000
     trade_frequency: 0.5
 spoofing:
-  cancel_rate: 0.78
-  cancellation_delay_ticks: 15
-  distance_from_bid_ask: 4
-  order_size_multiplier: 2.5
+  cancellation_delay_ticks: 8
+  order_distance_ticks: 3
+  spoof_size_ratio: 2

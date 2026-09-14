@@ -72,8 +72,8 @@ class RoundOrchestrator:
     def run_round(self, round_num: int) -> dict[str, dict[str, float]]:
         """
         Executes one full round:
-          1. Run the simulation (subprocess call to run_simulation.py)
-          2. Train & score the detector
+          1. Run the simulation twice (train and test) with different seeds
+          2. Train & score the detector on separate datasets
           3. Compute metrics
           4. Save everything to disk
 
@@ -81,27 +81,33 @@ class RoundOrchestrator:
         """
         round_dir = self.master_run_dir / f"round_{round_num}"
         round_dir.mkdir(parents=True, exist_ok=True)
+        
+        train_dir = round_dir / "train"
+        test_dir = round_dir / "test"
+        train_dir.mkdir(parents=True, exist_ok=True)
+        test_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info("=" * 60)
-        logger.info(f"ROUND {round_num} — Simulating market...")
-        logger.info("=" * 60)
-
-        # Step 1: Run simulation
-        self._run_simulation(round_dir)
+        logger.info(f"ROUND {round_num} — Simulating market (Training data)...")
+        self._run_simulation(train_dir, seed=self.sim_seed + round_num * 10)
+        
+        logger.info(f"ROUND {round_num} — Simulating market (Testing data)...")
+        self._run_simulation(test_dir, seed=self.sim_seed + round_num * 10 + 1)
 
         # Step 2: Load, train & score
         logger.info(f"Round {round_num} — Training & scoring detector...")
-        X, y = self.pipeline.load_and_preprocess(round_dir)
+        X_train, y_train = self.pipeline.load_and_preprocess(train_dir)
+        X_test, y_test = self.pipeline.load_and_preprocess(test_dir)
 
-        if X.empty:
+        if X_train.empty or X_test.empty:
             logger.warning(f"Round {round_num}: empty feature matrix. Skipping.")
             return {}
 
-        self.pipeline.train(X, y)
-        results = self.pipeline.score(X)
+        self.pipeline.train(X_train, y_train)
+        results = self.pipeline.score(X_test)
 
-        # Step 3: Compute metrics
-        metrics = compute_round_metrics(results, y, self.personas)
+        # Step 3: Compute metrics on the test set
+        metrics = compute_round_metrics(results, y_test, self.personas)
 
         # Step 4: Save
         save_round_metrics(metrics, round_num, round_dir)
@@ -146,10 +152,10 @@ class RoundOrchestrator:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _run_simulation(self, round_dir: Path) -> None:
+    def _run_simulation(self, out_dir: Path, seed: int) -> None:
         """
         Calls run_simulation.py as a subprocess, writing outputs directly
-        into round_dir so each round has isolated Parquet files.
+        into out_dir so each run has isolated Parquet files.
         """
         python_exe = sys.executable
         script = REPO_ROOT / "scripts" / "run_simulation.py"
@@ -157,8 +163,8 @@ class RoundOrchestrator:
         cmd = [
             python_exe, str(script),
             "--ticks",     str(self.sim_ticks),
-            "--seed",      str(self.sim_seed),
-            "--outdir",    str(round_dir),
+            "--seed",      str(seed),
+            "--outdir",    str(out_dir),
             "--commodity", self.commodity,
         ]
 
@@ -171,8 +177,8 @@ class RoundOrchestrator:
             )
 
         # run_simulation.py writes to outdir/<timestamp>_<seed>/
-        # We need to move those files up one level into round_dir
-        self._flatten_sim_output(round_dir)
+        # We need to move those files up one level into out_dir
+        self._flatten_sim_output(out_dir)
 
     def _flatten_sim_output(self, round_dir: Path) -> None:
         """
