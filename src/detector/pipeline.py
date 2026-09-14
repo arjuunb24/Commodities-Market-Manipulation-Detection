@@ -115,37 +115,40 @@ class DetectorPipeline:
         """
         Runs the ensemble scorer using both layers.
         Returns a DataFrame with isolation_score, supervised probabilities, and final flags.
+        Falls back to ISO-only results if no supervised models were trained.
         """
         results = pd.DataFrame(index=X.index)
-        
+
         # 1. Unsupervised
         results["iso_score"] = self.anomaly_detector.predict_scores(X)
         results["iso_flag"] = self.anomaly_detector.predict_labels(X)
-        
-        # 2. Supervised
-        sup_probs = self.supervised_detector.predict_proba(X)
-        for col in sup_probs.columns:
-            results[f"prob_{col}"] = sup_probs[col]
-            
+
+        # 2. Supervised (graceful fallback if no models trained)
+        sup_probs = pd.DataFrame(index=X.index)
+        if self.supervised_detector.is_trained():
+            sup_probs = self.supervised_detector.predict_proba(X)
+            for col in sup_probs.columns:
+                results[f"prob_{col}"] = sup_probs[col]
+        else:
+            logger.warning("No supervised models trained. Using ISO-only ensemble.")
+
         # Overall supervised probability is the max across personas
         results["sup_max_prob"] = sup_probs.max(axis=1) if not sup_probs.empty else 0.0
-        
+
         # 3. Ensemble Rule
         ensemble_config = self.config.get("ensemble", {})
         rule = ensemble_config.get("combination_rule", "or")
         sup_thresh = ensemble_config.get("supervised_threshold", 0.5)
-        
+
         results["sup_flag"] = results["sup_max_prob"] > sup_thresh
-        
+
         if rule == "or":
             results["ensemble_flag"] = results["iso_flag"] | results["sup_flag"]
         elif rule == "weighted":
             w_iso = ensemble_config.get("iso_weight", 0.4)
             w_sup = ensemble_config.get("supervised_weight", 0.6)
-            # Roughly map iso_score to 0-1 for weighting. 
-            # (In production, you'd use a fitted calibrator or MinMaxScaler on the scores).
             norm_iso = (results["iso_score"] - results["iso_score"].min()) / (results["iso_score"].max() - results["iso_score"].min() + 1e-9)
             results["ensemble_score"] = (norm_iso * w_iso) + (results["sup_max_prob"] * w_sup)
             results["ensemble_flag"] = results["ensemble_score"] > 0.5
-            
+
         return results

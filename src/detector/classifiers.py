@@ -86,21 +86,26 @@ class SupervisedDetector:
             self.models[persona] = model
             logger.info(f"[{persona}] Training complete.")
             
+    def is_trained(self) -> bool:
+        """Returns True if at least one supervised model was successfully trained."""
+        return bool(self.models)
+
     def predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
         """
         Returns probability of manipulation for each persona.
-        
+
         Returns:
-            DataFrame with columns matching self.personas.
+            DataFrame with columns matching trained personas.
+            Returns an empty DataFrame if no models were trained.
         """
         if not self.models:
-            raise RuntimeError("Models have not been trained yet.")
-            
+            return pd.DataFrame(index=X.index)
+
         results = pd.DataFrame(index=X.index)
-        
+
         for persona, model in self.models.items():
             # predict_proba returns [P(class=0), P(class=1)]
             probs = model.predict_proba(X)
             results[persona] = probs[:, 1]
-            
+
         return results

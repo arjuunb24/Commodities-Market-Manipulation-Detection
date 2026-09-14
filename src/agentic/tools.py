@@ -5,6 +5,7 @@ Shared tool definitions and schemas for the LLM agents (Module 4B, 4C).
 """
 
 from typing import Any
+from pathlib import Path
 
 # =============================================================================
 # SCHEMAS (OpenAI / LiteLLM format)
@@ -108,59 +109,108 @@ STRATEGIST_TOOLS = [
 
 class ToolRegistry:
     """Provides the actual Python implementations for the tools."""
-    
+
     def __init__(self, run_dir=None):
-        self.run_dir = run_dir
-        
+        self.run_dir = Path(run_dir) if run_dir else None
+
     def get_round_metrics(self, round_num: int) -> dict:
-        # In a real run, this would read from data/runs/round_{round_num}/metrics.json
-        # For now, return a mock response for testing
+        """
+        Reads metrics.json from the round directory written by RoundOrchestrator.
+        Falls back to mock data if the file doesn't exist (e.g., during testing).
+        """
+        if self.run_dir:
+            metrics_path = self.run_dir / f"round_{round_num}" / "metrics.json"
+            if metrics_path.exists():
+                import json
+                with open(metrics_path, "r") as f:
+                    data = json.load(f)
+                return data.get("personas", {})
+
+        # Fallback mock for standalone tests
         return {
             "spoofing": {"precision": 0.90, "recall": 0.86, "f1": 0.88},
-            "wash_trading": {"precision": 0.85, "recall": 0.80, "f1": 0.82}
+            "wash_trading": {"precision": 0.85, "recall": 0.80, "f1": 0.82},
         }
-        
+
     def get_shap_drift(self, persona: str, round_a: int, round_b: int) -> dict:
+        """
+        Reads metrics for both rounds from disk and computes deltas.
+        """
+        m_a = self.get_round_metrics(round_a).get(persona, {})
+        m_b = self.get_round_metrics(round_b).get(persona, {})
+
+        if not m_a or not m_b:
+            return {
+                "persona": persona,
+                "note": f"Could not compute drift: missing metrics for round {round_a} or {round_b}.",
+            }
+
         return {
             "persona": persona,
-            "drift": {
-                "cancel_rate": "-0.15 (decreased importance)",
-                "volume_concentration": "+0.08 (increased importance)"
-            }
+            "round_a": round_a,
+            "round_b": round_b,
+            "f1_delta": round(m_b.get("f1", 0) - m_a.get("f1", 0), 4),
+            "precision_delta": round(m_b.get("precision", 0) - m_a.get("precision", 0), 4),
+            "recall_delta": round(m_b.get("recall", 0) - m_a.get("recall", 0), 4),
+            "interpretation": (
+                "Negative f1_delta = detector got worse (evasion worked). "
+                "Positive = detector recovered."
+            ),
         }
-        
+
     def get_enforcement_notes(self, persona: str) -> str:
-        # Read from docs/enforcement_case_notes.md
-        # Returning a stub for prompt grounding
+        """Reads qualitative grounding from docs/enforcement_case_notes.md."""
+        notes_path = Path("docs/enforcement_case_notes.md")
+        if notes_path.exists():
+            content = notes_path.read_text(encoding="utf-8")
+            # Return the first section mentioning this persona
+            persona_keyword = persona.replace("_", " ")
+            lines = content.splitlines()
+            relevant = []
+            in_section = False
+            for line in lines:
+                if persona_keyword.lower() in line.lower():
+                    in_section = True
+                if in_section:
+                    relevant.append(line)
+                if in_section and len(relevant) > 20:
+                    break
+            if relevant:
+                return "\n".join(relevant[:20])
+
+        # Fallback hardcoded notes
         if "spoof" in persona.lower():
-            return "CFTC vs Navinder Sarao: Spoofer placed large passive orders away from best bid/ask to create false impression of supply, then cancelled before execution. Strategy: high cancel rate, large out-of-the-money orders."
+            return (
+                "CFTC vs Navinder Sarao: Spoofer placed large passive orders away "
+                "from best bid/ask to create false impression of supply, then cancelled "
+                "before execution. Key signal: high cancel rate, large out-of-the-money orders."
+            )
         return f"Enforcement notes for {persona}: Traders coordinated to falsely inflate volume."
 
     def propose_mutation(self, persona: str, parameters: dict) -> dict:
         """
-        Validates the proposed parameters and writes them to configs/persona_config.yaml.
+        Validates the proposed parameters and writes them to configs/persona_config.yaml
+        under the top-level persona key (separate from round_0 baseline).
         """
-        # 1. Validate
-        if "cancellation_delay_ticks" in parameters:
-            if not isinstance(parameters["cancellation_delay_ticks"], int) or parameters["cancellation_delay_ticks"] <= 0:
-                return {"error": "cancellation_delay_ticks must be a positive integer."}
-                
-        # 2. Write side-effect (mock logic)
         import yaml
-        from pathlib import Path
-        
+
+        # Validate types
+        if "cancellation_delay_ticks" in parameters:
+            if not isinstance(parameters["cancellation_delay_ticks"], (int, float)) or parameters["cancellation_delay_ticks"] <= 0:
+                return {"error": "cancellation_delay_ticks must be a positive number."}
+
         config_path = Path("configs/persona_config.yaml")
         existing = {}
         if config_path.exists():
             with open(config_path, "r") as f:
                 existing = yaml.safe_load(f) or {}
-                
+
         if persona not in existing:
             existing[persona] = {}
-            
+
         existing[persona].update(parameters)
-        
+
         with open(config_path, "w") as f:
-            yaml.dump(existing, f)
-            
+            yaml.dump(existing, f, default_flow_style=False)
+
         return {"status": "success", "message": f"Successfully mutated {persona} config."}
