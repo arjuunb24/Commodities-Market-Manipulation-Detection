@@ -59,6 +59,19 @@ def setup_logging(level: str | None = None) -> None:
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("numba").setLevel(logging.WARNING)
+    
+    # Suppress repetitive pipeline logs to keep the terminal dashboard clean
+    logging.getLogger("src.core.simulation").setLevel(logging.WARNING)
+    logging.getLogger("src.detector.features").setLevel(logging.WARNING)
+    logging.getLogger("src.detector.classifiers").setLevel(logging.WARNING)
+    logging.getLogger("src.detector.pipeline").setLevel(logging.WARNING)
+    logging.getLogger("src.detector.anomaly").setLevel(logging.WARNING)
+
+    import warnings
+    warnings.filterwarnings("ignore", category=FutureWarning, module="pandera.*")
+    
+    # Also explicitly set the environment variable just in case
+    os.environ["DISABLE_PANDERA_IMPORT_WARNING"] = "True"
 
 
 # Auto-configure on import

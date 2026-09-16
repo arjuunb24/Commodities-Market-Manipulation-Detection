@@ -205,6 +205,8 @@ class ToolRegistry:
             with open(config_path, "r") as f:
                 existing = yaml.safe_load(f) or {}
 
+        old_params = existing.get(persona, existing.get("round_0", {}).get(persona, {})).copy()
+
         if persona not in existing:
             existing[persona] = {}
 
@@ -213,4 +215,9 @@ class ToolRegistry:
         with open(config_path, "w") as f:
             yaml.dump(existing, f, default_flow_style=False)
 
-        return {"status": "success", "message": f"Successfully mutated {persona} config."}
+        return {
+            "status": "success", 
+            "message": f"Successfully mutated {persona} config.",
+            "old_params": old_params,
+            "new_params": existing[persona]
+        }

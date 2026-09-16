@@ -95,8 +95,25 @@ class RoundOrchestrator:
         self._run_simulation(test_dir, seed=self.sim_seed + round_num * 10 + 1)
 
         # Step 2: Load, train & score
-        logger.info(f"Round {round_num} — Training & scoring detector...")
-        X_train, y_train = self.pipeline.load_and_preprocess(train_dir)
+        logger.info(f"Round {round_num} — Training & scoring detector (Cumulative)...")
+        
+        import pandas as pd
+        X_train_list = []
+        y_train_list = []
+        for r in range(round_num + 1):
+            t_dir = self.master_run_dir / f"round_{r}" / "train"
+            X_r, y_r = self.pipeline.load_and_preprocess(t_dir)
+            if not X_r.empty:
+                X_train_list.append(X_r)
+                y_train_list.append(y_r)
+                
+        if X_train_list:
+            X_train = pd.concat(X_train_list)
+            y_train = pd.concat(y_train_list)
+        else:
+            X_train = pd.DataFrame()
+            y_train = pd.DataFrame()
+
         X_test, y_test = self.pipeline.load_and_preprocess(test_dir)
 
         if X_train.empty or X_test.empty:

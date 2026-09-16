@@ -17,41 +17,126 @@ import argparse
 import json
 import logging
 import sys
+import os
 from datetime import datetime, timezone
 from pathlib import Path
-
 import yaml
+
+# Suppress pandera warnings BEFORE importing any ML/data modules
+os.environ["DISABLE_PANDERA_IMPORT_WARNING"] = "True"
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="pandera.*")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from src.adversarial.orchestrator import RoundOrchestrator
-from src.adversarial.metrics import build_summary_table
-from src.agentic.adversarial_strategist import AdversarialStrategist
 from src.utils.logging_config import setup_logging
-
 setup_logging()
 logger = logging.getLogger(__name__)
 
+from src.adversarial.orchestrator import RoundOrchestrator
+from src.adversarial.metrics import build_summary_table
+from src.agentic.adversarial_strategist import AdversarialStrategist
 
-def print_metrics_table(summary_df):
+
+def print_metrics_table(summary_df, current_round: int = -1):
     """Prints a clean per-round, per-persona metrics table to the console."""
     if summary_df.empty:
         return
 
-    print("\n" + "=" * 72)
-    print(f"{'Round':<8} {'Persona':<20} {'Precision':>10} {'Recall':>8} {'F1':>8} {'FPR':>8}")
-    print("-" * 72)
+    if current_round >= 0:
+        print(f"\n" + "=" * 72)
+        print(f"📊 LIVE PIPELINE STATUS: ROUND {current_round}".center(72))
+        print("=" * 72)
 
-    for _, row in summary_df.iterrows():
-        # Highlight round boundaries
-        print(
-            f"{int(row['round']):<8} {row['persona']:<20} "
-            f"{row['precision']:>10.3f} {row['recall']:>8.3f} "
-            f"{row['f1']:>8.3f} {row['fpr']:>8.3f}"
-        )
+        baseline_df = summary_df[summary_df['round'] == 0]
+        if not baseline_df.empty:
+            print("\n[BASELINE METRICS - ROUND 0 (No LLM Mutations)]")
+            print(f"{'Persona':<20} {'Precision':>10} {'Recall':>8} {'F1':>8} {'FPR':>8}")
+            print("-" * 60)
+            for _, row in baseline_df.iterrows():
+                print(f"{row['persona']:<20} {row['precision']:>10.3f} {row['recall']:>8.3f} {row['f1']:>8.3f} {row['fpr']:>8.3f}")
 
-    print("=" * 72 + "\n")
+        if current_round > 0:
+            current_df = summary_df[summary_df['round'] == current_round]
+            if not current_df.empty:
+                print(f"\n[MUTATED METRICS - ROUND {current_round} (Post-LLM Mutations)]")
+                print(f"{'Persona':<20} {'Precision':>10} {'Recall':>8} {'F1':>8} {'FPR':>8}")
+                print("-" * 60)
+                for _, row in current_df.iterrows():
+                    print(f"{row['persona']:<20} {row['precision']:>10.3f} {row['recall']:>8.3f} {row['f1']:>8.3f} {row['fpr']:>8.3f}")
+
+        print("\n" + "=" * 72 + "\n")
+    else:
+        # Final full table print
+        print("\n" + "=" * 72)
+        print(f"{'Round':<8} {'Persona':<20} {'Precision':>10} {'Recall':>8} {'F1':>8} {'FPR':>8}")
+        print("-" * 72)
+
+        for _, row in summary_df.iterrows():
+            print(
+                f"{int(row['round']):<8} {row['persona']:<20} "
+                f"{row['precision']:>10.3f} {row['recall']:>8.3f} "
+                f"{row['f1']:>8.3f} {row['fpr']:>8.3f}"
+            )
+
+        print("=" * 72 + "\n")
+
+def print_parameter_dashboard(current_round: int):
+    """Reads persona_config.yaml and prints a historic parameter matrix for each persona."""
+    persona_config_path = REPO_ROOT / "configs" / "persona_config.yaml"
+    if not persona_config_path.exists():
+        return
+        
+    with open(persona_config_path) as f:
+        p_cfg = yaml.safe_load(f) or {}
+        
+    print("\n" + "*" * 72)
+    print(f"🛠️  PARAMETER EVOLUTION: UP TO ROUND {current_round}".center(72))
+    print("*" * 72)
+    
+    personas = ["spoofing", "wash_trading", "pump_and_dump"]
+    
+    for persona in personas:
+        # Collect all parameters ever used for this persona up to current_round
+        all_params = set()
+        for r in range(current_round + 1):
+            r_key = f"round_{r}"
+            # Fallback for LLM sometimes writing to top-level if it messes up structure
+            cfg_node = p_cfg.get(r_key, p_cfg)
+            if persona in cfg_node:
+                for param in cfg_node[persona].keys():
+                    if param not in ["enabled", "start_tick", "end_tick"]:
+                        all_params.add(param)
+        
+        if not all_params:
+            continue
+            
+        all_params = sorted(list(all_params))
+        
+        print(f"\n[{persona.upper()}]")
+        
+        # Header
+        header = f"{'Parameter':<28}"
+        for r in range(current_round + 1):
+            header += f" | R{r:<6}"
+        print(header)
+        print("-" * len(header))
+        
+        # Rows
+        for param in all_params:
+            row_str = f"{param:<28}"
+            for r in range(current_round + 1):
+                r_key = f"round_{r}"
+                cfg_node = p_cfg.get(r_key, p_cfg)
+                val = "-"
+                if persona in cfg_node:
+                    val = cfg_node[persona].get(param, "-")
+                row_str += f" | {str(val):<7}"
+            print(row_str)
+            
+    print("\n" + "*" * 72 + "\n")
+
 
 
 def main():
@@ -118,6 +203,10 @@ def main():
     # Main Loop
     # ----------------------------------------------------------------
     for round_num in range(args.rounds):
+        
+        # --- Step 0: Print Current Parameters ---
+        print_parameter_dashboard(round_num)
+        
         # --- Step 1: LLM Mutation (skip for Round 0 — it's the baseline) ---
         if round_num > 0:
             personas_to_mutate = (
@@ -139,6 +228,24 @@ def main():
                     logger.warning(f"LLM mutation failed: {result}. Using existing config.")
             except Exception as e:
                 logger.error(f"Strategist failed: {e}. Continuing with current config.")
+                
+            # --- Save History for Dashboard ---
+            persona_config_path = REPO_ROOT / "configs" / "persona_config.yaml"
+            if persona_config_path.exists():
+                with open(persona_config_path, "r") as f:
+                    p_cfg_hist = yaml.safe_load(f) or {}
+                
+                # Copy current top-level mutated parameters into round_{round_num} for historic tracking
+                p_cfg_hist[f"round_{round_num}"] = {}
+                for p_name in ["spoofing", "wash_trading", "pump_and_dump"]:
+                    if p_name in p_cfg_hist:
+                        p_cfg_hist[f"round_{round_num}"][p_name] = p_cfg_hist[p_name].copy()
+                        
+                with open(persona_config_path, "w") as f:
+                    yaml.dump(p_cfg_hist, f, default_flow_style=False)
+                    
+            # Print the NEWly mutated parameters
+            print_parameter_dashboard(round_num)
 
         # --- Step 2: Run the simulation + detector for this round ---
         logger.info(f"\nRound {round_num}: Running simulation + detection...")
@@ -150,7 +257,7 @@ def main():
 
         # --- Step 3: Print running summary ---
         summary_df = build_summary_table(orchestrator._all_metrics)
-        print_metrics_table(summary_df)
+        print_metrics_table(summary_df, round_num)
 
     # ----------------------------------------------------------------
     # Final output
@@ -160,6 +267,16 @@ def main():
     logger.info("PIPELINE COMPLETE")
     logger.info(f"Run directory: {master_run_dir}")
     logger.info(f"Cumulative metrics: {final_parquet}")
+    
+    # --- Auto-Visualize ---
+    try:
+        from scripts.visualize_results import plot_metrics
+        plot_path = plot_metrics(final_parquet)
+        if plot_path:
+            logger.info(f"📈 Performance graphs saved to: {plot_path}")
+    except Exception as e:
+        logger.error(f"Failed to generate graphs: {e}")
+        
     logger.info("=" * 60)
 
     # Print final table

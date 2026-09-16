@@ -14,8 +14,17 @@ from typing import Any
 
 import pandas as pd
 import numpy as np
+import networkx as nx
+import concurrent.futures
 
 logger = logging.getLogger(__name__)
+
+def _process_comm_parallel(args):
+    """Module-level function for multiprocessing to avoid pickling errors."""
+    comm, comm_trades, comm_orders, engine = args
+    df_feat = engine._process_single_commodity(comm_trades, comm_orders)
+    df_feat["commodity"] = comm
+    return df_feat
 
 class FeatureEngine:
     """
@@ -54,14 +63,20 @@ class FeatureEngine:
         # 2. Process per commodity to avoid bleeding states across assets
         commodities = set(t_df["commodity"].unique() if not t_df.empty else []) | set(o_df["commodity"].unique() if not o_df.empty else [])
         
-        all_features = []
+        args_list = []
         for comm in commodities:
             comm_trades = t_df[t_df["commodity"] == comm] if not t_df.empty else pd.DataFrame()
             comm_orders = o_df[o_df["commodity"] == comm] if not o_df.empty else pd.DataFrame()
+            args_list.append((comm, comm_trades, comm_orders, self))
             
-            df_feat = self._process_single_commodity(comm_trades, comm_orders)
-            df_feat["commodity"] = comm
-            all_features.append(df_feat)
+        all_features = []
+        import os
+        workers = min(len(commodities), os.cpu_count() or 4)
+        
+        # Maximize Ryzen CPU architecture by running fully distinct processes with pre-chunked data
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+            for df_feat in executor.map(_process_comm_parallel, args_list):
+                all_features.append(df_feat)
             
         if not all_features:
             return pd.DataFrame()
@@ -85,15 +100,19 @@ class FeatureEngine:
                 is_submit=(orders["event_type"] == "placed").astype(int),
                 is_cancel=(orders["event_type"] == "cancelled").astype(int),
                 submit_vol=np.where(orders["event_type"] == "placed", orders["quantity"], 0.0),
-                cancel_vol=np.where(orders["event_type"] == "cancelled", orders["quantity"], 0.0)
+                cancel_vol=np.where(orders["event_type"] == "cancelled", orders["quantity"], 0.0),
+                submit_buy_vol=np.where((orders["event_type"] == "placed") & (orders["side"] == "BUY"), orders["quantity"], 0.0),
+                submit_sell_vol=np.where((orders["event_type"] == "placed") & (orders["side"] == "SELL"), orders["quantity"], 0.0)
             ).resample(self.step).agg({
                 "is_submit": "sum",
                 "is_cancel": "sum",
                 "submit_vol": "sum",
-                "cancel_vol": "sum"
+                "cancel_vol": "sum",
+                "submit_buy_vol": "sum",
+                "submit_sell_vol": "sum"
             })
         else:
-            o_resampled = pd.DataFrame(columns=["is_submit", "is_cancel", "submit_vol", "cancel_vol"])
+            o_resampled = pd.DataFrame(columns=["is_submit", "is_cancel", "submit_vol", "cancel_vol", "submit_buy_vol", "submit_sell_vol"])
             
         # --- Trades Aggregation ---
         if not trades.empty:
@@ -117,6 +136,35 @@ class FeatureEngine:
             t_resampled["vwap"] = np.where(t_resampled["total_vol"] > 0, t_resampled["trade_val"] / t_resampled["total_vol"], np.nan)
             t_resampled["vwap"] = t_resampled["vwap"].ffill()
 
+            # --- SPOOFING Feature: L2 Distance to Mid ---
+            # Measures how far away cancelled orders are from the mid-price.
+            l2_features = []
+            if not orders.empty:
+                grouped_orders = orders.groupby(pd.Grouper(freq=self.step))
+                for step_time, grp in grouped_orders:
+                    mid_price = t_resampled["vwap"].get(step_time, np.nan)
+                    if pd.isna(mid_price):
+                        placed = grp[grp["event_type"] == "placed"]
+                        if not placed.empty:
+                            mid_price = placed["price"].mean()
+                            
+                    if pd.isna(mid_price) or mid_price == 0:
+                        l2_features.append({"timestamp": step_time, "avg_cancel_distance_to_mid": 0.0})
+                        continue
+                        
+                    cancelled = grp[grp["event_type"] == "cancelled"]
+                    if cancelled.empty:
+                        l2_features.append({"timestamp": step_time, "avg_cancel_distance_to_mid": 0.0})
+                        continue
+                        
+                    distances = np.abs(cancelled["price"] - mid_price) / mid_price
+                    l2_features.append({"timestamp": step_time, "avg_cancel_distance_to_mid": distances.mean()})
+                    
+                l2_df = pd.DataFrame(l2_features).set_index("timestamp")
+                o_resampled = o_resampled.join(l2_df)
+            else:
+                o_resampled["avg_cancel_distance_to_mid"] = 0.0
+
             # --- Custom volume concentration (Top K) ---
             def _top_k_concentration(grp):
                 if grp.empty or grp["quantity"].sum() == 0:
@@ -135,39 +183,51 @@ class FeatureEngine:
             conc.name = "volume_concentration"
             t_resampled = t_resampled.join(conc)
 
-            # --- WASH TRADING Feature 1: Top-K Circular Volume Ratio ---
-            # KEY FIX: Wash traders are only ~5% of total market volume.
-            # We identify the TOP-K traders by volume first, then compute
-            # circular volume ratio ONLY on those high-volume traders.
-            # A wash pair will dominate among the top-K active traders,
-            # and their circular volume will be ~1.0 (perfect round trips).
-            def _topk_circular_ratio(grp, k=5):
-                if grp.empty or grp["quantity"].sum() == 0:
-                    return 0.0
-                # Get the K traders with highest combined (buy+sell) volume
-                buys = grp.groupby("buyer_trader_id")["quantity"].sum()
-                sells = grp.groupby("seller_trader_id")["quantity"].sum()
-                combined = pd.concat([buys, sells]).groupby(level=0).sum()
-                top_traders = combined.nlargest(k).index
+            # --- WASH TRADING Feature 1: Stateful Graph-based Circular Volume Ratio ---
+            # Uses a time-decayed sliding window graph.
+            stateful_circ_ratio = []
+            if not trades.empty:
+                edges = {}
+                half_life_secs = 3600
+                cutoff_secs = 4 * 3600
                 
-                # Restrict to trades involving top-K traders
-                top_grp = grp[grp["buyer_trader_id"].isin(top_traders) | grp["seller_trader_id"].isin(top_traders)]
-                if top_grp.empty:
-                    return 0.0
-                
-                top_buys = top_grp.groupby("buyer_trader_id")["quantity"].sum()
-                top_sells = top_grp.groupby("seller_trader_id")["quantity"].sum()
-                common = top_buys.index.intersection(top_sells.index)
-                if common.empty:
-                    return 0.0
-                circ_vol = pd.DataFrame({"buys": top_buys[common], "sells": top_sells[common]}).min(axis=1).sum()
-                return circ_vol / max(top_grp["quantity"].sum(), 1)
-                
-            circ_ratio = trades.resample(self.step).apply(_topk_circular_ratio)
-            if isinstance(circ_ratio, pd.DataFrame):
-                 circ_ratio = circ_ratio.iloc[:, 0] if not circ_ratio.empty else pd.Series(dtype=float)
-            circ_ratio.name = "circular_volume_ratio"
-            t_resampled = t_resampled.join(circ_ratio)
+                grouped = trades.groupby(pd.Grouper(freq=self.step))
+                for step_time, grp in grouped:
+                    current_ts = step_time.timestamp()
+                    
+                    for _, row in grp.iterrows():
+                        b = row["buyer_trader_id"]
+                        s = row["seller_trader_id"]
+                        q = row["quantity"]
+                        t = row.name.timestamp() 
+                        edges.setdefault((b, s), []).append((t, q))
+                    
+                    G = nx.DiGraph()
+                    for (b, s), trade_list in list(edges.items()):
+                        valid_trades = [(t, q) for t, q in trade_list if current_ts - t <= cutoff_secs]
+                        if not valid_trades:
+                            del edges[(b, s)]
+                            continue
+                            
+                        edges[(b, s)] = valid_trades
+                        weight = sum(q * (0.5 ** ((current_ts - t) / half_life_secs)) for t, q in valid_trades)
+                        if weight > 0:
+                            G.add_edge(b, s, weight=weight)
+                        
+                    sccs = [c for c in nx.strongly_connected_components(G) if len(c) > 1]
+                    circular_vol = 0.0
+                    for scc in sccs:
+                        subgraph = G.subgraph(scc)
+                        circular_vol += sum(d["weight"] for u, v, d in subgraph.edges(data=True))
+                        
+                    total_vol_in_graph = sum(d["weight"] for u, v, d in G.edges(data=True))
+                    ratio = circular_vol / max(total_vol_in_graph, 1.0)
+                    stateful_circ_ratio.append({"timestamp": step_time, "stateful_circular_volume_ratio": ratio})
+                    
+                circ_df = pd.DataFrame(stateful_circ_ratio).set_index("timestamp")
+                t_resampled = t_resampled.join(circ_df)
+            else:
+                t_resampled["stateful_circular_volume_ratio"] = 0.0
 
             # --- WASH TRADING Feature 2: Min Net Position Ratio (Top-K) ---
             # KEY FIX: Same top-K strategy. For the K most active traders,
@@ -233,8 +293,23 @@ class FeatureEngine:
             if isinstance(size_cv, pd.DataFrame):
                  size_cv = size_cv.iloc[:, 0] if not size_cv.empty else pd.Series(dtype=float)
             size_cv.name = "trade_size_cv"
-
             t_resampled = t_resampled.join(size_cv)
+
+            # --- WASH TRADING Feature 5: Trade Time Uniformity (Coefficient of Variation) ---
+            def _trade_time_cv(grp):
+                if grp.empty or len(grp) < 3:
+                    return 1.0
+                diffs = grp.index.to_series().diff().dt.total_seconds().dropna()
+                mean_d = diffs.mean()
+                if mean_d == 0:
+                    return 0.0
+                return diffs.std() / mean_d
+
+            time_cv = trades.resample(self.step).apply(_trade_time_cv)
+            if isinstance(time_cv, pd.DataFrame):
+                 time_cv = time_cv.iloc[:, 0] if not time_cv.empty else pd.Series(dtype=float)
+            time_cv.name = "trade_time_cv"
+            t_resampled = t_resampled.join(time_cv)
         else:
             t_resampled = pd.DataFrame(columns=["total_vol", "buy_vol", "sell_vol", "trade_count", "volume_concentration"])
             
@@ -247,8 +322,9 @@ class FeatureEngine:
         rolled = combined.rolling(window=self.window, min_periods=1).sum()
         
         # These features are ratios so they should be averaged, not summed
-        for ratio_col in ["volume_concentration", "circular_volume_ratio",
-                          "net_position_ratio", "unique_counterparty_ratio", "trade_size_cv"]:
+        for ratio_col in ["volume_concentration", "stateful_circular_volume_ratio",
+                          "net_position_ratio", "unique_counterparty_ratio", "trade_size_cv", "trade_time_cv",
+                          "avg_cancel_distance_to_mid"]:
             if ratio_col in combined.columns:
                 rolled[ratio_col] = combined[ratio_col].rolling(window=self.window, min_periods=1).mean()
         
@@ -262,6 +338,12 @@ class FeatureEngine:
         features["trade_imbalance"] = np.where(rolled["total_vol"] > 0, 
                                                (rolled["buy_vol"] - rolled["sell_vol"]) / rolled["total_vol"], 
                                                0.0)
+        
+        # Order Book Imbalance Proxy
+        total_submit = rolled.get("submit_buy_vol", 0.0) + rolled.get("submit_sell_vol", 0.0)
+        features["order_book_imbalance"] = np.where(total_submit > 0, 
+                                                    (rolled.get("submit_buy_vol", 0.0) - rolled.get("submit_sell_vol", 0.0)) / total_submit, 
+                                                    0.0)
         features["volume_concentration"] = rolled.get("volume_concentration", 0.0)
         total_order_vol = rolled.get("submit_vol", 0.0) + rolled.get("cancel_vol", 0.0)
         features["cancel_volume_ratio"] = np.where(total_order_vol > 0, rolled.get("cancel_vol", 0.0) / total_order_vol, 0.0)
@@ -313,11 +395,14 @@ class FeatureEngine:
         else:
             features["max_cancel_ratio_topk"] = 0.0
 
+        features["avg_cancel_distance_to_mid"] = rolled.get("avg_cancel_distance_to_mid", 0.0)
+
         # --- Wash Trading Features ---
-        features["circular_volume_ratio"] = rolled.get("circular_volume_ratio", 0.0)
+        features["stateful_circular_volume_ratio"] = rolled.get("stateful_circular_volume_ratio", 0.0)
         features["net_position_ratio"] = rolled.get("net_position_ratio", 1.0)
         features["unique_counterparty_ratio"] = rolled.get("unique_counterparty_ratio", 1.0)
         features["trade_size_cv"] = rolled.get("trade_size_cv", 1.0)
+        features["trade_time_cv"] = rolled.get("trade_time_cv", 1.0)
         
         # --- Pump & Dump Features ---
         if "vwap" in combined.columns:
@@ -345,6 +430,11 @@ class FeatureEngine:
             rolling_mean_vol = vol_series.rolling(window=self.vol_spike_lookback, min_periods=1).mean().shift(1)
             rolling_mean_vol = rolling_mean_vol.fillna(vol_series).replace(0, 1.0)
             features["volume_spike_ratio"] = np.where(rolling_mean_vol > 0, vol_series / rolling_mean_vol, 1.0)
+            
+            # Multi-Timeframe Volume Spikes
+            rolling_mean_vol_long = vol_series.rolling(window=self.vol_spike_lookback * 3, min_periods=1).mean().shift(1)
+            rolling_mean_vol_long = rolling_mean_vol_long.fillna(vol_series).replace(0, 1.0)
+            features["long_volume_spike_ratio"] = np.where(rolling_mean_vol_long > 0, vol_series / rolling_mean_vol_long, 1.0)
             
             # abnormal_return_z: Z-score of (volume * abs_price_change) — academic gold-standard P&D signal
             abs_return = (vwap - prev_vwap).abs()
@@ -389,7 +479,9 @@ class FeatureEngine:
             features["price_volatility"] = 0.0
             features["price_return"] = 0.0
             features["volume_spike_ratio"] = 1.0
+            features["long_volume_spike_ratio"] = 1.0
             features["abnormal_return_z"] = 0.0
+            features["order_book_imbalance"] = 0.0
             features["topk_buy_imbalance"] = 0.5
         
         features = features.fillna(0.0)

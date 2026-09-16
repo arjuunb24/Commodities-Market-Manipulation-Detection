@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 # Features that are most informative for each persona's unsupervised detector
 WASH_TRADING_FEATURES = [
-    "circular_volume_ratio", "net_position_ratio",
+    "stateful_circular_volume_ratio", "net_position_ratio",
     "unique_counterparty_ratio", "trade_size_cv", "volume_concentration"
 ]
 

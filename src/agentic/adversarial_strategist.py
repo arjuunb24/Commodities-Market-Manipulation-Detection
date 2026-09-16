@@ -62,26 +62,26 @@ class AdversarialStrategist:
             f"We are on round {round_num}.",
             f"Please mutate the following personas: {', '.join(personas)}.",
             "",
-            "CRITICAL SCHEMA INFORMATION:",
-            "You MUST ONLY propose parameters that exist in the following schema. Any other keys will be completely ignored by the simulation engine:",
+            "CRITICAL SCHEMA INFORMATION AND REAL-WORLD CONSTRAINTS:",
+            "You MUST ONLY propose parameters that exist in the following schema. Mutations must be realistic. Over-mutating will make your trades unprofitable or obvious.",
             " - spoofing:",
-            "   * cancellation_delay_ticks (int, default 5, range 1 to 20)",
-            "   * order_size_multiplier (float, default 8.0, range 1.0 to 15.0)",
-            "   * frequency (float, default 0.4, range 0.05 to 1.0)",
-            "   * price_aggressiveness (float, default 0.003, range 0.0001 to 0.01)",
+            "   * cancellation_delay_ticks (int, range 1 to 20, default 5). Too low: order won't affect market. Too high: risk of execution.",
+            "   * order_size_multiplier (float, range 1.0 to 15.0, default 8.0). Too low: won't scare others. Too high: blatantly obvious to regulators.",
+            "   * frequency (float, range 0.05 to 1.0, default 0.4). High frequency flags anomaly detection.",
+            "   * price_aggressiveness (float, range 0.0001 to 0.01, default 0.003).",
             " - wash_trading:",
-            "   * trade_frequency (float, default 0.5, range 0.05 to 1.0)",
-            "   * price_deviation_from_mid (float, default 0.001, range 0.0001 to 0.01)",
-            "   * n_colluding_pairs (int, default 1, range 1 to 5)",
+            "   * trade_frequency (float, range 0.05 to 1.0, default 0.5). Highly frequent fixed intervals look like bots. Low frequency won't inflate volume.",
+            "   * price_deviation_from_mid (float, range 0.0001 to 0.01, default 0.001).",
+            "   * n_colluding_pairs (int, range 1 to 5, default 1).",
             " - pump_and_dump:",
-            "   * burst_duration_ticks (int, default 200, range 50 to 500)",
-            "   * n_coordinated_accounts (int, default 3, range 2 to 10)",
-            "   * dump_delay_ticks (int, default 100, range 10 to 300)",
-            "   * accumulation_size (int, default 150, range 50 to 500)",
+            "   * burst_duration_ticks (int, range 50 to 1000, default 200). A slow pump (e.g. 800) evades short-term volume detectors but requires more capital.",
+            "   * n_coordinated_accounts (int, range 2 to 15, default 3).",
+            "   * dump_delay_ticks (int, range 10 to 500, default 100).",
+            "   * accumulation_size (int, range 50 to 1000, default 150). Must be large enough to secure profit.",
             " - layering:",
-            "   * n_layers (int, default 4, range 2 to 8)",
-            "   * layer_spacing (float, default 0.002, range 0.0001 to 0.01)",
-            "   * cancellation_delay_ticks (int, default 3, range 1 to 20)",
+            "   * n_layers (int, range 2 to 8, default 4).",
+            "   * layer_spacing (float, range 0.0001 to 0.01, default 0.002).",
+            "   * cancellation_delay_ticks (int, range 1 to 20, default 3).",
             "",
             "Here is the context you need:",
             f"1. Current Metrics for Round {round_num}:",
@@ -152,8 +152,19 @@ class AdversarialStrategist:
                 if tool_call["function"]["name"] == "propose_mutation":
                     if "error" not in result:
                         args = json.loads(tool_call["function"]["arguments"])
-                        mutated_personas.add(args.get("persona"))
-                        logger.info(f"Mutation successfully proposed for {args.get('persona')}!")
+                        persona_name = args.get("persona")
+                        mutated_personas.add(persona_name)
+                        logger.info(f"Mutation successfully proposed for {persona_name}!")
+                        
+                        # Print the parameter diff to the console
+                        old_p = result.get("old_params", {})
+                        new_p = result.get("new_params", {})
+                        print(f"\n[{persona_name.upper()}] Adversarial Strategist Mutated Parameters:")
+                        for k, v in new_p.items():
+                            old_val = old_p.get(k, 'N/A')
+                            if old_val != v:
+                                print(f"  * {k}: {old_val} -> {v}")
+                        print("")
                     else:
                         logger.warning(f"Mutation validation failed: {result}")
                         

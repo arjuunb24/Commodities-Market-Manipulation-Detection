@@ -20,13 +20,13 @@ isolation_forest:
 # --- Supervised Layer: XGBoost (per-persona binary classifiers) ---
 xgboost:
   n_estimators: 300
-  max_depth: 5
+  max_depth: 3
   min_child_weight: 1
   n_estimators_small: 50
   max_depth_small: 2
   min_child_weight_small: 3
   learning_rate: 0.05
-  subsample: 0.8
+  subsample: 0.7
   colsample_bytree: 0.8
   gamma: 0.5
   reg_alpha: 0.1

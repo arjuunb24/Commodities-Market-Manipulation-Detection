@@ -1,3 +1,8 @@
+pump_and_dump:
+  accumulation_size: 200
+  burst_duration_ticks: 650
+  dump_delay_ticks: 220
+  n_coordinated_accounts: 7
 round_0:
   layering:
     cancellation_delay_ticks: 3
@@ -29,3 +34,72 @@ round_0:
     price_deviation_from_mid: 0.001
     start_tick: 1000
     trade_frequency: 0.5
+round_1:
+  pump_and_dump:
+    accumulation_size: 220
+    burst_duration_ticks: 550
+    dump_delay_ticks: 200
+    n_coordinated_accounts: 6
+  spoofing:
+    cancellation_delay_ticks: 9
+    frequency: 0.2
+    order_size_multiplier: 4.5
+    price_aggressiveness: 0.0015
+  wash_trading:
+    n_colluding_pairs: 3
+    price_deviation_from_mid: 0.002
+    trade_frequency: 0.25
+round_2:
+  pump_and_dump:
+    accumulation_size: 110
+    burst_duration_ticks: 650
+    dump_delay_ticks: 220
+    n_coordinated_accounts: 6
+  spoofing:
+    cancellation_delay_ticks: 9
+    frequency: 0.2
+    order_size_multiplier: 3.8
+    price_aggressiveness: 0.0018
+  wash_trading:
+    n_colluding_pairs: 3
+    price_deviation_from_mid: 0.0022
+    trade_frequency: 0.18
+round_3:
+  pump_and_dump:
+    accumulation_size: 250
+    burst_duration_ticks: 450
+    dump_delay_ticks: 220
+    n_coordinated_accounts: 6
+  spoofing:
+    cancellation_delay_ticks: 8
+    frequency: 0.25
+    order_size_multiplier: 5.5
+    price_aggressiveness: 0.002
+  wash_trading:
+    n_colluding_pairs: 3
+    price_deviation_from_mid: 0.0025
+    trade_frequency: 0.22
+round_4:
+  pump_and_dump:
+    accumulation_size: 200
+    burst_duration_ticks: 650
+    dump_delay_ticks: 220
+    n_coordinated_accounts: 7
+  spoofing:
+    cancellation_delay_ticks: 11
+    frequency: 0.22
+    order_size_multiplier: 4.8
+    price_aggressiveness: 0.0018
+  wash_trading:
+    n_colluding_pairs: 3
+    price_deviation_from_mid: 0.0022
+    trade_frequency: 0.25
+spoofing:
+  cancellation_delay_ticks: 11
+  frequency: 0.22
+  order_size_multiplier: 4.8
+  price_aggressiveness: 0.0018
+wash_trading:
+  n_colluding_pairs: 3
+  price_deviation_from_mid: 0.0022
+  trade_frequency: 0.25

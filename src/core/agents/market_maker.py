@@ -129,7 +129,7 @@ class MarketMaker(Agent):
 
         # Generate new ask
         ask_id = str(uuid.uuid4())
-        ask_price = round(skewed_mid + self.spread_ticks, 4)
+        ask_price = round(max(skewed_mid + self.spread_ticks, bid_price + 0.01), 4)
 
         # Do not quote if inventory is too extreme
         new_orders: list[Order] = []
