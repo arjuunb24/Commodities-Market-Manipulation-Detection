@@ -46,7 +46,7 @@ def print_metrics_table(summary_df, current_round: int = -1):
 
     if current_round >= 0:
         print(f"\n" + "=" * 72)
-        print(f"📊 LIVE PIPELINE STATUS: ROUND {current_round}".center(72))
+        print(f"[*] LIVE PIPELINE STATUS: ROUND {current_round}".center(72))
         print("=" * 72)
 
         baseline_df = summary_df[summary_df['round'] == 0]
@@ -92,7 +92,7 @@ def print_parameter_dashboard(current_round: int):
         p_cfg = yaml.safe_load(f) or {}
         
     print("\n" + "*" * 72)
-    print(f"🛠️  PARAMETER EVOLUTION: UP TO ROUND {current_round}".center(72))
+    print(f"[*] PARAMETER EVOLUTION: UP TO ROUND {current_round}".center(72))
     print("*" * 72)
     
     personas = ["spoofing", "wash_trading", "pump_and_dump"]
@@ -204,8 +204,9 @@ def main():
     # ----------------------------------------------------------------
     for round_num in range(args.rounds):
         
-        # --- Step 0: Print Current Parameters ---
-        print_parameter_dashboard(round_num)
+        # --- Step 0: Print Baseline Parameters for Round 0 ---
+        if round_num == 0:
+            print_parameter_dashboard(round_num)
         
         # --- Step 1: LLM Mutation (skip for Round 0 — it's the baseline) ---
         if round_num > 0:
@@ -220,6 +221,18 @@ def main():
                     round_num=round_num - 1,  # Strategist reads the PREVIOUS round's metrics
                     personas=personas_to_mutate,
                 )
+                
+                # --- Print and Log Reasoning ---
+                reasonings = result.get("reasoning", {})
+                if reasonings:
+                    reasoning_log_path = master_run_dir / "llm_reasoning.log"
+                    with open(reasoning_log_path, "a") as rf:
+                        rf.write(f"\n{'='*60}\nROUND {round_num} STRATEGIST REASONING\n{'='*60}\n")
+                        for persona, rationale in reasonings.items():
+                            formatted_reasoning = f"\n[{persona.upper()}]\n{rationale}\n"
+                            print(formatted_reasoning)
+                            rf.write(formatted_reasoning)
+                            
                 if result.get("status") == "success":
                     logger.info(f"LLM mutation applied for {personas_to_mutate} in Round {round_num}!")
                 elif result.get("status") == "partial_success":
@@ -273,7 +286,7 @@ def main():
         from scripts.visualize_results import plot_metrics
         plot_path = plot_metrics(final_parquet)
         if plot_path:
-            logger.info(f"📈 Performance graphs saved to: {plot_path}")
+            logger.info(f"[+] Performance graphs saved to: {plot_path}")
     except Exception as e:
         logger.error(f"Failed to generate graphs: {e}")
         

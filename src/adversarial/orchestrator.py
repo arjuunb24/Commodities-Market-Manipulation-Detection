@@ -88,11 +88,16 @@ class RoundOrchestrator:
         test_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info("=" * 60)
-        logger.info(f"ROUND {round_num} — Simulating market (Training data)...")
-        self._run_simulation(train_dir, seed=self.sim_seed + round_num * 10)
+        logger.info(f"ROUND {round_num} — Simulating market (Training and Testing data concurrently)...")
         
-        logger.info(f"ROUND {round_num} — Simulating market (Testing data)...")
-        self._run_simulation(test_dir, seed=self.sim_seed + round_num * 10 + 1)
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            future_train = executor.submit(self._run_simulation, train_dir, self.sim_seed + round_num * 10)
+            future_test = executor.submit(self._run_simulation, test_dir, self.sim_seed + round_num * 10 + 1)
+            
+            # Wait for both to complete
+            future_train.result()
+            future_test.result()
 
         # Step 2: Load, train & score
         logger.info(f"Round {round_num} — Training & scoring detector (Cumulative)...")

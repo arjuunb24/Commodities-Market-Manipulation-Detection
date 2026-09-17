@@ -14,10 +14,19 @@ from src.agentic.tools import STRATEGIST_TOOLS, ToolRegistry, PROPOSE_MUTATION_S
 
 logger = logging.getLogger(__name__)
 
-STRATEGIST_SYSTEM_PROMPT = """You are an Adversarial Strategist agent. Your goal is to mutate a 
-manipulation persona's parameters so that it evades our ML detection model in the next simulation round.
-You will be provided with the current round metrics, SHAP drift analysis, and enforcement notes.
-You MUST call `propose_mutation` to lock in your final config change based on this provided context.
+STRATEGIST_SYSTEM_PROMPT = """You are an Adversarial Strategist agent playing a high-stakes cat-and-mouse game against an ML detection model.
+Your goal is to mutate a manipulation persona's parameters so that it evades our ML detection model in the next simulation round.
+You must make the manipulations tougher and harder to detect at every round by learning from past rounds' metrics and failed parameters.
+You will be provided with the current round metrics, historical parameters that failed, SHAP drift analysis, and CFTC enforcement notes.
+Draw inspiration from real CFTC enforcement case notes to find new angles of attack. Do NOT repeat past failed parameters.
+You MUST call `propose_mutation` to lock in your final config change based on this provided context, and provide detailed step-by-step reasoning.
+
+CRITICAL FORMATTING INSTRUCTION: In the `reasoning` field of the `propose_mutation` tool, you MUST format your reasoning as a clean, easily readable numbered list where each number explicitly justifies a specific parameter change.
+Example format:
+"In Round [X], [Persona] was detected due to [Reason]. To evade detection:
+1. Increased/Decreased `parameter_name` from [Old] to [New]: [Explanation for why this evades detection].
+2. Increased/Decreased `another_parameter` from [Old] to [New]: [Explanation...]"
+Do NOT output a single massive paragraph. Use newlines to separate the numbered items.
 """
 
 class AdversarialStrategist:
@@ -25,7 +34,7 @@ class AdversarialStrategist:
         self.config = config
         self.client = LLMClient(config, run_dir=run_dir)
         self.tools = ToolRegistry(run_dir=run_dir)  # ← real disk reads when run_dir is set
-        self.max_tool_calls = config.get("max_tool_calls", 6)
+        self.max_tool_calls = config.get("max_tool_calls", 15)
 
 
     def _execute_tool_call(self, tool_call: dict) -> dict:
@@ -58,6 +67,18 @@ class AdversarialStrategist:
         # Pre-fetch context to save API calls
         current_metrics = self.tools.get_round_metrics(round_num)
         
+        # Pre-fetch historical parameters
+        import yaml
+        from pathlib import Path
+        config_path = Path("configs/persona_config.yaml")
+        historical_params = {}
+        if config_path.exists():
+            with open(config_path, "r") as f:
+                p_cfg = yaml.safe_load(f) or {}
+                for k, v in p_cfg.items():
+                    if k.startswith("round_"):
+                        historical_params[k] = v
+        
         context_parts = [
             f"We are on round {round_num}.",
             f"Please mutate the following personas: {', '.join(personas)}.",
@@ -86,6 +107,9 @@ class AdversarialStrategist:
             "Here is the context you need:",
             f"1. Current Metrics for Round {round_num}:",
             json.dumps(current_metrics, indent=2),
+            "",
+            f"2. Historical Parameters Used in Past Rounds (DO NOT REPEAT FAILED CONFIGURATIONS):",
+            json.dumps(historical_params, indent=2),
             ""
         ]
         
@@ -113,6 +137,7 @@ class AdversarialStrategist:
         ]
         
         mutated_personas = set()
+        reasoning_log = {}
         
         for i in range(self.max_tool_calls):
             logger.debug(f"[Strategist] Agent iteration {i+1}/{self.max_tool_calls}")
@@ -159,6 +184,9 @@ class AdversarialStrategist:
                         # Print the parameter diff to the console
                         old_p = result.get("old_params", {})
                         new_p = result.get("new_params", {})
+                        reasoning = result.get("reasoning", "No reasoning provided.")
+                        reasoning_log[persona_name] = reasoning
+                        
                         print(f"\n[{persona_name.upper()}] Adversarial Strategist Mutated Parameters:")
                         for k, v in new_p.items():
                             old_val = old_p.get(k, 'N/A')
@@ -170,11 +198,11 @@ class AdversarialStrategist:
                         
             if mutated_personas.issuperset(set(personas)):
                 logger.info("All requested personas successfully mutated!")
-                return {"status": "success", "rounds": i+1}
+                return {"status": "success", "rounds": i+1, "reasoning": reasoning_log}
                         
         if mutated_personas:
             logger.warning(f"[Strategist] Max tool calls reached. Mutated: {mutated_personas}, Missing: {set(personas) - mutated_personas}")
-            return {"status": "partial_success", "mutated": list(mutated_personas)}
+            return {"status": "partial_success", "mutated": list(mutated_personas), "reasoning": reasoning_log}
 
         logger.error("[Strategist] Max tool calls reached without a valid mutation. Falling back to mutation_library.py.")
-        return {"status": "fallback", "reason": "max_tool_calls_reached"}
+        return {"status": "fallback", "reason": "max_tool_calls_reached", "reasoning": reasoning_log}

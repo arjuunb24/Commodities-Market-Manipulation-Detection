@@ -1,8 +1,8 @@
 pump_and_dump:
-  accumulation_size: 200
-  burst_duration_ticks: 650
-  dump_delay_ticks: 220
-  n_coordinated_accounts: 7
+  accumulation_size: 130
+  burst_duration_ticks: 880
+  dump_delay_ticks: 420
+  n_coordinated_accounts: 12
 round_0:
   layering:
     cancellation_delay_ticks: 3
@@ -37,69 +37,84 @@ round_0:
 round_1:
   pump_and_dump:
     accumulation_size: 220
-    burst_duration_ticks: 550
-    dump_delay_ticks: 200
-    n_coordinated_accounts: 6
+    burst_duration_ticks: 600
+    dump_delay_ticks: 250
+    n_coordinated_accounts: 7
   spoofing:
     cancellation_delay_ticks: 9
-    frequency: 0.2
-    order_size_multiplier: 4.5
+    frequency: 0.18
+    order_size_multiplier: 4
     price_aggressiveness: 0.0015
   wash_trading:
     n_colluding_pairs: 3
-    price_deviation_from_mid: 0.002
-    trade_frequency: 0.25
+    price_deviation_from_mid: 0.0004
+    trade_frequency: 0.15
 round_2:
   pump_and_dump:
-    accumulation_size: 110
-    burst_duration_ticks: 650
-    dump_delay_ticks: 220
-    n_coordinated_accounts: 6
+    accumulation_size: 180
+    burst_duration_ticks: 750
+    dump_delay_ticks: 320
+    n_coordinated_accounts: 9
   spoofing:
-    cancellation_delay_ticks: 9
-    frequency: 0.2
-    order_size_multiplier: 3.8
-    price_aggressiveness: 0.0018
+    cancellation_delay_ticks: 12
+    frequency: 0.1
+    order_size_multiplier: 2.5
+    price_aggressiveness: 0.0008
   wash_trading:
-    n_colluding_pairs: 3
-    price_deviation_from_mid: 0.0022
-    trade_frequency: 0.18
+    n_colluding_pairs: 5
+    price_deviation_from_mid: 0.0008
+    trade_frequency: 0.08
 round_3:
   pump_and_dump:
-    accumulation_size: 250
-    burst_duration_ticks: 450
-    dump_delay_ticks: 220
-    n_coordinated_accounts: 6
+    accumulation_size: 180
+    burst_duration_ticks: 750
+    dump_delay_ticks: 320
+    n_coordinated_accounts: 9
   spoofing:
-    cancellation_delay_ticks: 8
-    frequency: 0.25
-    order_size_multiplier: 5.5
-    price_aggressiveness: 0.002
+    cancellation_delay_ticks: 12
+    frequency: 0.1
+    order_size_multiplier: 2.5
+    price_aggressiveness: 0.0008
   wash_trading:
-    n_colluding_pairs: 3
-    price_deviation_from_mid: 0.0025
-    trade_frequency: 0.22
+    n_colluding_pairs: 5
+    price_deviation_from_mid: 0.0008
+    trade_frequency: 0.08
 round_4:
   pump_and_dump:
-    accumulation_size: 200
-    burst_duration_ticks: 650
-    dump_delay_ticks: 220
-    n_coordinated_accounts: 7
+    accumulation_size: 130
+    burst_duration_ticks: 880
+    dump_delay_ticks: 420
+    n_coordinated_accounts: 12
   spoofing:
-    cancellation_delay_ticks: 11
-    frequency: 0.22
-    order_size_multiplier: 4.8
-    price_aggressiveness: 0.0018
+    cancellation_delay_ticks: 16
+    frequency: 0.06
+    order_size_multiplier: 1.8
+    price_aggressiveness: 0.0004
   wash_trading:
-    n_colluding_pairs: 3
-    price_deviation_from_mid: 0.0022
-    trade_frequency: 0.25
+    n_colluding_pairs: 4
+    price_deviation_from_mid: 0.0002
+    trade_frequency: 0.06
+round_5:
+  pump_and_dump:
+    accumulation_size: 130
+    burst_duration_ticks: 880
+    dump_delay_ticks: 420
+    n_coordinated_accounts: 12
+  spoofing:
+    cancellation_delay_ticks: 16
+    frequency: 0.06
+    order_size_multiplier: 1.8
+    price_aggressiveness: 0.0004
+  wash_trading:
+    n_colluding_pairs: 4
+    price_deviation_from_mid: 0.0002
+    trade_frequency: 0.06
 spoofing:
-  cancellation_delay_ticks: 11
-  frequency: 0.22
-  order_size_multiplier: 4.8
-  price_aggressiveness: 0.0018
+  cancellation_delay_ticks: 16
+  frequency: 0.06
+  order_size_multiplier: 1.8
+  price_aggressiveness: 0.0004
 wash_trading:
-  n_colluding_pairs: 3
-  price_deviation_from_mid: 0.0022
-  trade_frequency: 0.25
+  n_colluding_pairs: 4
+  price_deviation_from_mid: 0.0002
+  trade_frequency: 0.06

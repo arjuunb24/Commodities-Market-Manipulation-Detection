@@ -88,9 +88,13 @@ PROPOSE_MUTATION_SCHEMA = {
                 "parameters": {
                     "type": "object",
                     "description": "The mutated parameter dictionary (e.g., {'cancellation_delay_ticks': 10})"
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "Provide a detailed, step-by-step chain of thought explaining WHY you chose these specific parameters. Reference CFTC case notes and previous round metrics to justify how this mutation will make it harder for the detector."
                 }
             },
-            "required": ["persona", "parameters"]
+            "required": ["persona", "parameters", "reasoning"]
         }
     }
 }
@@ -187,7 +191,7 @@ class ToolRegistry:
             )
         return f"Enforcement notes for {persona}: Traders coordinated to falsely inflate volume."
 
-    def propose_mutation(self, persona: str, parameters: dict) -> dict:
+    def propose_mutation(self, persona: str, parameters: dict, reasoning: str = "") -> dict:
         """
         Validates the proposed parameters and writes them to configs/persona_config.yaml
         under the top-level persona key (separate from round_0 baseline).
@@ -219,5 +223,6 @@ class ToolRegistry:
             "status": "success", 
             "message": f"Successfully mutated {persona} config.",
             "old_params": old_params,
-            "new_params": existing[persona]
+            "new_params": existing[persona],
+            "reasoning": reasoning
         }
