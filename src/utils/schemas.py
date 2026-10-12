@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from enum import Enum
 
+import numpy as np
 import pandas as pd
 import pandera as pa
 from pandera.typing import Series
@@ -196,10 +197,10 @@ class ManipulationEventsSchema(pa.DataFrameModel):
     @pa.dataframe_check
     @classmethod
     def trader_ids_are_lists(cls, df: pd.DataFrame) -> bool:
-        """trader_ids column must contain list objects, not scalars."""
+        """trader_ids column must contain list or array-like objects, not scalars."""
         if df.empty:
             return True
-        return bool(df["trader_ids"].apply(lambda x: isinstance(x, list)).all())
+        return bool(df["trader_ids"].apply(lambda x: isinstance(x, (list, np.ndarray))).all())
 
     @pa.dataframe_check
     @classmethod

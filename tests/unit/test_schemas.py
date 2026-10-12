@@ -93,3 +93,28 @@ def test_manipulation_events_schema_empty_valid() -> None:
         "parameters": object,
     })
     ManipulationEventsSchema.validate(df)
+
+
+def test_manipulation_events_schema_accepts_numpy_array_trader_ids() -> None:
+    import numpy as np
+    df = pd.DataFrame([{
+        "event_id": "e1",
+        "commodity": "gold",
+        "persona": "spoofing",
+        "start_tick": 10,
+        "end_tick": 50,
+        "trader_ids": np.array(["trader_1", "trader_2"]),
+        "parameters": {"depth": 5},
+    }])
+    df = df.astype({
+        "event_id": str,
+        "commodity": str,
+        "persona": str,
+        "start_tick": "int64",
+        "end_tick": "int64",
+        "trader_ids": object,
+        "parameters": object,
+    })
+    validated = ManipulationEventsSchema.validate(df)
+    assert len(validated) == 1
+

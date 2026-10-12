@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import numpy as np
 
 from src.adversarial.metrics import (
     compute_round_metrics,
@@ -170,8 +171,15 @@ class RoundOrchestrator:
                 cum_dir.mkdir(parents=True, exist_ok=True)
                 io_utils.write_parquet(pd.concat(all_trades, ignore_index=True), cum_dir / "trade_log.parquet", "trade_log", overwrite=True)
                 io_utils.write_parquet(pd.concat(all_orders, ignore_index=True), cum_dir / "order_log.parquet", "order_log", overwrite=True)
-                io_utils.write_parquet(pd.concat(all_manips, ignore_index=True), cum_dir / "manipulation_events.parquet", "manipulation_events", overwrite=True)
-                io_utils.write_parquet(pd.concat(all_bars, ignore_index=True), cum_dir / "ohlcv_bars.parquet", "ohlcv_bars", overwrite=True)
+                if all_manips:
+                    final_manips = pd.concat(all_manips, ignore_index=True)
+                    if not final_manips.empty and "trader_ids" in final_manips.columns:
+                        final_manips["trader_ids"] = final_manips["trader_ids"].apply(
+                            lambda x: list(x) if isinstance(x, (list, np.ndarray)) else [x] if pd.notna(x) else []
+                        )
+                    io_utils.write_parquet(final_manips, cum_dir / "manipulation_events.parquet", "manipulation_events", overwrite=True)
+                if all_bars:
+                    io_utils.write_parquet(pd.concat(all_bars, ignore_index=True), cum_dir / "ohlcv_bars.parquet", "ohlcv_bars", overwrite=True)
 
     def get_metrics_for_round(self, round_num: int) -> dict[str, dict[str, float]]:
         """Reads metrics for a specific round from disk (used by tools.py)."""
