@@ -81,7 +81,7 @@ class PumpDumpAccount(Agent):
         self.end_tick = end_tick
         
         # Target total inventory to accumulate before stopping
-        self.accumulation_size = int(self.rng.integers(50000, 100000))
+        self.accumulation_size = int(self.rng.integers(300, 750))
         self.phase = PumpPhase.HOLD
         self.net_inventory: int = 0
 
@@ -108,10 +108,10 @@ class PumpDumpAccount(Agent):
             if self.net_inventory >= self.accumulation_size:
                 return None  # already fully accumulated
 
-            # Buy aggressively, pushing the price up
+            # Buy aggressively, pushing the price up with realistic lot sizing
             buy_price = round(ref_price * (1 + self.price_aggression), 4)
             buy_qty = min(
-                int(self.rng.integers(500, 1000)),
+                int(self.rng.integers(20, 50)),
                 self.accumulation_size - self.net_inventory,
             )
 
@@ -129,10 +129,10 @@ class PumpDumpAccount(Agent):
             if self.net_inventory <= 0:
                 return None  # nothing left to sell
 
-            # Sell aggressively to lock in profits
+            # Sell aggressively to lock in profits with realistic lot sizing
             sell_price = round(ref_price * (1 - self.price_aggression), 4)
             sell_qty = min(
-                int(self.rng.integers(1000, 5000)),
+                int(self.rng.integers(25, 65)),
                 self.net_inventory,
             )
 

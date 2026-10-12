@@ -85,15 +85,16 @@ class MeanReversionTrader(Agent):
         if abs(deviation) < self.reversion_threshold:
             return None  # price is close enough to fundamental; no action
 
-        # --- Fade the move ---
+        # --- Fade the move with relative price scaling ---
+        step = ref_price * self.rng.uniform(0.0005, 0.003)
         if deviation > 0:
             # Price above fundamental → sell (fade the overvaluation)
             side = Side.SELL
-            price = ref_price - self.rng.uniform(0, 0.3)
+            price = ref_price - step
         else:
             # Price below fundamental → buy (fade the undervaluation)
             side = Side.BUY
-            price = ref_price + self.rng.uniform(0, 0.3)
+            price = ref_price + step
 
         price = round(max(price, 0.01), 4)
 

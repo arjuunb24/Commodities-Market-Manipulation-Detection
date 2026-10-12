@@ -119,8 +119,14 @@ class MarketMaker(Agent):
         if self._pending_ask_id is not None:
             cancel_ids.append(self._pending_ask_id)
 
-        # Inventory skew: shift the ref_price slightly to discourage inventory accumulation
-        skew = self.inventory_skew_factor * self.net_inventory
+        # Inventory decay / macro re-hedging: smoothly unwind inventory over time
+        if self.net_inventory != 0 and self.rng.random() < 0.25:
+            self.net_inventory = int(self.net_inventory * 0.95)
+
+        # Inventory skew: bounded shift relative to reference price to avoid negative quotes
+        raw_skew = self.inventory_skew_factor * self.net_inventory
+        max_allowed_skew = ref_price * 0.04  # Cap skew at 4% of price
+        skew = np.clip(raw_skew * 0.01 * ref_price, -max_allowed_skew, max_allowed_skew)
         skewed_mid = ref_price - skew  # positive inventory → skew bids down, asks down
 
         # Generate new bid

@@ -109,6 +109,30 @@ FALLBACK_VOLUME_PARAMS = {
     "corn": VolumeParams(mean_daily_volume=3500, volume_cv=0.45),
 }
 
+# Empirical market baseline prices (USD)
+COMMODITY_INITIAL_PRICES = {
+    "crude_oil_wti": 75.0,
+    "brent_crude": 82.0,
+    "gold": 2400.0,
+    "silver": 28.5,
+    "natural_gas": 2.50,
+    "copper": 4.20,
+    "wheat": 5.80,
+    "corn": 4.30,
+}
+
+# Commodity-specific persona vulnerability profiles (affinity weights)
+COMMODITY_PERSONA_PROFILES = {
+    "gold":          {"spoofing": 0.45, "layering": 0.35, "pump_and_dump": 0.10, "wash_trading": 0.10},
+    "silver":        {"pump_and_dump": 0.40, "spoofing": 0.35, "layering": 0.15, "wash_trading": 0.10},
+    "crude_oil_wti": {"wash_trading": 0.40, "spoofing": 0.35, "layering": 0.15, "pump_and_dump": 0.10},
+    "brent_crude":   {"spoofing": 0.40, "wash_trading": 0.30, "layering": 0.20, "pump_and_dump": 0.10},
+    "natural_gas":   {"pump_and_dump": 0.45, "spoofing": 0.35, "wash_trading": 0.10, "layering": 0.10},
+    "copper":        {"wash_trading": 0.40, "layering": 0.30, "spoofing": 0.20, "pump_and_dump": 0.10},
+    "wheat":         {"wash_trading": 0.45, "pump_and_dump": 0.30, "spoofing": 0.15, "layering": 0.10},
+    "corn":          {"wash_trading": 0.40, "spoofing": 0.30, "pump_and_dump": 0.20, "layering": 0.10},
+}
+
 
 # ===========================================================================
 # CalibrationEngine

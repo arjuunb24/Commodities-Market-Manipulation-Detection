@@ -24,15 +24,13 @@ Architecture:
 from __future__ import annotations
 
 import logging
-import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
-import yaml
 
 from src.core.agents.base import Agent
 from src.core.agents.manipulation.layering import LayeringAgent
@@ -43,8 +41,8 @@ from src.core.agents.market_maker import MarketMaker
 from src.core.agents.mean_reversion_trader import MeanReversionTrader
 from src.core.agents.momentum_trader import MomentumTrader
 from src.core.agents.noise_trader import NoiseTrader
-from src.core.calibration import CalibrationEngine
-from src.core.order_book import BookState, Order, OrderBook, Trade
+from src.core.calibration import COMMODITY_INITIAL_PRICES, COMMODITY_PERSONA_PROFILES
+from src.core.order_book import BookState, Order, OrderBook, Side, Trade
 from src.utils import io as io_utils
 from src.utils.logging_config import setup_logging
 
@@ -69,9 +67,20 @@ class SimConfig:
     commodity: str = "gold"
     n_ticks: int = 10_000
     ticks_per_bar: int = 100
-    fundamental_value_initial: float = 100.0
+    fundamental_value_initial: float | None = None
     fundamental_value_drift: float = 0.0001
     fundamental_value_vol: float = 0.002
+    tick_offset: int = 0
+
+    # Optional explicit window overrides (used by tests and targeted scenarios)
+    spoof_start_tick: int | None = None
+    spoof_end_tick: int | None = None
+    wash_start_tick: int | None = None
+    wash_end_tick: int | None = None
+    pnd_start_tick: int | None = None
+    pnd_end_tick: int | None = None
+    layer_start_tick: int | None = None
+    layer_end_tick: int | None = None
 
     # Agent population (counts)
     n_noise_traders: int = 20
@@ -153,13 +162,12 @@ class SimulationOutput:
 
 class FundamentalValueProcess:
     """
-    Slow random walk modelling the 'true' underlying commodity value.
+    Random walk modelling the 'true' underlying commodity value with Merton jump diffusion.
 
     The fundamental value is provided as an exogenous signal to
     MeanReversionTrader agents each tick. It is NOT the market price.
 
-    Driven by: V_{t+1} = V_t * exp(drift + vol * Z_t)  where Z_t ~ N(0,1)
-    This is a simple GBM with very low volatility — intentionally slow-moving.
+    Driven by: V_{t+1} = V_t * exp(drift + vol * Z_t + Jump_t)
     """
 
     def __init__(
@@ -175,9 +183,13 @@ class FundamentalValueProcess:
         self.rng = rng
 
     def step(self) -> float:
-        """Advance by one tick and return the new fundamental value."""
+        """Advance by one tick with occasional macro/inventory jump shocks."""
         shock = self.rng.standard_normal()
-        self.value *= np.exp(self.drift + self.volatility * shock)
+        jump = 0.0
+        # ~0.8% probability of a discrete macro surprise shock
+        if self.rng.random() < 0.008:
+            jump = self.rng.standard_normal() * (self.volatility * 3.5)
+        self.value *= np.exp(self.drift + self.volatility * shock + jump)
         return self.value
 
 
@@ -192,17 +204,18 @@ def _build_agents(
 ) -> tuple[list[Agent], list[Any], list[dict]]:
     """
     Instantiate all agents and manipulation controllers.
-
-    Returns:
-        agents: All individual Agent instances (legitimate + manipulation)
-        controllers: Manipulation controller objects (PumpDumpCoalition, WashTradingPair, etc.)
-                     that the simulation loop must call .update_phase() or .get_cancels() on.
-        manipulation_event_rows: Pre-populated manipulation_events rows from controllers.
-
-    Each agent and controller gets its own independent sub-generator via rng.spawn(1)[0].
+    Dynamically tailors malicious persona distribution, window timing, durations,
+    and intensities to the specific commodity asset class.
     """
-    # Spawn a pool of sub-generators — one per entity needing randomness
-    # Conservative count: 50 agents + 10 controllers
+    init_price = config.fundamental_value_initial
+    if init_price is None or init_price == 100.0:
+        init_price = COMMODITY_INITIAL_PRICES.get(config.commodity, 100.0)
+
+    # Dynamically scale spreads and noise trader price offsets to asset price
+    scaled_mm_spread = max(0.01, round(init_price * 0.0015, 4))
+    scaled_noise_offset = max(0.01, round(init_price * 0.002, 4))
+
+    # Spawn a pool of sub-generators
     sub_rngs = iter(master_rng.spawn(100))
 
     agents: list[Agent] = []
@@ -214,7 +227,7 @@ def _build_agents(
         agents.append(NoiseTrader(
             f"noise_{i}", next(sub_rngs),
             arrival_rate_lambda=config.noise_lambda,
-            price_offset_ticks=config.noise_price_offset_ticks,
+            price_offset_ticks=scaled_noise_offset,
         ))
 
     for i in range(config.n_momentum_traders):
@@ -235,30 +248,152 @@ def _build_agents(
     for i in range(config.n_market_makers):
         agents.append(MarketMaker(
             f"mm_{i}", next(sub_rngs),
-            spread_ticks=config.market_maker_spread,
+            spread_ticks=scaled_mm_spread,
             arrival_rate_lambda=config.market_maker_lambda,
         ))
 
     # --- Manipulation personas (Dynamic Spawning) ---
-    # We dynamically calculate how many episodes to run based on total n_ticks.
-    # We aim for roughly 1 episode of each type per 5000 ticks.
-    n_episodes = max(1, config.n_ticks // 5000)
-    
-    def _get_random_window(window_size: int = 2000) -> tuple[int, int]:
-        # Ensure we have enough ticks to place the window
-        max_start = max(0, config.n_ticks - window_size - 100)
-        start = master_rng.integers(0, max_start + 1)
-        return int(start), int(start + window_size)
+    has_explicit_override = any(
+        v is not None for v in [
+            config.spoof_start_tick, config.wash_start_tick,
+            config.pnd_start_tick, config.layer_start_tick,
+        ]
+    )
 
-    if config.enable_spoofing:
-        for i in range(n_episodes):
-            start, end = _get_random_window(2000)
+    if has_explicit_override:
+        # Honor explicit test fixtures and CLI overrides
+        if config.enable_spoofing:
+            start = config.spoof_start_tick if config.spoof_start_tick is not None else 100
+            end = config.spoof_end_tick if config.spoof_end_tick is not None else start + 200
             spoofer = SpoofingAgent(
-                f"spoofer_{i}", next(sub_rngs),
+                "spoofer_0", next(sub_rngs),
                 order_size_multiplier=config.spoof_size_multiplier,
                 cancellation_delay_ticks=config.spoof_cancel_delay,
                 frequency=config.spoof_frequency,
                 price_aggressiveness=config.spoof_aggressiveness,
+                start_tick=start, end_tick=end,
+            )
+            agents.append(spoofer)
+            controllers.append(spoofer)
+            manipulation_event_rows.append(spoofer.log_activity(start))
+
+        if config.enable_wash_trading:
+            start = config.wash_start_tick if config.wash_start_tick is not None else 50
+            end = config.wash_end_tick if config.wash_end_tick is not None else start + 200
+            pair = WashTradingPair.create(
+                next(sub_rngs), 0,
+                trade_frequency=config.wash_frequency,
+                price_deviation_from_mid=config.wash_price_deviation,
+                start_tick=start, end_tick=end,
+            )
+            agents.extend(pair.agents)
+            controllers.append(pair)
+            manipulation_event_rows.append(pair.log_activity())
+
+        if config.enable_pump_and_dump:
+            start = config.pnd_start_tick if config.pnd_start_tick is not None else 150
+            end = config.pnd_end_tick if config.pnd_end_tick is not None else start + 300
+            coalition = PumpDumpCoalition.create(
+                next(sub_rngs),
+                n_coordinated_accounts=config.pnd_n_accounts,
+                burst_duration_ticks=config.pnd_burst_duration,
+                dump_delay_ticks=config.pnd_dump_delay,
+                start_tick=start, end_tick=end,
+            )
+            agents.extend(coalition.agents)
+            controllers.append(coalition)
+            manipulation_event_rows.append(coalition.log_activity())
+
+        if config.enable_layering:
+            start = config.layer_start_tick if config.layer_start_tick is not None else 200
+            end = config.layer_end_tick if config.layer_end_tick is not None else start + 200
+            layerer = LayeringAgent(
+                "layerer_0", next(sub_rngs),
+                n_layers=config.layer_n_layers,
+                layer_spacing=config.layer_spacing,
+                cancellation_delay_ticks=config.layer_cancel_delay,
+                start_tick=start, end_tick=end,
+            )
+            agents.append(layerer)
+            controllers.append(layerer)
+            manipulation_event_rows.append(layerer.log_activity())
+
+        return agents, controllers, manipulation_event_rows
+
+    # 1. Retrieve commodity-specific affinity weights
+    comm_affinities = COMMODITY_PERSONA_PROFILES.get(
+        config.commodity,
+        {"spoofing": 0.35, "wash_trading": 0.35, "pump_and_dump": 0.15, "layering": 0.15}
+    )
+
+    # 2. Filter by globally enabled persona flags in config
+    flag_map = {
+        "spoofing": config.enable_spoofing,
+        "wash_trading": config.enable_wash_trading,
+        "pump_and_dump": config.enable_pump_and_dump,
+        "layering": config.enable_layering,
+    }
+    if not any(flag_map.values()):
+        return agents, controllers, manipulation_event_rows
+
+    valid_personas = [p for p, enabled in flag_map.items() if enabled and p in comm_affinities]
+    if not valid_personas:
+        valid_personas = [p for p, enabled in flag_map.items() if enabled]
+
+
+    weights = np.array([comm_affinities.get(p, 0.25) for p in valid_personas], dtype=float)
+    if weights.sum() > 0:
+        weights /= weights.sum()
+    else:
+        weights = np.ones(len(valid_personas)) / len(valid_personas)
+
+    # 3. Determine number of episodes for this commodity (1 to 3 episodes — NO clean rounds)
+    min_episodes = 1
+    max_episodes = min(3, max(1, config.n_ticks // 1000))
+    n_episodes = int(master_rng.integers(min_episodes, max_episodes + 1))
+
+    # 4. Sample the sequence of attack personas
+    chosen_personas = master_rng.choice(valid_personas, size=n_episodes, p=weights, replace=True)
+
+    # 5. Stagger time windows across the simulation run
+    for ep_idx, persona in enumerate(chosen_personas):
+        # Sample realistic duration depending on attack type
+        if persona == "spoofing":
+            duration = int(master_rng.integers(140, 420))
+        elif persona == "layering":
+            duration = int(master_rng.integers(120, 350))
+        elif persona == "wash_trading":
+            duration = int(master_rng.integers(220, 600))
+        elif persona == "pump_and_dump":
+            burst = int(master_rng.integers(60, 160))
+            dump_delay = int(master_rng.integers(100, 240))
+            duration = burst + dump_delay + 40
+        else:
+            duration = int(master_rng.integers(150, 400))
+
+        # Sample start tick with spacing across the timeline
+        max_start = max(10, config.n_ticks - duration - 30)
+        segment_len = max_start // max(1, n_episodes)
+        seg_start = ep_idx * segment_len + 15
+        seg_end = min(max_start, (ep_idx + 1) * segment_len)
+        if seg_end > seg_start:
+            start = int(master_rng.integers(seg_start, seg_end + 1))
+        else:
+            start = int(master_rng.integers(15, max_start + 1))
+        end = start + duration
+
+        # Instantiate the chosen persona with randomized parameter variation
+        if persona == "spoofing":
+            size_mult = float(master_rng.uniform(4.5, 9.5))
+            c_delay = int(master_rng.integers(3, 8))
+            freq = float(master_rng.uniform(0.35, 0.65))
+            aggr = float(master_rng.uniform(0.0015, 0.0045))
+            spoofer = SpoofingAgent(
+                f"spoofer_{ep_idx}", next(sub_rngs),
+                order_size_multiplier=size_mult,
+                cancellation_delay_ticks=c_delay,
+                frequency=freq,
+                price_aggressiveness=aggr,
                 start_tick=start,
                 end_tick=end,
             )
@@ -266,29 +401,29 @@ def _build_agents(
             controllers.append(spoofer)
             manipulation_event_rows.append(spoofer.log_activity(start))
 
-    if config.enable_wash_trading:
-        for i in range(n_episodes):
-            start, end = _get_random_window(2000)
-            for j in range(config.wash_n_pairs):
-                pair = WashTradingPair.create(
-                    next(sub_rngs), i * 100 + j,
-                    trade_frequency=config.wash_frequency,
-                    price_deviation_from_mid=config.wash_price_deviation,
-                    start_tick=start,
-                    end_tick=end,
-                )
-                agents.extend(pair.agents)
-                controllers.append(pair)
-                manipulation_event_rows.append(pair.log_activity())
+        elif persona == "wash_trading":
+            w_freq = float(master_rng.uniform(0.35, 0.70))
+            w_dev = float(master_rng.uniform(0.0005, 0.002))
+            pair = WashTradingPair.create(
+                next(sub_rngs), ep_idx * 100,
+                trade_frequency=w_freq,
+                price_deviation_from_mid=w_dev,
+                start_tick=start,
+                end_tick=end,
+            )
+            agents.extend(pair.agents)
+            controllers.append(pair)
+            manipulation_event_rows.append(pair.log_activity())
 
-    if config.enable_pump_and_dump:
-        for i in range(n_episodes):
-            start, end = _get_random_window(2000)
+        elif persona == "pump_and_dump":
+            burst_ticks = int(master_rng.integers(60, 160))
+            dump_ticks = int(master_rng.integers(100, 240))
+            n_accts = int(master_rng.integers(2, 4))
             coalition = PumpDumpCoalition.create(
                 next(sub_rngs),
-                n_coordinated_accounts=config.pnd_n_accounts,
-                burst_duration_ticks=config.pnd_burst_duration,
-                dump_delay_ticks=config.pnd_dump_delay,
+                n_coordinated_accounts=n_accts,
+                burst_duration_ticks=burst_ticks,
+                dump_delay_ticks=dump_ticks,
                 start_tick=start,
                 end_tick=end,
             )
@@ -296,14 +431,15 @@ def _build_agents(
             controllers.append(coalition)
             manipulation_event_rows.append(coalition.log_activity())
 
-    if config.enable_layering:
-        for i in range(n_episodes):
-            start, end = _get_random_window(2000)
+        elif persona == "layering":
+            layers = int(master_rng.integers(3, 6))
+            spacing = float(master_rng.uniform(0.001, 0.003))
+            c_delay = int(master_rng.integers(2, 6))
             layerer = LayeringAgent(
-                f"layerer_{i}", next(sub_rngs),
-                n_layers=config.layer_n_layers,
-                layer_spacing=config.layer_spacing,
-                cancellation_delay_ticks=config.layer_cancel_delay,
+                f"layerer_{ep_idx}", next(sub_rngs),
+                n_layers=layers,
+                layer_spacing=spacing,
+                cancellation_delay_ticks=c_delay,
                 start_tick=start,
                 end_tick=end,
             )
@@ -401,10 +537,15 @@ def run_simulation(
     # --- Seeded RNG ---
     master_rng = np.random.default_rng(seed)
 
+    # --- Determine Initial Price ---
+    init_price = config.fundamental_value_initial
+    if init_price is None or init_price == 100.0:
+        init_price = COMMODITY_INITIAL_PRICES.get(config.commodity, 100.0)
+
     # --- Fundamental value process ---
     fundamental_rng, *_ = master_rng.spawn(1)
     fundamental = FundamentalValueProcess(
-        initial_value=config.fundamental_value_initial,
+        initial_value=init_price,
         drift=config.fundamental_value_drift,
         volatility=config.fundamental_value_vol,
         rng=fundamental_rng,
@@ -426,7 +567,7 @@ def run_simulation(
     regular_agents = [a for a in agents if not isinstance(a, (MarketMaker, LayeringAgent))]
 
     # --- Order book ---
-    book = OrderBook(initial_price=config.fundamental_value_initial)
+    book = OrderBook(initial_price=init_price)
 
     # --- Accumulators ---
     all_trades: list[dict] = []
@@ -509,6 +650,20 @@ def run_simulation(
     manip_df["commodity"] = config.commodity
     bars_df["commodity"] = config.commodity
 
+    # --- Apply tick_offset if continuous uninterrupted ticks are enabled ---
+    if config.tick_offset > 0:
+        if not trade_df.empty and "tick" in trade_df.columns:
+            trade_df["tick"] = trade_df["tick"] + config.tick_offset
+        if not order_df.empty and "tick" in order_df.columns:
+            order_df["tick"] = order_df["tick"] + config.tick_offset
+        if not manip_df.empty:
+            if "start_tick" in manip_df.columns:
+                manip_df["start_tick"] = manip_df["start_tick"] + config.tick_offset
+            if "end_tick" in manip_df.columns:
+                manip_df["end_tick"] = manip_df["end_tick"] + config.tick_offset
+        if not bars_df.empty and "bar_start" in bars_df.columns:
+            bars_df["bar_start"] = bars_df["bar_start"] + config.tick_offset
+
     # --- Validate & write (Pandera validates at write time — FR-0.2) ---
     logger.info(
         "Run complete: %d trades, %d order events, %d manipulation episodes",
@@ -538,8 +693,6 @@ def run_simulation(
 # Internal helpers
 # ===========================================================================
 
-
-from src.core.order_book import Side
 
 def _collect(
     trades: list[Trade],

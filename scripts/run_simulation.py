@@ -34,7 +34,7 @@ COMMODITIES = [
 ]
 
 
-def simulate_commodity_worker(com: str, seed: int, ticks: int, outdir: str, p_cfg: dict) -> tuple:
+def simulate_commodity_worker(com: str, seed: int, ticks: int, outdir: str, p_cfg: dict, tick_offset: int = 0) -> tuple:
     from src.core.calibration import CalibrationEngine
     from src.core.simulation import SimConfig, run_simulation
     from pathlib import Path
@@ -47,6 +47,7 @@ def simulate_commodity_worker(com: str, seed: int, ticks: int, outdir: str, p_cf
         fundamental_value_drift=ou_target.drift,
         fundamental_value_vol=ou_target.volatility,
         n_ticks=ticks,
+        tick_offset=tick_offset,
         data_dir=Path(outdir),
         overwrite=True,
         write_to_disk=False  # Do not write to disk yet
@@ -91,6 +92,7 @@ def main() -> None:
     parser.add_argument("--ticks", type=int, default=10000, help="Number of ticks to simulate")
     parser.add_argument("--outdir", type=str, default="data/runs", help="Output directory")
     parser.add_argument("--commodity", type=str, default="gold", help="Commodity to simulate (e.g. gold, crude_oil_wti) or 'all' for all 8.")
+    parser.add_argument("--tick-offset", type=int, default=0, help="Tick offset for uninterrupted multi-round datasets")
     
     args = parser.parse_args()
 
@@ -106,7 +108,7 @@ def main() -> None:
     all_manip_logs = []
     all_bars_logs = []
 
-    print(f"Running simulation for {len(coms_to_run)} commodities with seed {args.seed} for {args.ticks} ticks...")
+    print(f"Running simulation for {len(coms_to_run)} commodities with seed {args.seed} for {args.ticks} ticks (tick_offset={args.tick_offset})...")
     
     ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_id = f"{ts}_{args.seed}"
@@ -120,10 +122,11 @@ def main() -> None:
 
     from concurrent.futures import ProcessPoolExecutor, as_completed
     with ProcessPoolExecutor() as executor:
-        futures = {
-            executor.submit(simulate_commodity_worker, com, args.seed, args.ticks, args.outdir, p_cfg): com
-            for com in coms_to_run
-        }
+        futures = {}
+        for com in coms_to_run:
+            # If multiple commodities are run, decouple seeds to avoid identical price trajectories
+            com_seed = (args.seed * 10007 + abs(hash(com))) % (2**31 - 1) if len(coms_to_run) > 1 else args.seed
+            futures[executor.submit(simulate_commodity_worker, com, com_seed, args.ticks, args.outdir, p_cfg, args.tick_offset)] = com
         
         for future in as_completed(futures):
             com = futures[future]

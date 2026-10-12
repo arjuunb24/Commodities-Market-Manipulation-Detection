@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-import yaml
 
 from src.adversarial.metrics import (
     compute_round_metrics,
@@ -25,6 +24,7 @@ from src.adversarial.metrics import (
     load_round_metrics,
 )
 from src.detector.pipeline import DetectorPipeline
+from src.utils import io as io_utils
 
 logger = logging.getLogger(__name__)
 
@@ -90,10 +90,11 @@ class RoundOrchestrator:
         logger.info("=" * 60)
         logger.info(f"ROUND {round_num} — Simulating market (Training and Testing data concurrently)...")
         
+        tick_offset = round_num * self.sim_ticks
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            future_train = executor.submit(self._run_simulation, train_dir, self.sim_seed + round_num * 10)
-            future_test = executor.submit(self._run_simulation, test_dir, self.sim_seed + round_num * 10 + 1)
+            future_train = executor.submit(self._run_simulation, train_dir, self.sim_seed + round_num * 10, tick_offset)
+            future_test = executor.submit(self._run_simulation, test_dir, self.sim_seed + round_num * 10 + 1, tick_offset)
             
             # Wait for both to complete
             future_train.result()
@@ -131,12 +132,46 @@ class RoundOrchestrator:
         # Step 3: Compute metrics on the test set
         metrics = compute_round_metrics(results, y_test, self.personas)
 
-        # Step 4: Save
+        # Step 4: Save & accumulate multi-round datasets
         save_round_metrics(metrics, round_num, round_dir)
         self._all_metrics.append({"round": round_num, "personas": metrics})
         self._save_cumulative_metrics()
+        self._accumulate_master_datasets(round_num)
 
         return metrics
+
+    def _accumulate_master_datasets(self, round_num: int) -> None:
+        """
+        Merges trading sim outputs across rounds into a master cumulative dataset
+        with continuous uninterrupted ticks.
+        """
+        for split in ["train", "test"]:
+            all_trades = []
+            all_orders = []
+            all_manips = []
+            all_bars = []
+            for r in range(round_num + 1):
+                split_dir = self.master_run_dir / f"round_{r}" / split
+                t_p = split_dir / "trade_log.parquet"
+                o_p = split_dir / "order_log.parquet"
+                m_p = split_dir / "manipulation_events.parquet"
+                b_p = split_dir / "ohlcv_bars.parquet"
+                if t_p.exists():
+                    all_trades.append(pd.read_parquet(t_p))
+                if o_p.exists():
+                    all_orders.append(pd.read_parquet(o_p))
+                if m_p.exists():
+                    all_manips.append(pd.read_parquet(m_p))
+                if b_p.exists():
+                    all_bars.append(pd.read_parquet(b_p))
+
+            if all_trades:
+                cum_dir = self.master_run_dir / "cumulative" / split
+                cum_dir.mkdir(parents=True, exist_ok=True)
+                io_utils.write_parquet(pd.concat(all_trades, ignore_index=True), cum_dir / "trade_log.parquet", "trade_log", overwrite=True)
+                io_utils.write_parquet(pd.concat(all_orders, ignore_index=True), cum_dir / "order_log.parquet", "order_log", overwrite=True)
+                io_utils.write_parquet(pd.concat(all_manips, ignore_index=True), cum_dir / "manipulation_events.parquet", "manipulation_events", overwrite=True)
+                io_utils.write_parquet(pd.concat(all_bars, ignore_index=True), cum_dir / "ohlcv_bars.parquet", "ohlcv_bars", overwrite=True)
 
     def get_metrics_for_round(self, round_num: int) -> dict[str, dict[str, float]]:
         """Reads metrics for a specific round from disk (used by tools.py)."""
@@ -174,7 +209,7 @@ class RoundOrchestrator:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _run_simulation(self, out_dir: Path, seed: int) -> None:
+    def _run_simulation(self, out_dir: Path, seed: int, tick_offset: int = 0) -> None:
         """
         Calls run_simulation.py as a subprocess, writing outputs directly
         into out_dir so each run has isolated Parquet files.
@@ -184,10 +219,11 @@ class RoundOrchestrator:
 
         cmd = [
             python_exe, str(script),
-            "--ticks",     str(self.sim_ticks),
-            "--seed",      str(seed),
-            "--outdir",    str(out_dir),
-            "--commodity", self.commodity,
+            "--ticks",       str(self.sim_ticks),
+            "--seed",        str(seed),
+            "--outdir",      str(out_dir),
+            "--commodity",   self.commodity,
+            "--tick-offset", str(tick_offset),
         ]
 
         logger.info(f"Running: {' '.join(cmd)}")
