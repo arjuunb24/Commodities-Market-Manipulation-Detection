@@ -20,6 +20,14 @@ from tenacity import Retrying, stop_after_attempt, wait_exponential
 # Load environment variables (API keys, DEMO_MODE)
 load_dotenv()
 
+# Ensure GEMINI_API_KEY is available to LiteLLM from fallback keys
+if not os.getenv("GEMINI_API_KEY"):
+    fallback_key = os.getenv("GEMINI_STRATEGIST_API_KEY")
+    if not fallback_key and os.getenv("GEMINI_GENERAL_API_KEYS"):
+        fallback_key = os.getenv("GEMINI_GENERAL_API_KEYS").split(",")[0].strip()
+    if fallback_key:
+        os.environ["GEMINI_API_KEY"] = fallback_key
+
 logger = logging.getLogger(__name__)
 
 class LLMClient:

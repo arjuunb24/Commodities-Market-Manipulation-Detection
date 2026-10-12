@@ -42,6 +42,9 @@ data/raw/
 # To keep a specific run: git add -f data/runs/<demo_run_id>/
 data/runs/
 
+# LLM cache
+data/llm_cache/
+
 # =============================================================================
 # MLflow experiment tracking (local runs)
 # =============================================================================

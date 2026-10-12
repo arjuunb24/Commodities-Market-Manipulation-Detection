@@ -17,9 +17,9 @@ narrative_generator:
   provider: "gemini"
   model: "gemini-3.6-flash"
   temperature: 0.0            # deterministic for reproducible compliance artifacts
-  max_tokens: 300             # 2-4 sentence narrative
+  max_tokens: 2048            # ample room for reasoning + complete 2-4 sentence narrative
   max_retries: 3
-  timeout_seconds: 15
+  timeout_seconds: 45
   # Cost note: ~150 narratives/round × ~400 in + 150 out tokens ≈ very low cost
 
 # --- 4B: Adversarial Strategist (Gemini — reasoning + tool-use) ---
