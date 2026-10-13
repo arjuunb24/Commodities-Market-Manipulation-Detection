@@ -34,53 +34,73 @@ from src.utils.logging_config import setup_logging
 setup_logging()
 logger = logging.getLogger(__name__)
 
+# LLM output can contain non-ASCII punctuation; never let console encoding crash a round.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 from src.adversarial.orchestrator import RoundOrchestrator
 from src.adversarial.metrics import build_summary_table
 from src.agentic.adversarial_strategist import AdversarialStrategist
 
 
+def _fmt(v) -> str:
+    return "   n/a" if v is None or v != v else f"{v:6.3f}"
+
+
+def _print_rows(df) -> None:
+    print(f"{'Persona':<16} {'Phase':<6} {'Precision':>9} {'Recall':>7} {'F1':>7} {'FPR':>7} {'Events':>8} {'Latency':>8} {'Effect x':>8} {'Score':>6}")
+    print("-" * 96)
+    for _, row in df.sort_values(["persona", "phase"], ascending=[True, False]).iterrows():
+        lat = row.get("detection_latency_ticks")
+        lat_s = "  -" if lat is None or lat != lat else f"{lat:.0f}"
+        print(f"{row['persona']:<16} {row['phase']:<6} {_fmt(row['precision']):>9} {_fmt(row['recall']):>7} "
+              f"{_fmt(row['f1']):>7} {_fmt(row['fpr']):>7} {int(row['events_detected'])}/{int(row['events_total']):<6} {lat_s:>8} "
+              f"{_fmt(row.get('effectiveness_ratio')):>8} {_fmt(row.get('mutation_score')) if row['phase'] == 'pre' else '':>6}")
+
+
+def write_strategist_record(run_dir: Path, round_num: int, personas: list[str],
+                            source: dict[str, str], reasoning: dict[str, str]) -> None:
+    """
+    round_N/strategist.json: who chose each persona's parameters for round N, the
+    exact changes (old -> new, versus the parameters used in round N-1) and the
+    reasoning. Structured so the dashboard never has to parse free text.
+    """
+    from src.core.persona_params import effective_params, resolve_persona_config
+    prev_path = run_dir / f"round_{round_num - 1}" / "metrics.json"
+    prev = json.loads(prev_path.read_text()).get("params_used", {}) if prev_path.exists() else {}
+    cfg_path = REPO_ROOT / "configs" / "persona_config.yaml"
+    active = resolve_persona_config(yaml.safe_load(cfg_path.read_text()) or {}) if cfg_path.exists() else {}
+    record = {"round": round_num, "personas": {}}
+    for p in personas:
+        new = effective_params(active, p)
+        old = prev.get(p, {})
+        changes = {k: [old.get(k), v] for k, v in new.items() if old.get(k) != v}
+        record["personas"][p] = {
+            "source": source.get(p, "unchanged"),
+            "changes": changes,
+            "params": new,
+            "reasoning": reasoning.get(p, ""),
+        }
+    out = run_dir / f"round_{round_num}"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "strategist.json").write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def print_metrics_table(summary_df, current_round: int = -1):
-    """Prints a clean per-round, per-persona metrics table to the console."""
+    """Per-round, per-persona metrics. 'pre' = frozen previous detector, 'post' = retrained."""
     if summary_df.empty:
         return
+    rounds = [current_round] if current_round >= 0 else sorted(summary_df["round"].unique())
+    for r in rounds:
+        print("\n" + "=" * 76)
+        print(f"ROUND {r}  (pre = detector frozen before this round's mutation, post = retrained)".center(76))
+        print("=" * 76)
+        _print_rows(summary_df[summary_df["round"] == r])
+    print()
 
-    if current_round >= 0:
-        print(f"\n" + "=" * 72)
-        print(f"[*] LIVE PIPELINE STATUS: ROUND {current_round}".center(72))
-        print("=" * 72)
-
-        baseline_df = summary_df[summary_df['round'] == 0]
-        if not baseline_df.empty:
-            print("\n[BASELINE METRICS - ROUND 0 (No LLM Mutations)]")
-            print(f"{'Persona':<20} {'Precision':>10} {'Recall':>8} {'F1':>8} {'FPR':>8}")
-            print("-" * 60)
-            for _, row in baseline_df.iterrows():
-                print(f"{row['persona']:<20} {row['precision']:>10.3f} {row['recall']:>8.3f} {row['f1']:>8.3f} {row['fpr']:>8.3f}")
-
-        if current_round > 0:
-            current_df = summary_df[summary_df['round'] == current_round]
-            if not current_df.empty:
-                print(f"\n[MUTATED METRICS - ROUND {current_round} (Post-LLM Mutations)]")
-                print(f"{'Persona':<20} {'Precision':>10} {'Recall':>8} {'F1':>8} {'FPR':>8}")
-                print("-" * 60)
-                for _, row in current_df.iterrows():
-                    print(f"{row['persona']:<20} {row['precision']:>10.3f} {row['recall']:>8.3f} {row['f1']:>8.3f} {row['fpr']:>8.3f}")
-
-        print("\n" + "=" * 72 + "\n")
-    else:
-        # Final full table print
-        print("\n" + "=" * 72)
-        print(f"{'Round':<8} {'Persona':<20} {'Precision':>10} {'Recall':>8} {'F1':>8} {'FPR':>8}")
-        print("-" * 72)
-
-        for _, row in summary_df.iterrows():
-            print(
-                f"{int(row['round']):<8} {row['persona']:<20} "
-                f"{row['precision']:>10.3f} {row['recall']:>8.3f} "
-                f"{row['f1']:>8.3f} {row['fpr']:>8.3f}"
-            )
-
-        print("=" * 72 + "\n")
 
 def print_parameter_dashboard(current_round: int):
     """Reads persona_config.yaml and prints a historic parameter matrix for each persona."""
@@ -145,14 +165,19 @@ def main():
     parser.add_argument("--ticks",     type=int, default=5000,            help="Simulation ticks per round")
     parser.add_argument("--seed",      type=int, default=42,              help="Random seed for simulation")
     parser.add_argument("--commodity", type=str, default="crude_oil_wti", help="Commodity to simulate")
-    parser.add_argument("--persona",   type=str, default="spoofing",      help="Persona to target for adversarial mutation (or 'all' for all enabled personas)")
+    parser.add_argument("--persona",   type=str, default="all",           help="Persona to target for adversarial mutation (or 'all' for all enabled personas)")
+    parser.add_argument("--mutations", choices=["llm", "hand"], default="llm",
+                        help="llm = Adversarial Strategist (falls back to the hand-authored library on failure); "
+                             "hand = hand-authored library only (no API calls; baseline for comparisons)")
+    parser.add_argument("--test-markets", type=int, default=2, help="Held-out test markets per round")
+    parser.add_argument("--run-name", type=str, default="", help="Optional label appended to the run id")
     args = parser.parse_args()
 
     # ----------------------------------------------------------------
     # Setup
     # ----------------------------------------------------------------
     ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_id = f"adversarial_{ts}_seed{args.seed}"
+    run_id = f"adversarial_{ts}_seed{args.seed}" + (f"_{args.run_name}" if args.run_name else "")
     master_run_dir = REPO_ROOT / "data" / "runs" / run_id
 
     logger.info("=" * 60)
@@ -191,6 +216,7 @@ def main():
         sim_ticks=args.ticks,
         sim_seed=args.seed,
         commodity=args.commodity,
+        n_test_markets=args.test_markets,
     )
 
     # Initialise LLM strategist (uses real disk reads via ToolRegistry)
@@ -215,18 +241,34 @@ def main():
                 if args.persona.lower() == "all" else [args.persona]
             )
 
-            logger.info(f"\nRound {round_num}: Launching Adversarial Strategist for personas: {personas_to_mutate}...")
+            logger.info(f"\nRound {round_num}: mutating {personas_to_mutate} ({args.mutations})...")
             try:
-                result = strategist.run_strategist_round(
-                    round_num=round_num - 1,  # Strategist reads the PREVIOUS round's metrics
-                    personas=personas_to_mutate,
-                )
-                
+                if args.mutations == "hand":
+                    from src.agentic.mutation_library import get_fallback_mutation
+                    result = {"status": "success", "source": {}, "reasoning": {}}
+                    for p in personas_to_mutate:
+                        fb = get_fallback_mutation(p, round_num)
+                        res = strategist.tools.propose_mutation(p, fb["parameters"], fb["reasoning"])
+                        if "error" not in res:
+                            result["source"][p] = "hand_authored"
+                            result["reasoning"][p] = fb["reasoning"]
+                else:
+                    result = strategist.run_strategist_round(
+                        round_num=round_num - 1,  # Strategist reads the PREVIOUS round's metrics
+                        personas=personas_to_mutate,
+                        target_round=round_num,   # ...and mutates for THIS round
+                    )
+                mutation_source = {p: result.get("source", {}).get(p, "unchanged") for p in personas_to_mutate}
+
+                # --- Structured record of this round's mutation (read by the dashboard) ---
+                write_strategist_record(master_run_dir, round_num, personas_to_mutate, mutation_source,
+                                        result.get("reasoning", {}))
+
                 # --- Print and Log Reasoning ---
                 reasonings = result.get("reasoning", {})
                 if reasonings:
                     reasoning_log_path = master_run_dir / "llm_reasoning.log"
-                    with open(reasoning_log_path, "a") as rf:
+                    with open(reasoning_log_path, "a", encoding="utf-8") as rf:
                         rf.write(f"\n{'='*60}\nROUND {round_num} STRATEGIST REASONING\n{'='*60}\n")
                         for persona, rationale in reasonings.items():
                             formatted_reasoning = f"\n[{persona.upper()}]\n{rationale}\n"
@@ -241,6 +283,7 @@ def main():
                     logger.warning(f"LLM mutation failed: {result}. Using existing config.")
             except Exception as e:
                 logger.error(f"Strategist failed: {e}. Continuing with current config.")
+                mutation_source = {p: "unchanged" for p in personas_to_mutate}
                 
             # --- Save History for Dashboard ---
             persona_config_path = REPO_ROOT / "configs" / "persona_config.yaml"
@@ -262,7 +305,8 @@ def main():
 
         # --- Step 2: Run the simulation + detector for this round ---
         logger.info(f"\nRound {round_num}: Running simulation + detection...")
-        metrics = orchestrator.run_round(round_num)
+        metrics = orchestrator.run_round(
+            round_num, mutation_source=None if round_num == 0 else mutation_source)
 
         if not metrics:
             logger.warning(f"Round {round_num} produced no metrics. Check simulation output.")

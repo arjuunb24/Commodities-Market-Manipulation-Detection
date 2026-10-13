@@ -20,8 +20,6 @@ value signal, NOT an imposed OU formula on the price series.
 
 from __future__ import annotations
 
-import uuid
-
 import numpy as np
 
 from src.core.agents.base import Agent
@@ -41,6 +39,8 @@ class MeanReversionTrader(Agent):
         order_size_base: Base order quantity.
         arrival_rate_lambda: Per-tick activation probability.
     """
+
+    mean_order_ttl = 60.0
 
     def __init__(
         self,
@@ -85,30 +85,15 @@ class MeanReversionTrader(Agent):
         if abs(deviation) < self.reversion_threshold:
             return None  # price is close enough to fundamental; no action
 
-        # --- Fade the move with relative price scaling ---
-        step = ref_price * self.rng.uniform(0.0005, 0.003)
+        # --- Fade the move at the touch: commercial hedgers work orders patiently
+        # and take only the liquidity displayed at the best price (no book sweeps).
         if deviation > 0:
-            # Price above fundamental → sell (fade the overvaluation)
             side = Side.SELL
-            price = ref_price - step
+            price = book_state.best_bid or ref_price * (1 - 0.0002)
         else:
-            # Price below fundamental → buy (fade the undervaluation)
             side = Side.BUY
-            price = ref_price + step
+            price = book_state.best_ask or ref_price * (1 + 0.0002)
 
-        price = round(max(price, 0.01), 4)
-
-        # Order size scales with deviation strength
         deviation_strength = min(abs(deviation) / self.reversion_threshold, 5.0)
-        quantity = int(self.order_size_base * deviation_strength)
-        quantity = max(1, quantity)
-
-        return Order(
-            order_id=str(uuid.uuid4()),
-            trader_id=self.trader_id,
-            side=side,
-            price=price,
-            quantity=quantity,
-            tick=tick,
-            order_type="limit",
-        )
+        quantity = max(1, int(self.order_size_base * deviation_strength))
+        return self.limit(side, max(price, self.tick_size), quantity, tick)

@@ -16,7 +16,7 @@ import yaml
 sys.path.append(str(Path(__file__).parent.parent))
 
 from src.core.calibration import CalibrationEngine
-from src.core.simulation import SimConfig, run_simulation
+from src.core.simulation import SimConfig, multi_commodity_seed, run_simulation
 from src.utils.logging_config import setup_logging
 import pandas as pd
 from datetime import datetime, timezone
@@ -53,32 +53,9 @@ def simulate_commodity_worker(com: str, seed: int, ticks: int, outdir: str, p_cf
         write_to_disk=False  # Do not write to disk yet
     )
 
-    # Apply LLM mutations
-    if "spoofing" in p_cfg:
-        sp_cfg = p_cfg["spoofing"]
-        if "cancellation_delay_ticks" in sp_cfg: config.spoof_cancel_delay = sp_cfg["cancellation_delay_ticks"]
-        if "order_size_multiplier" in sp_cfg: config.spoof_size_multiplier = float(sp_cfg["order_size_multiplier"])
-        if "frequency" in sp_cfg: config.spoof_frequency = float(sp_cfg["frequency"])
-        if "price_aggressiveness" in sp_cfg: config.spoof_aggressiveness = float(sp_cfg["price_aggressiveness"])
-
-    if "wash_trading" in p_cfg:
-        wt_cfg = p_cfg["wash_trading"]
-        if "trade_frequency" in wt_cfg: config.wash_frequency = float(wt_cfg["trade_frequency"])
-        if "price_deviation_from_mid" in wt_cfg: config.wash_price_deviation = float(wt_cfg["price_deviation_from_mid"])
-        if "n_colluding_pairs" in wt_cfg: config.wash_n_pairs = int(wt_cfg["n_colluding_pairs"])
-
-    if "pump_and_dump" in p_cfg:
-        pnd_cfg = p_cfg["pump_and_dump"]
-        if "burst_duration_ticks" in pnd_cfg: config.pnd_burst_duration = int(pnd_cfg["burst_duration_ticks"])
-        if "n_coordinated_accounts" in pnd_cfg: config.pnd_n_accounts = int(pnd_cfg["n_coordinated_accounts"])
-        if "dump_delay_ticks" in pnd_cfg: config.pnd_dump_delay = int(pnd_cfg["dump_delay_ticks"])
-        if "accumulation_size" in pnd_cfg: config.pnd_accumulation_size = int(pnd_cfg["accumulation_size"])
-
-    if "layering" in p_cfg:
-        ly_cfg = p_cfg["layering"]
-        if "n_layers" in ly_cfg: config.layer_n_layers = int(ly_cfg["n_layers"])
-        if "layer_spacing" in ly_cfg: config.layer_spacing = float(ly_cfg["layer_spacing"])
-        if "cancellation_delay_ticks" in ly_cfg: config.layer_cancel_delay = int(ly_cfg["cancellation_delay_ticks"])
+    # Resolve persona configuration (round_0 baseline + mutations) via the shared mapping.
+    from src.core.persona_params import apply_persona_config, resolve_persona_config
+    apply_persona_config(config, resolve_persona_config(p_cfg))
 
     output = run_simulation(config, seed)
     return (com, output.trade_log, output.order_log, output.manipulation_events, output.ohlcv_bars)
@@ -125,7 +102,7 @@ def main() -> None:
         futures = {}
         for com in coms_to_run:
             # If multiple commodities are run, decouple seeds to avoid identical price trajectories
-            com_seed = (args.seed * 10007 + abs(hash(com))) % (2**31 - 1) if len(coms_to_run) > 1 else args.seed
+            com_seed = multi_commodity_seed(args.seed, com) if len(coms_to_run) > 1 else args.seed
             futures[executor.submit(simulate_commodity_worker, com, com_seed, args.ticks, args.outdir, p_cfg, args.tick_offset)] = com
         
         for future in as_completed(futures):

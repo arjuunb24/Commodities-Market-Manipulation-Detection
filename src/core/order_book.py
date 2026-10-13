@@ -5,8 +5,8 @@ Continuous Double Auction Limit Order Book (LOB) matching engine.
 
 DESIGN PRINCIPLES (from ABM Project Plan Section 3.1):
   - Pure data structures + control flow. Zero ML, zero randomness.
-  - Price-time priority: bids sorted descending by price, then ascending by time;
-    asks sorted ascending by price, then ascending by time.
+  - Price-time priority: bids sorted descending by price, then ascending by arrival;
+    asks sorted ascending by price, then ascending by arrival.
   - Price ALWAYS emerges from two real orders crossing — never imposed externally.
   - This is the single source of truth. Everything else reads from its logs.
 
@@ -15,17 +15,19 @@ EDGE CASES (Implementation Plan Section 5.2 — all required):
   E2. Incoming buy at exact best-bid price → rests (time priority), never self-matches.
   E3. Cancel of filled/unknown order_id → no-op, log rejected_cancel, never raise.
   E4. Zero/negative quantity → ValueError in test mode; log+drop in sim run.
-  E5. Tick collision tie-break → deterministic insertion order in activation queue.
-  E6. Market maker requote → atomic cancel-and-replace, logged as requote pair.
-  E7. Self-trade prevention for all non-wash-trading agents (enforced at agent-logic level;
-      the book itself is told about wash-trading pairs via allow_self_trade flag).
+  E5. Tick collision tie-break → strict arrival sequence number (deterministic).
+  E6. Market maker requote → cancel-and-replace inside the same tick.
+  E7. Self-trade prevention for all non-wash-trading agents (enforced at agent-logic level).
   E8. Zero-persona run → valid zero-row manipulation_events (not a missing file).
+
+DETERMINISM (SRS FR-0.4):
+  Trade ids are a per-book counter prefixed with `id_prefix`, so two runs with the
+  same seed produce byte-identical trade logs (no uuid4 anywhere in the sim path).
 """
 
 from __future__ import annotations
 
 import heapq
-import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Literal
@@ -54,6 +56,14 @@ class EventType(str, Enum):
     REQUOTE = "requote"                  # market maker atomic cancel-and-replace
 
 
+def round_to_tick(price: float, tick_size: float) -> float:
+    """Snap a price onto the instrument's tick grid (never below one tick)."""
+    if tick_size <= 0:
+        return round(price, 6)
+    snapped = round(round(price / tick_size) * tick_size, 8)
+    return max(snapped, tick_size)
+
+
 # ===========================================================================
 # Data classes
 # ===========================================================================
@@ -65,7 +75,7 @@ class Order:
     A single order submitted to the order book.
 
     Fields:
-        order_id:    Unique identifier (typically a UUID string).
+        order_id:    Unique identifier (deterministic: <prefix><trader_id>-<n>).
         trader_id:   Identifier of the submitting trader.
         side:        Buy or sell.
         price:       Limit price. Must be > 0.
@@ -99,7 +109,8 @@ class Trade:
     A single executed trade — produced by OrderBook.submit().
 
     One Trade is generated per resting order consumed (not one per incoming order).
-    This is required by Implementation Plan Section 5.2, Edge Case E1.
+    `aggressor_side` is the side of the incoming (liquidity-taking) order — real
+    exchange trade feeds publish this flag and surveillance relies on it.
     """
     trade_id: str
     tick: int
@@ -107,6 +118,7 @@ class Trade:
     quantity: int          # quantity matched in this trade
     buyer_trader_id: str
     seller_trader_id: str
+    aggressor_side: Side = Side.BUY
 
     def to_dict(self) -> dict:
         return {
@@ -116,6 +128,7 @@ class Trade:
             "quantity": self.quantity,
             "buyer_trader_id": self.buyer_trader_id,
             "seller_trader_id": self.seller_trader_id,
+            "aggressor_side": self.aggressor_side.value,
         }
 
 
@@ -126,9 +139,9 @@ class OrderEvent:
     """
     order_id: str
     trader_id: str
-    side: Side | None      # None for cancel/rejected_cancel events
-    price: float | None    # None for cancel/rejected_cancel events
-    quantity: int | None   # None for cancel/rejected_cancel events
+    side: Side | None      # None for rejected_cancel events
+    price: float | None    # None for rejected_cancel events
+    quantity: int | None   # None for rejected_cancel events
     tick: int
     event_type: EventType
 
@@ -173,8 +186,11 @@ class OrderEvent:
 class BookState:
     """
     Snapshot of the order book's current state, passed to every agent's decide() call.
-
     This is a read-only view — agents must never modify the book directly.
+
+    bid_band_volume / ask_band_volume: total resting volume within ±band of mid.
+    This is the visible-liquidity signal that real order-book-imbalance (OBI)
+    strategies react to, and the channel through which spoofing moves prices.
     """
     best_bid: float | None           # highest resting bid price (None if book is empty)
     best_ask: float | None           # lowest resting ask price (None if book is empty)
@@ -183,6 +199,17 @@ class BookState:
     ask_depth: list[tuple[float, int]]   # [(price, total_qty), ...] top-N asks, ascending
     last_trade_price: float | None   # price of the most recent executed trade
     tick: int                        # current simulation tick
+    bid_band_volume: int = 0
+    ask_band_volume: int = 0
+
+    def imbalance(self) -> float:
+        """Visible order-book imbalance in [-1, 1]; positive = bid-heavy."""
+        bv, av = self.bid_band_volume, self.ask_band_volume
+        if bv + av == 0:
+            bv = sum(q for _, q in self.bid_depth)
+            av = sum(q for _, q in self.ask_depth)
+        total = bv + av
+        return (bv - av) / total if total > 0 else 0.0
 
 
 # ===========================================================================
@@ -192,12 +219,9 @@ class BookState:
 
 @dataclass(order=True)
 class _BidEntry:
-    """
-    Entry in the bid heap (max-heap implemented via negated price).
-    Sorted by: highest price first, then lowest tick first (time priority).
-    """
-    neg_price: float      # negate to turn min-heap into max-heap
-    tick: int             # insertion tick (lower = higher time priority)
+    """Bid heap entry: highest price first, then earliest arrival (seq)."""
+    neg_price: float
+    seq: int
     order_id: str = field(compare=False)
     trader_id: str = field(compare=False)
     quantity: int = field(compare=False)
@@ -206,12 +230,9 @@ class _BidEntry:
 
 @dataclass(order=True)
 class _AskEntry:
-    """
-    Entry in the ask heap (min-heap — naturally ascending price order).
-    Sorted by: lowest price first, then lowest tick first (time priority).
-    """
+    """Ask heap entry: lowest price first, then earliest arrival (seq)."""
     price: float
-    tick: int
+    seq: int
     order_id: str = field(compare=False)
     trader_id: str = field(compare=False)
     quantity: int = field(compare=False)
@@ -227,31 +248,23 @@ class OrderBook:
     Continuous Double Auction Limit Order Book with price-time priority matching.
 
     State:
-      _bids: min-heap of _BidEntry (negated price → effectively max-heap)
-      _asks: min-heap of _AskEntry (natural min-heap on price)
-      _resting: dict[order_id → {price, quantity, side, trader_id, tick}]
-                Fast lookup for cancels and for the book_state() depth snapshot.
-      _cancelled: set of order_ids that have been fully cancelled or filled
-                  Used to implement lazy deletion from the heaps.
-
-    Lazy deletion:
-      Heaps don't support efficient removal, so cancelled/filled orders remain
-      in the heap until they reach the top and are found to be in _cancelled —
-      at that point they are discarded (standard "lazy deletion" pattern).
-      This is O(log n) amortised for all operations and is correct.
+      _bids / _asks: heaps with lazy deletion of cancelled orders.
+      _resting:      order_id → resting order details (cancel lookup).
+      _bid_levels / _ask_levels: price → aggregate resting quantity, kept in sync
+                     with every rest / fill / cancel so depth snapshots are exact.
     """
 
-    def __init__(self, initial_price: float | None = None) -> None:
-        self._bids: list[_BidEntry] = []   # min-heap (negated price)
-        self._asks: list[_AskEntry] = []   # min-heap
-
-        # order_id → full order details (for cancel lookup + depth computation)
+    def __init__(self, initial_price: float | None = None, id_prefix: str = "") -> None:
+        self._bids: list[_BidEntry] = []
+        self._asks: list[_AskEntry] = []
         self._resting: dict[str, dict] = {}
-
-        # set of order_ids that are no longer active (filled or cancelled)
         self._inactive: set[str] = set()
-
+        self._bid_levels: dict[float, int] = {}
+        self._ask_levels: dict[float, int] = {}
         self._last_trade_price: float | None = initial_price
+        self._id_prefix = id_prefix
+        self._trade_seq = 0
+        self._arrival_seq = 0
 
     # -----------------------------------------------------------------------
     # Public API
@@ -273,14 +286,8 @@ class OrderBook:
                              If False (test mode), they raise ValueError immediately.
 
         Returns:
-            A tuple of:
-                trades: list[Trade] — executed trades (empty if order rested or was cancel).
-                events: list[OrderEvent] — order log events generated by this submit call.
-
-        Note: This method does NOT write to any file. The simulation loop is
-        responsible for collecting trades + events and writing them to disk.
+            (trades, events) generated by this submit call. The book never writes files.
         """
-        # --- Validate quantity / price (Edge Case E4) ---
         if order.order_type == "limit":
             if order.quantity <= 0 or order.price <= 0:
                 if simulation_mode:
@@ -300,42 +307,44 @@ class OrderBook:
 
         if order.order_type == "cancel":
             return self._process_cancel(order)
-        else:
-            return self._process_limit(order)
+        return self._process_limit(order)
 
     def best_bid(self) -> float | None:
         """Return the highest resting bid price, or None if the bid side is empty."""
-        self._clean_top(self._bids, is_bid=True)
-        if not self._bids:
-            return None
-        return self._bids[0].price  # _BidEntry.price (not neg_price)
+        self._clean_top(self._bids)
+        return self._bids[0].price if self._bids else None
 
     def best_ask(self) -> float | None:
         """Return the lowest resting ask price, or None if the ask side is empty."""
-        self._clean_top(self._asks, is_bid=False)
-        if not self._asks:
-            return None
-        return self._asks[0].price
+        self._clean_top(self._asks)
+        return self._asks[0].price if self._asks else None
 
-    def book_state(self, depth: int = 5) -> BookState:
+    def is_resting(self, order_id: str) -> bool:
+        """True while order_id still has quantity resting on the book."""
+        return order_id in self._resting
+
+    def book_state(self, depth: int = 5, band: float = 0.002) -> BookState:
         """
         Snapshot of the current book state for agent decision-making.
-        Called by every agent's decide() call each tick.
 
         Args:
             depth: Number of price levels to include in bid_depth / ask_depth.
-
-        Returns:
-            BookState — read-only snapshot.
+            band:  Half-width (fraction of mid) for the band-volume imbalance signal.
         """
         bb = self.best_bid()
         ba = self.best_ask()
         mid = (bb + ba) / 2.0 if (bb is not None and ba is not None) else None
 
-        bid_levels = self._aggregate_depth(self._bids, is_bid=True, depth=depth)
-        ask_levels = self._aggregate_depth(self._asks, is_bid=False, depth=depth)
+        bid_levels = heapq.nlargest(depth, self._bid_levels.items())
+        ask_levels = heapq.nsmallest(depth, self._ask_levels.items())
 
-        # tick is injected by the simulation loop; we don't track it in the book
+        bid_band = ask_band = 0
+        ref = mid if mid is not None else self._last_trade_price
+        if ref is not None:
+            lo, hi = ref * (1 - band), ref * (1 + band)
+            bid_band = sum(q for p, q in self._bid_levels.items() if p >= lo)
+            ask_band = sum(q for p, q in self._ask_levels.items() if p <= hi)
+
         return BookState(
             best_bid=bb,
             best_ask=ba,
@@ -344,213 +353,130 @@ class OrderBook:
             ask_depth=ask_levels,
             last_trade_price=self._last_trade_price,
             tick=-1,  # simulation loop overwrites this
+            bid_band_volume=bid_band,
+            ask_band_volume=ask_band,
         )
 
     def cancel_order(self, order_id: str, trader_id: str, tick: int) -> list[OrderEvent]:
-        """
-        Convenience method to cancel a specific order_id directly.
-        Returns list containing either a CANCELLED or REJECTED_CANCEL event.
-        """
-        cancel_order = Order(
+        """Cancel a specific order_id; returns a CANCELLED or REJECTED_CANCEL event."""
+        cancel = Order(
             order_id=order_id,
             trader_id=trader_id,
-            side=Side.BUY,      # side is irrelevant for cancels
-            price=1.0,          # price is irrelevant for cancels
-            quantity=1,         # quantity is irrelevant for cancels
+            side=Side.BUY,      # irrelevant for cancels
+            price=1.0,
+            quantity=1,
             tick=tick,
             order_type="cancel",
         )
-        _, events = self.submit(cancel_order)
+        _, events = self.submit(cancel)
         return events
 
     # -----------------------------------------------------------------------
     # Private: matching logic
     # -----------------------------------------------------------------------
 
+    def _next_trade_id(self) -> str:
+        self._trade_seq += 1
+        return f"{self._id_prefix}T{self._trade_seq}"
+
     def _process_limit(self, order: Order) -> tuple[list[Trade], list[OrderEvent]]:
-        """
-        Process a new limit order: try to match, then rest if not fully filled.
-        """
+        """Process a new limit order: match against the opposite side, rest any remainder."""
         trades: list[Trade] = []
-        events: list[OrderEvent] = []
-
-        # Log the placed event
-        events.append(OrderEvent.from_order(order, EventType.PLACED))
-
+        events: list[OrderEvent] = [OrderEvent.from_order(order, EventType.PLACED)]
         remaining_qty = order.quantity
+        is_buy = order.side == Side.BUY
+        heap = self._asks if is_buy else self._bids
+        levels = self._ask_levels if is_buy else self._bid_levels
+        resting_side = Side.SELL if is_buy else Side.BUY
 
-        if order.side == Side.BUY:
-            # Walk the ask side while we can match (price crosses)
-            while remaining_qty > 0 and self._asks:
-                self._clean_top(self._asks, is_bid=False)
-                if not self._asks:
-                    break
+        while remaining_qty > 0:
+            self._clean_top(heap)
+            if not heap:
+                break
+            top = heap[0]
+            # Price-cross check (E2: equal price on the SAME side never matches —
+            # we only ever look at the opposite heap here).
+            if is_buy and order.price < top.price:
+                break
+            if not is_buy and order.price > top.price:
+                break
 
-                best_ask_entry = self._asks[0]
+            match_qty = min(remaining_qty, top.quantity)
+            trade = Trade(
+                trade_id=self._next_trade_id(),
+                tick=order.tick,
+                price=top.price,  # execution at the resting order's price
+                quantity=match_qty,
+                buyer_trader_id=order.trader_id if is_buy else top.trader_id,
+                seller_trader_id=top.trader_id if is_buy else order.trader_id,
+                aggressor_side=order.side,
+            )
+            trades.append(trade)
+            self._last_trade_price = trade.price
+            remaining_qty -= match_qty
+            self._reduce_level(levels, top.price, match_qty)
 
-                # Self-trade prevention (Edge Case E7):
-                # The order book does NOT enforce this — agents must avoid
-                # placing orders that cross their own resting orders.
-                # For the wash-trading persona, crossing own orders is intentional.
+            new_resting_qty = top.quantity - match_qty
+            if new_resting_qty == 0:
+                heapq.heappop(heap)
+                self._inactive.add(top.order_id)
+                self._resting.pop(top.order_id, None)
+                event_type = EventType.FILLED
+            else:
+                # Ordering keys (price, seq) are unchanged, so the heap stays valid.
+                top.quantity = new_resting_qty
+                self._resting[top.order_id]["quantity"] = new_resting_qty
+                event_type = EventType.PARTIAL_FILL
+            events.append(OrderEvent(
+                order_id=top.order_id,
+                trader_id=top.trader_id,
+                side=resting_side,
+                price=top.price,
+                quantity=match_qty,
+                tick=order.tick,
+                event_type=event_type,
+            ))
 
-                if order.price < best_ask_entry.price:
-                    break  # order does not cross best ask → rest
-
-                # Match at the resting (ask) price — price-time priority
-                match_qty = min(remaining_qty, best_ask_entry.quantity)
-                trade = Trade(
-                    trade_id=str(uuid.uuid4()),
-                    tick=order.tick,
-                    price=best_ask_entry.price,   # execution at resting order's price
-                    quantity=match_qty,
-                    buyer_trader_id=order.trader_id,
-                    seller_trader_id=best_ask_entry.trader_id,
-                )
-                trades.append(trade)
-                self._last_trade_price = trade.price
-
-                remaining_qty -= match_qty
-                new_resting_qty = best_ask_entry.quantity - match_qty
-
-                if new_resting_qty == 0:
-                    # Resting order fully filled → remove from heap + resting dict
-                    heapq.heappop(self._asks)
-                    self._inactive.add(best_ask_entry.order_id)
-                    self._resting.pop(best_ask_entry.order_id, None)
-                    events.append(OrderEvent(
-                        order_id=best_ask_entry.order_id,
-                        trader_id=best_ask_entry.trader_id,
-                        side=Side.SELL,
-                        price=best_ask_entry.price,
-                        quantity=match_qty,
-                        tick=order.tick,
-                        event_type=EventType.FILLED,
-                    ))
-                else:
-                    # Resting order partially filled → update quantity
-                    self._asks[0] = _AskEntry(
-                        price=best_ask_entry.price,
-                        tick=best_ask_entry.tick,
-                        order_id=best_ask_entry.order_id,
-                        trader_id=best_ask_entry.trader_id,
-                        quantity=new_resting_qty,
-                    )
-                    heapq.heapify(self._asks)
-                    self._resting[best_ask_entry.order_id]["quantity"] = new_resting_qty
-                    events.append(OrderEvent(
-                        order_id=best_ask_entry.order_id,
-                        trader_id=best_ask_entry.trader_id,
-                        side=Side.SELL,
-                        price=best_ask_entry.price,
-                        quantity=match_qty,
-                        tick=order.tick,
-                        event_type=EventType.PARTIAL_FILL,
-                    ))
-
-        else:  # SELL order
-            while remaining_qty > 0 and self._bids:
-                self._clean_top(self._bids, is_bid=True)
-                if not self._bids:
-                    break
-
-                best_bid_entry = self._bids[0]
-
-                if order.price > best_bid_entry.price:
-                    break  # order does not cross best bid → rest
-
-                match_qty = min(remaining_qty, best_bid_entry.quantity)
-                trade = Trade(
-                    trade_id=str(uuid.uuid4()),
-                    tick=order.tick,
-                    price=best_bid_entry.price,   # execution at resting bid price
-                    quantity=match_qty,
-                    buyer_trader_id=best_bid_entry.trader_id,
-                    seller_trader_id=order.trader_id,
-                )
-                trades.append(trade)
-                self._last_trade_price = trade.price
-
-                remaining_qty -= match_qty
-                new_resting_qty = best_bid_entry.quantity - match_qty
-
-                if new_resting_qty == 0:
-                    heapq.heappop(self._bids)
-                    self._inactive.add(best_bid_entry.order_id)
-                    self._resting.pop(best_bid_entry.order_id, None)
-                    events.append(OrderEvent(
-                        order_id=best_bid_entry.order_id,
-                        trader_id=best_bid_entry.trader_id,
-                        side=Side.BUY,
-                        price=best_bid_entry.price,
-                        quantity=match_qty,
-                        tick=order.tick,
-                        event_type=EventType.FILLED,
-                    ))
-                else:
-                    self._bids[0] = _BidEntry(
-                        neg_price=-best_bid_entry.price,
-                        tick=best_bid_entry.tick,
-                        order_id=best_bid_entry.order_id,
-                        trader_id=best_bid_entry.trader_id,
-                        quantity=new_resting_qty,
-                        price=best_bid_entry.price,
-                    )
-                    heapq.heapify(self._bids)
-                    self._resting[best_bid_entry.order_id]["quantity"] = new_resting_qty
-                    events.append(OrderEvent(
-                        order_id=best_bid_entry.order_id,
-                        trader_id=best_bid_entry.trader_id,
-                        side=Side.BUY,
-                        price=best_bid_entry.price,
-                        quantity=match_qty,
-                        tick=order.tick,
-                        event_type=EventType.PARTIAL_FILL,
-                    ))
-
-        # Log the incoming order's own fill/rest event
         if remaining_qty == 0:
             events.append(OrderEvent.from_order(order, EventType.FILLED))
-        elif remaining_qty < order.quantity:
-            # Partially filled → log partial fill then rest the remainder
-            partial_order = Order(
-                order_id=order.order_id,
-                trader_id=order.trader_id,
-                side=order.side,
-                price=order.price,
-                quantity=order.quantity - remaining_qty,
-                tick=order.tick,
-                order_type="limit",
-            )
-            events.append(OrderEvent.from_order(partial_order, EventType.PARTIAL_FILL))
-            self._rest_order(order, remaining_qty)
         else:
-            # Not filled at all → rest on the book
+            if remaining_qty < order.quantity:
+                filled = Order(
+                    order_id=order.order_id,
+                    trader_id=order.trader_id,
+                    side=order.side,
+                    price=order.price,
+                    quantity=order.quantity - remaining_qty,
+                    tick=order.tick,
+                    order_type="limit",
+                )
+                events.append(OrderEvent.from_order(filled, EventType.PARTIAL_FILL))
             self._rest_order(order, remaining_qty)
 
         return trades, events
 
     def _rest_order(self, order: Order, quantity: int) -> None:
-        """Place an order (or remaining quantity) onto the book."""
+        """Place an order (or its remaining quantity) onto the book."""
+        self._arrival_seq += 1
         if order.side == Side.BUY:
-            entry = _BidEntry(
+            heapq.heappush(self._bids, _BidEntry(
                 neg_price=-order.price,
-                tick=order.tick,
+                seq=self._arrival_seq,
                 order_id=order.order_id,
                 trader_id=order.trader_id,
                 quantity=quantity,
                 price=order.price,
-            )
-            heapq.heappush(self._bids, entry)
+            ))
+            self._bid_levels[order.price] = self._bid_levels.get(order.price, 0) + quantity
         else:
-            entry = _AskEntry(
+            heapq.heappush(self._asks, _AskEntry(
                 price=order.price,
-                tick=order.tick,
+                seq=self._arrival_seq,
                 order_id=order.order_id,
                 trader_id=order.trader_id,
                 quantity=quantity,
-            )
-            heapq.heappush(self._asks, entry)
-
+            ))
+            self._ask_levels[order.price] = self._ask_levels.get(order.price, 0) + quantity
         self._resting[order.order_id] = {
             "price": order.price,
             "quantity": quantity,
@@ -565,88 +491,48 @@ class OrderBook:
 
         Edge Case E3: cancel of a filled or unknown order_id → no-op,
         log rejected_cancel event, NEVER raise an exception.
-        This is critical for the spoofing agent, which may attempt to cancel
-        an order that was partially or fully filled before the cancel arrived.
         """
         target_id = order.order_id
-
         if target_id in self._inactive or target_id not in self._resting:
-            # Filled, already cancelled, or was never in the book
-            event = OrderEvent.rejected_cancel(
-                order_id=target_id,
-                trader_id=order.trader_id,
-                tick=order.tick,
-            )
-            return [], [event]
+            return [], [OrderEvent.rejected_cancel(target_id, order.trader_id, order.tick)]
 
-        # Order is resting — mark inactive (lazy deletion from heap)
-        resting_info = self._resting.pop(target_id)
+        info = self._resting.pop(target_id)
         self._inactive.add(target_id)
-
-        event = OrderEvent(
+        levels = self._bid_levels if info["side"] == Side.BUY else self._ask_levels
+        self._reduce_level(levels, info["price"], info["quantity"])
+        return [], [OrderEvent(
             order_id=target_id,
-            trader_id=resting_info["trader_id"],
-            side=resting_info["side"],
-            price=resting_info["price"],
-            quantity=resting_info["quantity"],
+            trader_id=info["trader_id"],
+            side=info["side"],
+            price=info["price"],
+            quantity=info["quantity"],
             tick=order.tick,
             event_type=EventType.CANCELLED,
-        )
-        return [], [event]
+        )]
 
     # -----------------------------------------------------------------------
-    # Private: heap maintenance
+    # Private: heap / level maintenance
     # -----------------------------------------------------------------------
 
-    def _clean_top(self, heap: list, *, is_bid: bool) -> None:
-        """
-        Remove inactive entries from the top of a heap (lazy deletion).
-        Modifies heap in place.
-        """
-        while heap:
-            top_id = heap[0].order_id
-            if top_id in self._inactive:
-                heapq.heappop(heap)
-            else:
-                break
+    @staticmethod
+    def _reduce_level(levels: dict[float, int], price: float, qty: int) -> None:
+        left = levels.get(price, 0) - qty
+        if left > 0:
+            levels[price] = left
+        else:
+            levels.pop(price, None)
 
-    def _aggregate_depth(
-        self,
-        heap: list,
-        *,
-        is_bid: bool,
-        depth: int,
-    ) -> list[tuple[float, int]]:
-        """
-        Compute the depth-N price level aggregation for book_state().
-
-        Returns a list of (price, total_quantity) tuples, bids descending,
-        asks ascending, up to `depth` levels.
-        Does NOT modify the heap.
-        """
-        levels: dict[float, int] = {}
-        seen_inactive = set()
-
-        for entry in heap:
-            if entry.order_id in self._inactive:
-                continue
-            price = entry.price if is_bid else entry.price
-            levels[price] = levels.get(price, 0) + entry.quantity
-            if len(levels) >= depth * 3:  # approximate limit for performance
-                break
-
-        sorted_levels = sorted(levels.items(), key=lambda x: -x[0] if is_bid else x[0])
-        return sorted_levels[:depth]
+    def _clean_top(self, heap: list) -> None:
+        """Pop inactive entries from the top of a heap (lazy deletion)."""
+        while heap and heap[0].order_id in self._inactive:
+            heapq.heappop(heap)
 
     # -----------------------------------------------------------------------
     # Snapshot utilities
     # -----------------------------------------------------------------------
 
     def to_dataframes(self) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Return the current resting book as (bids_df, asks_df) DataFrames.
-        Useful for debugging and sanity-check plots.
-        """
+        """Return the current resting book as (bids_df, asks_df) DataFrames."""
         bids = []
         asks = []
         for oid, info in self._resting.items():
@@ -655,22 +541,6 @@ class OrderBook:
                 bids.append(row)
             else:
                 asks.append(row)
-
         bids_df = pd.DataFrame(bids).sort_values("price", ascending=False) if bids else pd.DataFrame()
         asks_df = pd.DataFrame(asks).sort_values("price", ascending=True) if asks else pd.DataFrame()
         return bids_df, asks_df
-
-
-# ===========================================================================
-# Helpers
-# ===========================================================================
-
-
-def make_order_id() -> str:
-    """Generate a unique order identifier."""
-    return str(uuid.uuid4())
-
-
-def make_event_id() -> str:
-    """Generate a unique manipulation event identifier."""
-    return str(uuid.uuid4())

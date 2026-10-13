@@ -867,16 +867,16 @@ def _render_all_commodities_view(
 
 # ── Main render ──────────────────────────────────────────────────────────────
 
-def render_market_tab(run_dir: Path | None, selected_round: int) -> None:
+def render_market_tab(run_dir: Path | None, selected_round: int, market: str | None = None) -> None:
     if run_dir is None:
         st.warning("No run selected. Use the sidebar to pick a run.")
         return
 
     # ── Fast Data loading (without loading massive raw order log) ─────────────
     with st.spinner("Loading market data…"):
-        ohlcv   = load_ohlcv(str(run_dir), selected_round)
-        trades  = load_trade_log(str(run_dir), selected_round)
-        events  = load_manipulation_events(str(run_dir), selected_round)
+        ohlcv   = load_ohlcv(str(run_dir), selected_round, market)
+        trades  = load_trade_log(str(run_dir), selected_round, market)
+        events  = load_manipulation_events(str(run_dir), selected_round, market)
         r_metrics = load_round_metrics_json(str(run_dir), selected_round)
 
     # ── Commodity selector ───────────────────────────────────────────────
@@ -1006,7 +1006,7 @@ def render_market_tab(run_dir: Path | None, selected_round: int) -> None:
         "Elevated cancel rate (>50%) and high OTR are hallmarks of spoofing. "
         "Shaded regions indicate ground-truth manipulation windows."
     )
-    micro_df = load_microstructure_resampled(str(run_dir), selected_round, sel_commodity)
+    micro_df = load_microstructure_resampled(str(run_dir), selected_round, sel_commodity, market=market)
     fig_micro = _build_microstructure_chart(comm_trades, micro_df, comm_events)
     st.plotly_chart(fig_micro, use_container_width=True, config={"displayModeBar": False}, key=f"fig_micro_{sel_commodity}")
 

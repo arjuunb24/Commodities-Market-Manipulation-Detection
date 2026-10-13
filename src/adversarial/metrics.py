@@ -1,8 +1,17 @@
 """
 src/adversarial/metrics.py
 ==========================
-Helper functions for computing, comparing, and persisting per-round
-detection metrics.
+Computing, comparing and persisting per-round detection metrics.
+
+Two levels, both per persona (SRS FR-2.6 — never one lumped number):
+
+  Row level    precision / recall / F1 / FPR over (account, window) rows, using
+               each persona classifier's tuned-threshold flag.
+  Event level  an episode counts as detected when any of its accounts is flagged
+               for that persona in a window overlapping the episode. Detection
+               latency = window_end of the first such flag − episode start
+               (FR-2.7); missed episodes have NaN latency and are reported as
+               misses, never averaged in as zero.
 """
 
 from __future__ import annotations
@@ -14,9 +23,42 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import precision_score, recall_score, f1_score
+from sklearn.metrics import f1_score, precision_score, recall_score
+
+from src.utils import io as io_utils
 
 logger = logging.getLogger(__name__)
+
+
+def _persona_pred(results: pd.DataFrame, persona: str, threshold: float) -> np.ndarray:
+    if f"flag_{persona}" in results.columns:
+        return results[f"flag_{persona}"].astype(int).to_numpy()
+    if f"prob_{persona}" in results.columns:
+        return (results[f"prob_{persona}"] > threshold).astype(int).to_numpy()
+    return results["final_flag" if "final_flag" in results else "ensemble_flag"].astype(int).to_numpy()
+
+
+def event_detection(
+    results: pd.DataFrame,
+    events: pd.DataFrame,
+    persona: str,
+) -> tuple[int, int, list[float]]:
+    """Returns (n_events, n_detected, latencies_of_detected_events)."""
+    ev = events[events["persona"] == persona] if events is not None and not events.empty else pd.DataFrame()
+    if ev.empty:
+        return 0, 0, []
+    flag_col = f"flag_{persona}"
+    if flag_col not in results.columns:
+        return len(ev), 0, []
+    hits = results[results[flag_col].astype(bool)].reset_index()
+    latencies: list[float] = []
+    for _, e in ev.iterrows():
+        accts = set(e["trader_ids"])
+        h = hits[(hits["commodity"] == e["commodity"]) & hits["trader_id"].isin(accts)
+                 & (hits["window_end"] >= e["start_tick"]) & (hits["window_start"] <= e["end_tick"])]
+        if not h.empty:
+            latencies.append(float(max(0, int(h["window_end"].min()) - int(e["start_tick"]))))
+    return len(ev), len(latencies), latencies
 
 
 def compute_round_metrics(
@@ -24,137 +66,166 @@ def compute_round_metrics(
     y: pd.DataFrame,
     personas: list[str],
     threshold: float = 0.5,
+    events: pd.DataFrame | None = None,
 ) -> dict[str, dict[str, float]]:
     """
-    Computes per-persona Precision, Recall, F1 and FPR by comparing 
-    ensemble_flag / supervised probabilities against ground-truth labels.
+    Per-persona metrics for one scored test set.
 
-    Args:
-        results:   Output of DetectorPipeline.score(X) — contains ensemble_flag,
-                   prob_<persona> columns, sup_flag, iso_flag.
-        y:         Ground-truth label DataFrame from DetectorPipeline._generate_labels().
-                   Columns are persona names, values are 0/1 integers.
-        personas:  List of persona names matching y's columns.
-        threshold: Probability threshold for supervised per-persona flags.
-
-    Returns:
-        Dict: {persona: {precision, recall, f1, fpr, support}}
+    Returns {persona: {precision, recall, f1, fpr, support, events_total,
+                       events_detected, detection_latency_ticks}}.
+    A persona with no positive rows gets NaN precision/recall/F1 (undefined,
+    not zero) and support 0.
     """
     metrics: dict[str, dict[str, float]] = {}
-
-    # Align indexes (both share the same (commodity, timestamp) MultiIndex)
     common_idx = results.index.intersection(y.index)
     if common_idx.empty:
         logger.warning("No common index between results and labels. Returning empty metrics.")
         return {}
-
-    results_aligned = results.loc[common_idx]
-    y_aligned = y.loc[common_idx]
+    res = results.loc[common_idx]
+    lab = y.loc[common_idx]
 
     for persona in personas:
-        if persona not in y_aligned.columns:
+        if persona not in lab.columns:
             continue
-
-        y_true = y_aligned[persona].values
-
-        # Use per-persona probability column if available, else fall back to ensemble_flag
-        prob_col = f"prob_{persona}"
-        if prob_col in results_aligned.columns:
-            y_pred = (results_aligned[prob_col] > threshold).astype(int).values
-        else:
-            y_pred = results_aligned["ensemble_flag"].astype(int).values
-
-        # Handle degenerate case: all zeros in y_true → model can't be evaluated
-        if y_true.sum() == 0:
-            logger.warning(f"No positive labels for persona '{persona}' in this round. Skipping.")
-            metrics[persona] = {"precision": 0.0, "recall": 0.0, "f1": 0.0, "fpr": 0.0, "support": 0}
-            continue
-
-        precision = precision_score(y_true, y_pred, zero_division=0)
-        recall    = recall_score(y_true, y_pred, zero_division=0)
-        f1        = f1_score(y_true, y_pred, zero_division=0)
-
-        # FPR = FP / (FP + TN)
+        y_true = lab[persona].astype(int).to_numpy()
+        y_pred = _persona_pred(res, persona, threshold)
         tn = int(((y_true == 0) & (y_pred == 0)).sum())
         fp = int(((y_true == 0) & (y_pred == 1)).sum())
         fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-
-        metrics[persona] = {
-            "precision": round(float(precision), 4),
-            "recall":    round(float(recall), 4),
-            "f1":        round(float(f1), 4),
-            "fpr":       round(fpr, 4),
-            "support":   int(y_true.sum()),
+        n_ev, n_det, lats = event_detection(res, events, persona) if events is not None else (0, 0, [])
+        entry: dict[str, Any] = {
+            "fpr": round(fpr, 4),
+            "support": int(y_true.sum()),
+            "events_total": n_ev,
+            "events_detected": n_det,
+            "detection_latency_ticks": round(float(np.mean(lats)), 1) if lats else float("nan"),
         }
-
-        logger.info(
-            f"[Metrics] Round persona={persona}: "
-            f"P={precision:.3f} R={recall:.3f} F1={f1:.3f} FPR={fpr:.3f}"
-        )
-
+        if y_true.sum() == 0:
+            logger.warning("No positive labels for persona '%s' in this test set.", persona)
+            entry.update({"precision": float("nan"), "recall": float("nan"), "f1": float("nan")})
+        else:
+            entry.update({
+                "precision": round(float(precision_score(y_true, y_pred, zero_division=0)), 4),
+                "recall": round(float(recall_score(y_true, y_pred, zero_division=0)), 4),
+                "f1": round(float(f1_score(y_true, y_pred, zero_division=0)), 4),
+            })
+            logger.info("[Metrics] %s: P=%.3f R=%.3f F1=%.3f FPR=%.3f events %d/%d",
+                        persona, entry["precision"], entry["recall"], entry["f1"], fpr, n_det, n_ev)
+        metrics[persona] = entry
     return metrics
 
 
-def compute_shap_drift(
-    shap_a: dict[str, float],
-    shap_b: dict[str, float],
-) -> dict[str, float]:
-    """
-    Computes the change in feature importance between two rounds.
-    Returns a dict of {feature_name: delta} sorted by abs(delta) descending.
-    """
-    all_features = set(shap_a) | set(shap_b)
-    drift = {}
-    for feat in all_features:
-        val_a = shap_a.get(feat, 0.0)
-        val_b = shap_b.get(feat, 0.0)
-        drift[feat] = round(val_b - val_a, 4)
+def compute_unsupervised_metrics(results: pd.DataFrame, y: pd.DataFrame) -> dict[str, float]:
+    """IsolationForest flags vs. 'any manipulation' (it is persona-agnostic)."""
+    idx = results.index.intersection(y.index)
+    if idx.empty or "iso_flag" not in results:
+        return {}
+    y_any = (y.loc[idx].sum(axis=1) > 0).astype(int).to_numpy()
+    pred = results.loc[idx, "iso_flag"].astype(int).to_numpy()
+    fp = int(((y_any == 0) & (pred == 1)).sum())
+    tn = int(((y_any == 0) & (pred == 0)).sum())
+    return {
+        "precision": round(float(precision_score(y_any, pred, zero_division=0)), 4),
+        "recall": round(float(recall_score(y_any, pred, zero_division=0)), 4),
+        "f1": round(float(f1_score(y_any, pred, zero_division=0)), 4),
+        "fpr": round(fp / (fp + tn), 4) if fp + tn else 0.0,
+        "support": int(y_any.sum()),
+    }
 
+
+def compute_shap_drift(shap_a: dict[str, float], shap_b: dict[str, float]) -> dict[str, float]:
+    """Change in feature importance between two rounds, sorted by |delta|."""
+    drift = {f: round(shap_b.get(f, 0.0) - shap_a.get(f, 0.0), 6) for f in set(shap_a) | set(shap_b)}
     return dict(sorted(drift.items(), key=lambda kv: abs(kv[1]), reverse=True))
+
+
+def _clean(obj):
+    """JSON-safe copy (NaN → None)."""
+    if isinstance(obj, dict):
+        return {k: _clean(v) for k, v in obj.items()}
+    if isinstance(obj, float) and np.isnan(obj):
+        return None
+    return obj
 
 
 def save_round_metrics(
     metrics: dict[str, dict[str, float]],
     round_num: int,
     round_dir: Path,
+    *,
+    pre_retrain: dict[str, dict[str, float]] | None = None,
+    unsupervised: dict[str, float] | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> None:
-    """Persists round metrics to JSON and updates the cumulative parquet file."""
+    """Persist round metrics to round_dir/metrics.json ("personas" = post-retrain)."""
     round_dir.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {"round": round_num, "personas": metrics}
+    if pre_retrain is not None:
+        payload["pre_retrain"] = pre_retrain
+    if unsupervised is not None:
+        payload["unsupervised"] = unsupervised
+    if extra:
+        payload.update(extra)
+    with open(round_dir / "metrics.json", "w") as f:
+        json.dump(_clean(payload), f, indent=2)
+    logger.info("Round %d metrics saved to %s", round_num, round_dir / "metrics.json")
 
-    # Save per-round JSON
-    metrics_path = round_dir / "metrics.json"
-    payload = {"round": round_num, "personas": metrics}
-    with open(metrics_path, "w") as f:
-        json.dump(payload, f, indent=2)
-    logger.info(f"Round {round_num} metrics saved to {metrics_path}")
 
-
-def load_round_metrics(round_dir: Path) -> dict[str, dict[str, float]]:
-    """Loads metrics.json from a round directory."""
-    path = round_dir / "metrics.json"
+def load_round_metrics(round_dir: Path, phase: str = "post") -> dict[str, dict[str, float]]:
+    """Load metrics.json; phase 'post' (default) or 'pre'."""
+    path = Path(round_dir) / "metrics.json"
     if not path.exists():
         return {}
-    with open(path, "r") as f:
+    with open(path) as f:
         data = json.load(f)
-    return data.get("personas", {})
+    return data.get("personas" if phase == "post" else "pre_retrain", {}) or {}
 
 
 def build_summary_table(all_metrics: list[dict[str, Any]]) -> pd.DataFrame:
     """
-    Converts a list of {round, persona, precision, recall, f1} dicts
-    into a tidy DataFrame for pretty-printing and parquet export.
+    Tidy table: one row per (round, persona, phase).
+
+    all_metrics entries: {"round": r, "personas": post_metrics, "pre_retrain": pre_metrics?}
     """
     rows = []
     for entry in all_metrics:
-        rnd = entry["round"]
-        for persona, m in entry["personas"].items():
-            rows.append({
-                "round": rnd,
-                "persona": persona,
-                "precision": m.get("precision", 0.0),
-                "recall":    m.get("recall", 0.0),
-                "f1":        m.get("f1", 0.0),
-                "fpr":       m.get("fpr", 0.0),
-                "support":   m.get("support", 0),
-            })
-    return pd.DataFrame(rows)
+        for phase, key in (("post", "personas"), ("pre", "pre_retrain")):
+            for persona, m in (entry.get(key) or {}).items():
+                rows.append({
+                    "round": entry["round"],
+                    "persona": persona,
+                    "phase": phase,
+                    "precision": m.get("precision"),
+                    "recall": m.get("recall"),
+                    "f1": m.get("f1"),
+                    "fpr": m.get("fpr"),
+                    "support": m.get("support", 0),
+                    "events_total": m.get("events_total", 0),
+                    "events_detected": m.get("events_detected", 0),
+                    "detection_latency_ticks": m.get("detection_latency_ticks"),
+                    "effectiveness_ratio": (entry.get("effectiveness_ratio") or {}).get(persona),
+                    "mutation_score": (entry.get("mutation_score") or {}).get(persona),
+                })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        for c in ("precision", "recall", "f1", "fpr", "detection_latency_ticks"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def write_round_metrics_parquet(summary: pd.DataFrame, commodity: str, path: Path) -> None:
+    """Schema-validated round_metrics.parquet (SRS §6.1 round_metrics contract)."""
+    if summary.empty:
+        return
+    df = pd.DataFrame({
+        "round_num": summary["round"].astype("int64"),
+        "commodity": commodity,
+        "persona": summary["persona"].astype(str),
+        "precision": summary["precision"].astype(float),
+        "recall": summary["recall"].astype(float),
+        "f1": summary["f1"].astype(float),
+        "fpr": summary["fpr"].astype(float),
+        "detection_latency_ticks": summary["detection_latency_ticks"].astype(float),
+        "is_post_retrain": (summary["phase"] == "post").astype(bool),
+    })
+    io_utils.write_parquet(df, path, "round_metrics", overwrite=True)

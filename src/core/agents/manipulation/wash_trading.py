@@ -1,165 +1,79 @@
 """
 src/core/agents/manipulation/wash_trading.py
 =============================================
-Wash Trading Pair — two colluding trader_ids crossing pre-arranged trades
-with no net inventory change.
+Wash trading persona — pre-arranged crosses between colluding accounts.
 
 CFTC Definition:
   "Entering into, or purporting to enter into, transactions to give the
   appearance of purchases and sales but resulting in no net change in
   the trader's market position."
 
-Grounded in:
-  - CFTC v. Kraft Foods Group (2015): $16M wash trading settlement
-  (see docs/enforcement_case_notes.md)
+How it works in practice (Kraft 2015 and the wash-trade cases in
+docs/enforcement_case_notes.md) — and how this persona reproduces it:
 
-Mechanism:
-  Two trader_ids (wash_buyer and wash_seller) simultaneously:
-  1. Wash buyer places a buy limit order near mid-price.
-  2. Wash seller places a matching sell limit order at same price.
-  These cross in the order book, creating artificial volume with no net
-  inventory change across the pair.
+  * Two accounts under common control trade with EACH OTHER. One rests a limit
+    order and the other immediately takes it at the same price and size. In a
+    real book this is done inside the spread so no third party gets in between.
+  * The roles alternate, so each account's net position stays ≈ 0 while gross
+    volume is large — the trades print volume, nothing changes hands.
+  * Any leg that could not be matched with the partner is cancelled straight
+    away (the colluders do not want genuine exposure).
 
-  In the order book, buyer_trader_id != seller_trader_id (two distinct
-  trader_ids), so the trade appears legitimate at the book level.
-  The manipulation is revealed by the net-position/gross-volume ratio
-  feature: each account's gross volume is high, net position ≈ 0.
+The previous implementation had each account independently send aggressive
+orders at mid ± 0.1%, which mostly traded against *other* participants — i.e.
+two directional traders, not a wash. That has been replaced by the cross above.
 
-Note on self-cross:
-  The book does NOT prevent this. The WashTradingPair uses two SEPARATE
-  trader_ids for the two sides — this is intentional design.
+Evasion knobs (docs/enforcement_case_notes.md):
+  ring_size        accounts per colluding group; crosses rotate A→B→C→A so no
+                   single pair dominates (Coinbase cyclical washes)
+  n_groups         independent groups; the persona's total cross rate is SPLIT
+                   across them (account proliferation dilutes per-account
+                   signals without adding volume — advisory #3, Kraft round 2)
+  size_jitter      0 = fixed scripted lot size; higher = varied sizes
+  camouflage_rate  share of cycles in which an account instead takes a small
+                   genuine directional trade from the market (Kraft round 2,
+                   advisory #4) — costs real exposure and wash volume
+price_deviation_from_mid only moves the cross price inside the spread, so it
+has almost no market effect and is not offered to the strategist.
 """
 
 from __future__ import annotations
 
-import uuid
-
 import numpy as np
 
-from src.core.agents.base import Agent
+from src.core.agents.manipulation.common import ManipulationController, ManipulatorAccount
 from src.core.order_book import BookState, Order, Side
 
 
-class WashBuyer(Agent):
-    """The buy-side of a wash trading pair. Must be paired with a WashSeller."""
-
-    def __init__(
-        self,
-        trader_id: str,
-        rng: np.random.Generator,
-        partner_trader_id: str,
-        *,
-        trade_frequency: float = 0.5,
-        price_deviation_from_mid: float = 0.001,
-        start_tick: int = 0,
-        end_tick: int = 10000,
-    ) -> None:
-        super().__init__(trader_id, rng)
-        self.partner_trader_id = partner_trader_id
-        self.trade_frequency = trade_frequency
-        self.price_deviation_from_mid = price_deviation_from_mid
-        self.start_tick = start_tick
-        self.end_tick = end_tick
-
-    def decide(self, book_state: BookState, tick: int) -> Order | None:
-        if tick < self.start_tick or tick > self.end_tick:
-            return None
-
-        if self.rng.random() > self.trade_frequency:
-            return None
-
-        ref_price = book_state.mid_price or book_state.last_trade_price
-        if ref_price is None or ref_price <= 0:
-            return None
-
-        # Place a buy slightly above mid (aggressive enough to cross the wash seller)
-        buy_price = round(ref_price * (1 + self.price_deviation_from_mid), 4)
-
-        return Order(
-            order_id=str(uuid.uuid4()),
-            trader_id=self.trader_id,
-            side=Side.BUY,
-            price=buy_price,
-            quantity=int(self.rng.integers(100, 500)),
-            tick=tick,
-            order_type="limit",
-        )
+WASH_BASE_LOT = 120
 
 
-class WashSeller(Agent):
-    """The sell-side of a wash trading pair. Must be paired with a WashBuyer."""
-
-    def __init__(
-        self,
-        trader_id: str,
-        rng: np.random.Generator,
-        partner_trader_id: str,
-        *,
-        trade_frequency: float = 0.5,
-        price_deviation_from_mid: float = 0.001,
-        start_tick: int = 0,
-        end_tick: int = 10000,
-    ) -> None:
-        super().__init__(trader_id, rng)
-        self.partner_trader_id = partner_trader_id
-        self.trade_frequency = trade_frequency
-        self.price_deviation_from_mid = price_deviation_from_mid
-        self.start_tick = start_tick
-        self.end_tick = end_tick
-
-    def decide(self, book_state: BookState, tick: int) -> Order | None:
-        if tick < self.start_tick or tick > self.end_tick:
-            return None
-
-        if self.rng.random() > self.trade_frequency:
-            return None
-
-        ref_price = book_state.mid_price or book_state.last_trade_price
-        if ref_price is None or ref_price <= 0:
-            return None
-
-        # Place a sell slightly below mid (aggressive enough to cross the wash buyer)
-        sell_price = round(ref_price * (1 - self.price_deviation_from_mid), 4)
-
-        return Order(
-            order_id=str(uuid.uuid4()),
-            trader_id=self.trader_id,
-            side=Side.SELL,
-            price=sell_price,
-            quantity=int(self.rng.integers(100, 500)),
-            tick=tick,
-            order_type="limit",
-        )
-
-
-class WashTradingPair:
-    """
-    Factory that creates and manages a coordinated WashBuyer + WashSeller pair.
-
-    Usage:
-        pair = WashTradingPair.create(rng, pair_index=0, **params)
-        agents = pair.agents  # [WashBuyer, WashSeller]
-        event = pair.log_activity(start_tick)  # manipulation_events row
-
-    The simulation loop adds both agents to its agent list.
-    """
+class WashTradingRing(ManipulationController):
+    """One group of colluding accounts crossing pre-arranged trades with each other."""
 
     PERSONA = "wash_trading"
 
     def __init__(
         self,
-        buyer: WashBuyer,
-        seller: WashSeller,
+        accounts: list[ManipulatorAccount],
+        rng: np.random.Generator,
+        *,
+        trade_frequency: float,
+        price_deviation_from_mid: float,
         start_tick: int,
         end_tick: int,
-        parameters: dict,
+        size_jitter: float = 0.0,
+        camouflage_rate: float = 0.0,
+        n_groups: int = 1,
     ) -> None:
-        self.buyer = buyer
-        self.seller = seller
-        self.start_tick = start_tick
-        self.end_tick = end_tick
-        self.parameters = parameters
-        self.agents: list[Agent] = [buyer, seller]
+        super().__init__(accounts, start_tick, end_tick)
+        self.rng = rng
+        self.trade_frequency = trade_frequency
+        self.price_deviation_from_mid = price_deviation_from_mid
+        self.size_jitter = float(np.clip(size_jitter, 0.0, 0.95))
+        self.camouflage_rate = float(np.clip(camouflage_rate, 0.0, 0.9))
+        self.n_groups = max(1, int(n_groups))
+        self._next = 0
 
     @classmethod
     def create(
@@ -171,42 +85,79 @@ class WashTradingPair:
         price_deviation_from_mid: float = 0.001,
         start_tick: int = 0,
         end_tick: int = 10000,
-    ) -> "WashTradingPair":
-        buyer_id = f"wash_buyer_{pair_index}"
-        seller_id = f"wash_seller_{pair_index}"
-
-        # Each agent gets its own sub-generator (rng.spawn(1)[0]) for independence
-        buyer_rng, seller_rng = rng.spawn(2)
-
-        buyer = WashBuyer(
-            buyer_id, buyer_rng, seller_id,
+        background_rate: float = 0.05,
+        ring_size: int = 2,
+        size_jitter: float = 0.0,
+        camouflage_rate: float = 0.0,
+        n_groups: int = 1,
+    ) -> "WashTradingRing":
+        ring_size = max(2, int(ring_size))
+        ctrl_rng, *acct_rngs = rng.spawn(ring_size + 1)
+        accounts = [
+            ManipulatorAccount(f"wash_{pair_index}{chr(ord('a') + k)}", acct_rngs[k], background_rate=background_rate)
+            for k in range(ring_size)
+        ]
+        return cls(
+            accounts, ctrl_rng,
             trade_frequency=trade_frequency,
             price_deviation_from_mid=price_deviation_from_mid,
-            start_tick=start_tick,
-            end_tick=end_tick,
-        )
-        seller = WashSeller(
-            seller_id, seller_rng, buyer_id,
-            trade_frequency=trade_frequency,
-            price_deviation_from_mid=price_deviation_from_mid,
-            start_tick=start_tick,
-            end_tick=end_tick,
+            start_tick=start_tick, end_tick=end_tick,
+            size_jitter=size_jitter, camouflage_rate=camouflage_rate, n_groups=n_groups,
         )
 
-        params = {
-            "trade_frequency": trade_frequency,
-            "price_deviation_from_mid": price_deviation_from_mid,
-            "n_colluding_pairs": 1,  # this pair
-        }
-        return cls(buyer, seller, start_tick, end_tick, params)
+    @property
+    def buyer(self) -> ManipulatorAccount:  # kept for backward compatibility
+        return self.accounts[0]
 
-    def log_activity(self) -> dict:
-        """Return a manipulation_events row for this pair."""
+    @property
+    def seller(self) -> ManipulatorAccount:
+        return self.accounts[1]
+
+    def parameters_snapshot(self) -> dict:
         return {
-            "event_id": str(uuid.uuid4()),
-            "persona": self.PERSONA,
-            "start_tick": self.start_tick,
-            "end_tick": self.end_tick,
-            "trader_ids": [self.buyer.trader_id, self.seller.trader_id],
-            "parameters": self.parameters,
+            "trade_frequency": self.trade_frequency * self.n_groups,
+            "price_deviation_from_mid": self.price_deviation_from_mid,
+            "n_groups": self.n_groups,
+            "ring_size": len(self.accounts),
+            "size_jitter": self.size_jitter,
+            "camouflage_rate": self.camouflage_rate,
         }
+
+    def _lot(self) -> int:
+        j = self.size_jitter
+        return max(5, int(round(WASH_BASE_LOT * self.rng.uniform(1 - j, 1 + j))))
+
+    def manipulate(self, state: BookState, tick: int) -> list[Order]:
+        if self.rng.random() > self.trade_frequency:
+            return []
+        if state.best_bid is None or state.best_ask is None:
+            return []
+
+        n = len(self.accounts)
+        a = self.accounts[self._next % n]
+        b = self.accounts[(self._next + 1) % n]
+        self._next += 1
+
+        if self.rng.random() < self.camouflage_rate:
+            # Genuine directional trade against the market, sized like normal flow.
+            side = Side.BUY if a.net_position <= 0 else Side.SELL
+            price = state.best_ask if side == Side.BUY else state.best_bid
+            return [a.limit(side, price, int(self.rng.integers(10, 40)), tick, exact_ttl=2, tag="c")]
+
+        tick_size = a.tick_size
+        lo, hi = state.best_bid + tick_size, state.best_ask - tick_size
+        if hi < lo - 1e-12:
+            return []  # no price strictly inside the spread: wait rather than trade with strangers
+        mid = (state.best_bid + state.best_ask) / 2
+        price = float(np.clip(mid * (1 + self.price_deviation_from_mid * self.rng.uniform(-1, 1)), lo, hi))
+        qty = self._lot()
+        rest_side = Side.SELL if self.rng.random() < 0.5 else Side.BUY
+        take_side = Side.BUY if rest_side == Side.SELL else Side.SELL
+        # Unmatched remainders are pulled on the next tick.
+        leg1 = a.limit(rest_side, price, qty, tick, exact_ttl=1, tag="w")
+        leg2 = b.limit(take_side, leg1.price, qty, tick, exact_ttl=1, tag="w")
+        return [leg1, leg2]
+
+
+# Backward-compatible name (a pair is a ring of size 2).
+WashTradingPair = WashTradingRing

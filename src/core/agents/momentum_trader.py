@@ -11,13 +11,16 @@ Mechanism:
   a threshold, places a limit order in the direction of the trend.
   Order size scales linearly with momentum strength (stronger trend → larger order).
 
+Orders are marketable (priced through the opposite best quote) because trend
+followers demand immediacy, and each trader respects a position limit, so
+herding is bounded the way risk limits bound real CTAs.
+
 This agent is intentionally exploitable by the PumpDump persona, which
 relies on momentum traders amplifying a coordinated price burst.
 """
 
 from __future__ import annotations
 
-import uuid
 from collections import deque
 
 import numpy as np
@@ -30,16 +33,19 @@ class MomentumTrader(Agent):
     """
     Trend-following agent: buys in uptrends, sells in downtrends.
 
-    Tracks a rolling window of last_trade_prices to compute momentum.
-    Acts only when |momentum| >= threshold and activation Bernoulli fires.
+    Tracks a rolling window of trade prices to compute momentum and acts only
+    when |momentum| >= threshold and the activation Bernoulli fires.
 
     Args:
-        lookback_ticks: Number of past trade prices to use for trend computation.
-        momentum_threshold: Minimum |price change| / ref_price to trigger action.
+        lookback_ticks: Number of past per-tick price samples used for the trend.
+        momentum_threshold: Minimum |relative price change| to trigger action.
         order_size_base: Base order quantity.
-        order_size_scale: Multiplier: quantity = base + scale * |momentum| * 1000
+        order_size_scale: quantity = base + scale * |momentum| * 1000
         arrival_rate_lambda: Per-tick activation probability.
+        max_position: Absolute position limit (risk limit).
     """
+
+    mean_order_ttl = 8.0
 
     def __init__(
         self,
@@ -51,6 +57,7 @@ class MomentumTrader(Agent):
         order_size_base: int = 30,
         order_size_scale: float = 5.0,
         arrival_rate_lambda: float = 0.3,
+        max_position: int = 400,
     ) -> None:
         super().__init__(trader_id, rng)
         self.lookback_ticks = lookback_ticks
@@ -58,63 +65,46 @@ class MomentumTrader(Agent):
         self.order_size_base = order_size_base
         self.order_size_scale = order_size_scale
         self.arrival_rate_lambda = arrival_rate_lambda
-
-        # Rolling price history — fed by the simulation loop via update_price()
+        self.max_position = max_position
+        self.net_position = 0
         self._price_history: deque[float] = deque(maxlen=lookback_ticks)
 
     def update_price(self, price: float) -> None:
-        """
-        Feed a new trade price into the rolling window.
-        Called by the simulation loop after each tick that produced a trade.
-        """
+        """Feed the latest price into the rolling window (the simulation calls this once per tick)."""
         self._price_history.append(price)
 
+    def update_inventory(self, side: Side, quantity: int) -> None:
+        self.net_position += quantity if side == Side.BUY else -quantity
+
     def decide(self, book_state: BookState, tick: int) -> Order | None:
-        # --- Activation ---
         if self.rng.random() > self.arrival_rate_lambda:
             return None
-
-        # --- Need enough history ---
         if len(self._price_history) < 2:
             return None
 
-        # --- Compute momentum ---
         oldest = self._price_history[0]
         newest = self._price_history[-1]
-
         if oldest <= 0:
             return None
-
-        momentum = (newest - oldest) / oldest  # relative price change over window
-
+        momentum = (newest - oldest) / oldest
         if abs(momentum) < self.momentum_threshold:
-            return None  # trend not strong enough
+            return None
 
-        # --- Reference price for order placement ---
         ref_price = book_state.mid_price or book_state.last_trade_price or newest
         if ref_price is None or ref_price <= 0:
             return None
 
-        # --- Order direction follows trend ---
+        slip = self.rng.uniform(0.0, 0.0005)
         if momentum > 0:
+            if self.net_position >= self.max_position:
+                return None
             side = Side.BUY
-            price = ref_price + self.rng.uniform(0, 0.5)  # slightly aggressive
+            price = (book_state.best_ask or ref_price) * (1 + slip)
         else:
+            if self.net_position <= -self.max_position:
+                return None
             side = Side.SELL
-            price = ref_price - self.rng.uniform(0, 0.5)
+            price = (book_state.best_bid or ref_price) * (1 - slip)
 
-        price = round(max(price, 0.01), 4)
-
-        # Quantity scales with momentum strength
         quantity = int(self.order_size_base + self.order_size_scale * abs(momentum) * 1000)
-        quantity = max(1, quantity)
-
-        return Order(
-            order_id=str(uuid.uuid4()),
-            trader_id=self.trader_id,
-            side=side,
-            price=price,
-            quantity=quantity,
-            tick=tick,
-            order_type="limit",
-        )
+        return self.limit(side, max(price, self.tick_size), max(1, quantity), tick)

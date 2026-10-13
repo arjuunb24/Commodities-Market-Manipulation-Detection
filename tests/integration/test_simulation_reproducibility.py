@@ -124,3 +124,14 @@ def test_ohlcv_reproducible_same_seed(minimal_config: SimConfig) -> None:
             b2.loc[mask, col].values,
             rtol=1e-10, atol=1e-10,
         ), f"OHLCV column '{col}' not reproducible with same seed."
+
+
+def test_full_logs_identical_including_ids(minimal_config: SimConfig) -> None:
+    """FR-0.4 (strict): ids are deterministic too — every log is identical for the same seed."""
+    import pandas as pd
+    minimal_config.write_to_disk = False
+    a = run_simulation(minimal_config, seed=11)
+    b = run_simulation(minimal_config, seed=11)
+    pd.testing.assert_frame_equal(a.trade_log, b.trade_log)
+    pd.testing.assert_frame_equal(a.order_log, b.order_log)
+    pd.testing.assert_frame_equal(a.manipulation_events, b.manipulation_events)

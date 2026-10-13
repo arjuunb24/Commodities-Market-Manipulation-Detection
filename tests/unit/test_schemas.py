@@ -24,7 +24,8 @@ def test_trade_log_schema_valid() -> None:
             "price": 100.5,
             "quantity": 10,
             "buyer_trader_id": "b1",
-            "seller_trader_id": "s1"
+            "seller_trader_id": "s1",
+            "aggressor_side": "buy"
         }
     ])
     TradeLogSchema.validate(df)
@@ -38,7 +39,8 @@ def test_trade_log_schema_invalid_price() -> None:
             "price": -10.0,  # invalid
             "quantity": 10,
             "buyer_trader_id": "b1",
-            "seller_trader_id": "s1"
+            "seller_trader_id": "s1",
+            "aggressor_side": "buy"
         }
     ])
     with pytest.raises(SchemaError):

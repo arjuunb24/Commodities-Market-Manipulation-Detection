@@ -23,6 +23,43 @@ logger = logging.getLogger(__name__)
 RUNS_DIR = Path(__file__).resolve().parent.parent / "data" / "runs"
 
 
+# ── Test-market discovery (a round can have several held-out test markets) ──
+
+def _test_dirs(run_dir_str: str, round_num: int, market: str | None = None) -> list[Path]:
+    rd = Path(run_dir_str) / f"round_{round_num}"
+    dirs = [rd / "test"] + sorted((d for d in rd.glob("test_*") if d.is_dir()), key=lambda d: int(d.name.split("_")[1]))
+    dirs = [d for d in dirs if d.is_dir()]
+    if market is not None:
+        dirs = [d for d in dirs if d.name == market]
+    return dirs
+
+
+def list_test_markets(run_dir_str: str, round_num: int) -> list[str]:
+    """Names of a round's independent test markets ('test', 'test_1', ...)."""
+    return [d.name for d in _test_dirs(run_dir_str, round_num)]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def market_tick_range(run_dir_str: str, round_num: int, market: str) -> tuple[int, int] | None:
+    """(first, last) traded tick of one test market (reads only the tick column)."""
+    df = _read_test(run_dir_str, round_num, "trade_log.parquet", columns=["tick"], market=market)
+    if df.empty:
+        return None
+    return int(df["tick"].min()), int(df["tick"].max())
+
+
+def _read_test(run_dir_str: str, round_num: int, filename: str, columns: list[str] | None = None,
+               market: str | None = None) -> pd.DataFrame:
+    """
+    Read `filename` from one test market (`market`), or concatenate all of a
+    round's test markets when market is None. Each test market is a separate,
+    independently simulated market — views should normally pass `market`.
+    """
+    frames = [pd.read_parquet(d / filename, columns=columns) for d in _test_dirs(run_dir_str, round_num, market)
+              if (d / filename).exists()]
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
 # ── Run / round discovery ───────────────────────────────────────────────────
 
 def list_run_dirs() -> list[Path]:
@@ -51,15 +88,14 @@ def list_rounds(run_dir: Path) -> list[int]:
 # ── OHLCV ───────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_ohlcv(run_dir_str: str, round_num: int) -> pd.DataFrame:
+def load_ohlcv(run_dir_str: str, round_num: int, market: str | None = None) -> pd.DataFrame:
     """Loads ohlcv_bars.parquet from a round's test directory.
     
     Schema: bar_start (int tick), open, high, low, close, volume, commodity
     """
-    path = Path(run_dir_str) / f"round_{round_num}" / "test" / "ohlcv_bars.parquet"
-    if not path.exists():
-        return pd.DataFrame()
-    df = pd.read_parquet(path)
+    df = _read_test(run_dir_str, round_num, "ohlcv_bars.parquet", market=market)
+    if df.empty:
+        return df
     # Convert bar_start (tick integer) to a datetime for Plotly time-axis
     base_time = pd.Timestamp("2026-01-01")
     if "bar_start" in df.columns and "timestamp" not in df.columns:
@@ -74,14 +110,13 @@ def load_ohlcv(run_dir_str: str, round_num: int) -> pd.DataFrame:
 # ── Trade log ───────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_trade_log(run_dir_str: str, round_num: int) -> pd.DataFrame:
+def load_trade_log(run_dir_str: str, round_num: int, market: str | None = None) -> pd.DataFrame:
     """Loads trade_log.parquet.
     Schema: trade_id, tick, price, quantity, buyer_trader_id, seller_trader_id, commodity
     """
-    path = Path(run_dir_str) / f"round_{round_num}" / "test" / "trade_log.parquet"
-    if not path.exists():
-        return pd.DataFrame()
-    df = pd.read_parquet(path)
+    df = _read_test(run_dir_str, round_num, "trade_log.parquet", market=market)
+    if df.empty:
+        return df
     base_time = pd.Timestamp("2026-01-01")
     if "timestamp" not in df.columns and "tick" in df.columns:
         df["timestamp"] = base_time + pd.to_timedelta(df["tick"], unit="s")
@@ -91,14 +126,13 @@ def load_trade_log(run_dir_str: str, round_num: int) -> pd.DataFrame:
 # ── Order log ───────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=600, show_spinner=False)
-def load_order_log(run_dir_str: str, round_num: int) -> pd.DataFrame:
+def load_order_log(run_dir_str: str, round_num: int, market: str | None = None) -> pd.DataFrame:
     """Loads order_log.parquet.
     Schema: order_id, trader_id, side, price, quantity, tick, event_type, commodity
     """
-    path = Path(run_dir_str) / f"round_{round_num}" / "test" / "order_log.parquet"
-    if not path.exists():
-        return pd.DataFrame()
-    df = pd.read_parquet(path)
+    df = _read_test(run_dir_str, round_num, "order_log.parquet", market=market)
+    if df.empty:
+        return df
     base_time = pd.Timestamp("2026-01-01")
     if "timestamp" not in df.columns and "tick" in df.columns:
         df["timestamp"] = base_time + pd.to_timedelta(df["tick"], unit="s")
@@ -106,16 +140,14 @@ def load_order_log(run_dir_str: str, round_num: int) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def load_microstructure_resampled(run_dir_str: str, round_num: int, commodity: str, freq: str = "5min") -> pd.DataFrame:
+def load_microstructure_resampled(run_dir_str: str, round_num: int, commodity: str, freq: str = "5min",
+                                  market: str | None = None) -> pd.DataFrame:
     """Pre-aggregates 5-min cancel rate and order submits/cancels for a commodity.
     Reads only 3 columns to avoid loading ~1M order rows on every rerun.
     """
-    path = Path(run_dir_str) / f"round_{round_num}" / "test" / "order_log.parquet"
-    if not path.exists():
-        return pd.DataFrame()
     try:
         cols = ["tick", "event_type", "commodity"]
-        df = pd.read_parquet(path, columns=cols)
+        df = _read_test(run_dir_str, round_num, "order_log.parquet", columns=cols, market=market)
         if "commodity" in df.columns and commodity:
             df = df[df["commodity"] == commodity]
         if df.empty:
@@ -138,11 +170,10 @@ def load_microstructure_resampled(run_dir_str: str, round_num: int, commodity: s
 # ── Manipulation events ─────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_manipulation_events(run_dir_str: str, round_num: int) -> pd.DataFrame:
-    path = Path(run_dir_str) / f"round_{round_num}" / "test" / "manipulation_events.parquet"
-    if not path.exists():
-        return pd.DataFrame()
-    df = pd.read_parquet(path)
+def load_manipulation_events(run_dir_str: str, round_num: int, market: str | None = None) -> pd.DataFrame:
+    df = _read_test(run_dir_str, round_num, "manipulation_events.parquet", market=market)
+    if df.empty:
+        return df
     base = pd.Timestamp("2026-01-01")
     if "start_tick" in df.columns:
         df["start_time"] = base + pd.to_timedelta(df["start_tick"], unit="s")
@@ -154,44 +185,75 @@ def load_manipulation_events(run_dir_str: str, round_num: int) -> pd.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_round_metrics_json(run_dir_str: str, round_num: int) -> dict:
+    """metrics.json for a round; undefined metrics (stored as null) come back as NaN."""
     path = Path(run_dir_str) / f"round_{round_num}" / "metrics.json"
     if not path.exists():
         return {}
     with open(path) as f:
-        return json.load(f)
+        data = json.load(f)
+    for key in ("personas", "pre_retrain"):
+        for m in (data.get(key) or {}).values():
+            for k, v in list(m.items()):
+                if v is None:
+                    m[k] = float("nan")
+    return data
 
 
 # ── Cumulative metrics parquet ──────────────────────────────────────────────
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_cumulative_metrics(run_dir_str: str) -> pd.DataFrame:
-    path = Path(run_dir_str) / "round_metrics.parquet"
-    if not path.exists():
-        # Fall back: build from individual round JSON files
-        run_dir = Path(run_dir_str)
+def load_cumulative_metrics(run_dir_str: str, phase: str | None = "post") -> pd.DataFrame:
+    """
+    Per-round, per-persona metrics. Columns: round, persona, phase, precision,
+    recall, f1, fpr, support, events_total, events_detected, detection_latency_ticks.
+
+    phase: "post" (retrained detector — default), "pre" (frozen previous
+    detector) or None for both.
+    """
+    run_dir = Path(run_dir_str)
+    summary = run_dir / "round_summary.parquet"
+    if summary.exists():
+        df = pd.read_parquet(summary)
+    else:
         rows = []
         for d in sorted(run_dir.iterdir()):
-            if d.is_dir() and d.name.startswith("round_"):
+            if d.is_dir() and d.name.startswith("round_") and (d / "metrics.json").exists():
+                data = json.loads((d / "metrics.json").read_text())
                 rnd = int(d.name.split("_")[1])
-                m_path = d / "metrics.json"
-                if m_path.exists():
-                    with open(m_path) as f:
-                        data = json.load(f)
-                    for persona, m in data.get("personas", {}).items():
-                        rows.append({"round": rnd, "persona": persona, **m})
-        return pd.DataFrame(rows) if rows else pd.DataFrame()
-    return pd.read_parquet(path)
+                for ph, key in (("post", "personas"), ("pre", "pre_retrain")):
+                    for persona, m in (data.get(key) or {}).items():
+                        rows.append({"round": rnd, "persona": persona, "phase": ph, **m})
+        df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    if "phase" not in df.columns:  # runs produced before pre/post-retrain tracking
+        df["phase"] = "post"
+    for c in ("precision", "recall", "f1", "fpr"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    if phase is not None:
+        df = df[df["phase"] == phase]
+    return df.reset_index(drop=True)
+
+
+# ── Detector flags ──────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_flags(run_dir_str: str, round_num: int) -> pd.DataFrame:
+    """flags.parquet written by the detector (post-retrain) for a round; empty if absent."""
+    path = Path(run_dir_str) / f"round_{round_num}" / "flags.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    from src.detector.pipeline import read_flags
+    return read_flags(path)
 
 
 # ── Feature matrix ──────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_features(run_dir_str: str, round_num: int) -> pd.DataFrame:
+def load_features(run_dir_str: str, round_num: int, market: str | None = None) -> pd.DataFrame:
     """Load pre-computed features if saved; else return empty."""
-    path = Path(run_dir_str) / f"round_{round_num}" / "test" / "features.parquet"
-    if not path.exists():
-        return pd.DataFrame()
-    return pd.read_parquet(path)
+    return _read_test(run_dir_str, round_num, "features.parquet", market=market)
 
 
 # ── LLM reasoning log ───────────────────────────────────────────────────────
@@ -201,8 +263,85 @@ def load_llm_reasoning(run_dir_str: str) -> str:
     path = Path(run_dir_str) / "llm_reasoning.log"
     if not path.exists():
         return ""
-    with open(path) as f:
-        return f.read()
+    # Written as UTF-8 (LLM text contains non-ASCII punctuation such as U+2011).
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _round_dirs(run_dir: Path) -> list[Path]:
+    """round_<n> directories of a run, in round order (ignores files like round_metrics.parquet)."""
+    dirs = [d for d in run_dir.glob("round_*") if d.is_dir() and d.name.split("_", 1)[1].isdigit()]
+    return sorted(dirs, key=lambda d: int(d.name.split("_", 1)[1]))
+
+
+def _parse_reasoning_log(text: str) -> dict[int, dict[str, str]]:
+    """Legacy llm_reasoning.log → {round: {persona: reasoning}} (for runs without strategist.json)."""
+    import re
+    out: dict[int, dict[str, str]] = {}
+    for m in re.finditer(r"ROUND (\d+) STRATEGIST REASONING\s*=+\s*(.*?)(?=\n=+\nROUND \d+ STRATEGIST|\Z)", text, re.S):
+        rnd, body = int(m.group(1)), m.group(2)
+        blocks = re.split(r"^\[(SPOOFING|WASH_TRADING|PUMP_AND_DUMP|LAYERING)\]\s*$", body, flags=re.M)
+        for i in range(1, len(blocks) - 1, 2):
+            out.setdefault(rnd, {})[blocks[i].lower()] = blocks[i + 1].strip()
+    return out
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_strategist_history(run_dir_str: str) -> list[dict]:
+    """
+    One entry per round >= 1: for each persona the mutation source, parameter
+    changes (old → new), reasoning and the outcome measured in that round
+    (frozen/retrained recall, effectiveness ratio, mutation score).
+    """
+    run_dir = Path(run_dir_str)
+    metrics = {}
+    for d in _round_dirs(run_dir):
+        if (d / "metrics.json").exists():
+            metrics[int(d.name.split("_")[1])] = json.loads((d / "metrics.json").read_text(encoding="utf-8"))
+    legacy = _parse_reasoning_log(load_llm_reasoning(run_dir_str))
+    history = []
+    for rnd in sorted(r for r in metrics if r >= 1):
+        m, prev = metrics[rnd], metrics.get(rnd - 1, {})
+        rec_path = run_dir / f"round_{rnd}" / "strategist.json"
+        rec = json.loads(rec_path.read_text(encoding="utf-8")).get("personas", {}) if rec_path.exists() else {}
+        personas = {}
+        for p in sorted(set(m.get("params_used", {})) | set(rec)):
+            r = rec.get(p, {})
+            new = m.get("params_used", {}).get(p, r.get("params", {}))
+            old = prev.get("params_used", {}).get(p, {})
+            changes = r.get("changes") or {k: [old.get(k), v] for k, v in new.items() if old.get(k) != v}
+            pre = (m.get("pre_retrain") or {}).get(p, {})
+            post = (m.get("personas") or {}).get(p, {})
+            personas[p] = {
+                "source": r.get("source") or (m.get("mutation_source") or {}).get(p, "unknown"),
+                "changes": changes,
+                "reasoning": r.get("reasoning") or legacy.get(rnd, {}).get(p, ""),
+                "frozen_recall": pre.get("recall"),
+                "retrained_recall": post.get("recall"),
+                "effect_ratio": (m.get("effectiveness_ratio") or {}).get(p),
+                "score": (m.get("mutation_score") or {}).get(p),
+            }
+        history.append({"round": rnd, "personas": personas})
+    return history
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_params_history(run_dir_str: str) -> pd.DataFrame:
+    """Parameters actually used per round and persona (from each round's metrics.json)."""
+    rows = []
+    for d in _round_dirs(Path(run_dir_str)):
+        if not (d / "metrics.json").exists():
+            continue
+        m = json.loads((d / "metrics.json").read_text(encoding="utf-8"))
+        rnd = int(d.name.split("_")[1])
+        for persona, params in (m.get("params_used") or {}).items():
+            for k, v in params.items():
+                rows.append({"Persona": persona, "Parameter": k, "round": f"R{rnd}", "value": v})
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    wide = df.pivot_table(index=["Persona", "Parameter"], columns="round", values="value", aggfunc="first")
+    wide = wide[sorted(wide.columns, key=lambda c: int(c[1:]))]
+    return wide.reset_index()
 
 
 # ── Persona config ──────────────────────────────────────────────────────────
@@ -242,138 +381,3 @@ def build_feature_matrix_live(run_dir: Path, round_num: int) -> pd.DataFrame:
     except Exception as e:
         logger.warning(f"Could not build feature matrix live: {e}")
         return pd.DataFrame()
-
-
-# ── Synthetic flagged-windows builder ───────────────────────────────────────
-
-def build_flagged_windows(
-    run_dir: Path,
-    round_num: int,
-    X: Optional[pd.DataFrame] = None,
-) -> pd.DataFrame:
-    """
-    Derives a flagged-windows DataFrame by cross-referencing manipulation_events
-    with the OHLCV and feature data.
-
-    Returns columns:
-        commodity, window_start, window_end, persona, persona_display,
-        confidence, iso_score, price_at_flag, volume_at_flag,
-        cancel_rate, otr, volume_spike_ratio, ...
-    """
-    events = load_manipulation_events(str(run_dir), round_num)
-    ohlcv = load_ohlcv(str(run_dir), round_num)
-    trades = load_trade_log(str(run_dir), round_num)
-
-    if events.empty:
-        return pd.DataFrame()
-
-    rows = []
-    for _, ev in events.iterrows():
-        # Map persona string → canonical
-        raw_persona = str(ev.get("persona", "unknown"))
-        if "spoof" in raw_persona:
-            persona = "spoofing"
-        elif "wash" in raw_persona:
-            persona = "wash_trading"
-        elif "pump" in raw_persona:
-            persona = "pump_and_dump"
-        elif "layer" in raw_persona:
-            persona = "layering"
-        else:
-            persona = raw_persona
-
-        start_t = ev.get("start_time", pd.NaT)
-        end_t = ev.get("end_time", pd.NaT)
-        commodity = ev.get("commodity", "unknown")
-
-        # Derive price & volume in window from trade log
-        price_at = np.nan
-        vol_at = np.nan
-        if not trades.empty and "timestamp" in trades.columns:
-            mask = (
-                (trades["timestamp"] >= start_t) &
-                (trades["timestamp"] <= end_t) &
-                (trades.get("commodity", trades.get("asset", pd.Series(commodity, index=trades.index))) == commodity)
-            )
-            window_trades = trades[mask]
-            if not window_trades.empty:
-                if "price" in window_trades.columns:
-                    price_at = window_trades["price"].mean()
-                if "quantity" in window_trades.columns:
-                    vol_at = window_trades["quantity"].sum()
-
-        # Pull features if available, or populate from parameters / persona patterns
-        feat_row = {}
-        if X is not None and not X.empty:
-            try:
-                comm_X = X.xs(commodity, level="commodity") if "commodity" in X.index.names else X
-                mask_x = (comm_X.index >= start_t) & (comm_X.index <= end_t)
-                feat_window = comm_X[mask_x]
-                if not feat_window.empty:
-                    feat_row = feat_window.mean().to_dict()
-            except Exception:
-                pass
-
-        params = ev.get("parameters", {}) or {}
-        if not feat_row:
-            # Provide sensible signal indicators based on simulation parameters
-            if persona == "spoofing":
-                feat_row["cancel_rate"] = 0.85
-                feat_row["otr"] = float(params.get("order_size_multiplier", 8.0)) * 1.5
-                feat_row["avg_cancel_distance_to_mid"] = float(params.get("price_aggressiveness", 0.003))
-            elif persona == "wash_trading":
-                feat_row["stateful_circular_volume_ratio"] = 0.88
-                feat_row["trade_size_cv"] = 0.075
-            elif persona == "pump_and_dump":
-                feat_row["volume_spike_ratio"] = 4.2
-                feat_row["price_momentum"] = 0.048
-                feat_row["topk_buy_imbalance"] = 0.82
-            elif persona == "layering":
-                feat_row["cancel_rate"] = 0.78
-                feat_row["otr"] = 9.2
-
-        # Fake confidence (deterministic from event data) if model scores not available
-        confidence = ev.get("confidence", None)
-        if confidence is None:
-            confidence_map = {
-                "spoofing": 0.88,
-                "wash_trading": 0.82,
-                "pump_and_dump": 0.74,
-                "layering": 0.85,
-            }
-            confidence = confidence_map.get(persona, 0.75)
-
-        start_tick = int(ev.get("start_tick", 0))
-        end_tick = int(ev.get("end_tick", 0))
-        trader_ids = list(ev.get("trader_ids", [])) if hasattr(ev.get("trader_ids", []), "__iter__") else []
-
-        rows.append({
-            "event_id": str(ev.get("event_id", f"ev_{len(rows)}")),
-            "start_tick": start_tick,
-            "end_tick": end_tick,
-            "start_time": start_t,
-            "end_time": end_t,
-            "commodity": commodity,
-            "window_start": start_t,
-            "window_end": end_t,
-            "persona": persona,
-            "confidence": round(float(confidence), 3),
-            "price_at_flag": round(float(price_at), 4) if not np.isnan(price_at) else None,
-            "volume_at_flag": round(float(vol_at), 0) if not np.isnan(vol_at) else None,
-            "cancel_rate": feat_row.get("cancel_rate", None),
-            "otr": feat_row.get("otr", None),
-            "volume_spike_ratio": feat_row.get("volume_spike_ratio", None),
-            "stateful_circular_volume_ratio": feat_row.get("stateful_circular_volume_ratio", None),
-            "price_momentum": feat_row.get("price_momentum", None),
-            "abnormal_return_z": feat_row.get("abnormal_return_z", None),
-            "trade_size_cv": feat_row.get("trade_size_cv", None),
-            "avg_cancel_distance_to_mid": feat_row.get("avg_cancel_distance_to_mid", None),
-            "topk_buy_imbalance": feat_row.get("topk_buy_imbalance", None),
-            "trader_ids": trader_ids,
-            "parameters": params,
-        })
-
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values("confidence", ascending=False).reset_index(drop=True)
-    return df

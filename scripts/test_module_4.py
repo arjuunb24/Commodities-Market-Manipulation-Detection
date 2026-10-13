@@ -30,19 +30,21 @@ def main():
     generator = NarrativeGenerator(narrative_config)
     
     # Mock some detector output
+    # Shape matches what the dashboard sends for one flagged case (flags.parquet v2)
     flag_row = {
+        "trader_id": "spoofer_0",
         "commodity": "crude_oil_wti",
-        "timestamp": "2026-01-01 01:46:00",
-        "ensemble_flag": True,
-        "prob_spoofing": 0.998,
-        "total_volume": 45000,
-        "cancel_rate": 0.92
+        "flagged_persona": "spoofing",
+        "window_start_tick": 690,
+        "window_end_tick": 869,
+        "detector_score": 0.981,
+        "triggered_by": ["spoofing_classifier"],
     }
-    
+
     shap_summary = {
-        "cancel_rate_importance": 0.45,
-        "volume_concentration_importance": 0.22,
-        "otr_importance": 0.15
+        "spoof_signature": 1.84,
+        "large_cancel_ratio": 1.12,
+        "fast_cancel_ratio": 0.67,
     }
     
     logger.info("Requesting narrative from LLM... (This will fail if your API keys in .env are invalid)")

@@ -84,6 +84,10 @@ class TradeLogSchema(pa.DataFrameModel):
     quantity: Series[int] = pa.Field(gt=0, description="Quantity matched in this trade")
     buyer_trader_id: Series[str] = pa.Field(description="trader_id of the buy-side participant")
     seller_trader_id: Series[str] = pa.Field(description="trader_id of the sell-side participant")
+    aggressor_side: Series[str] = pa.Field(
+        isin=[s.value for s in OrderSide],
+        description="Side of the incoming (liquidity-taking) order, as published by real trade feeds",
+    )
 
     class Config:
         name = "trade_log"
@@ -296,12 +300,22 @@ class FlagsSchema(pa.DataFrameModel):
       per triggering classifier.
     """
 
-    window_start: Series[int] = pa.Field(ge=0, description="First tick of detection window")
+    # Schema version 2 (trader-level detector): adds window_end, iso_score and
+    # predicted_persona. Module 4A / dashboard / analyst tools updated together.
     commodity: Series[str] = pa.Field(description="Commodity symbol (e.g. gold, crude_oil_wti)")
+    window_start: Series[int] = pa.Field(ge=0, description="First tick of detection window")
     trader_id: Series[str] = pa.Field(description="Trader being assessed in this window")
+    window_end: Series[int] = pa.Field(ge=0, description="Last tick of detection window (inclusive)")
     final_flag: Series[bool] = pa.Field(description="True if flagged as anomalous/manipulative")
     final_score: Series[float] = pa.Field(
         ge=0.0, le=1.0, description="Ensemble anomaly/manipulation score in [0, 1]"
+    )
+    iso_score: Series[float] = pa.Field(
+        ge=0.0, le=1.0, description="Trader-level IsolationForest anomaly percentile"
+    )
+    predicted_persona: Series[str] = pa.Field(
+        nullable=True,
+        description="Most likely persona when a classifier fired, 'anomaly' when only the IsolationForest fired",
     )
     triggered_by: Series[object] = pa.Field(
         description="List of sub-layer names that fired for this flag"

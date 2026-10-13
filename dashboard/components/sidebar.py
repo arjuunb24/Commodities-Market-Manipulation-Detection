@@ -10,7 +10,13 @@ from pathlib import Path
 
 import streamlit as st
 
-from dashboard.data_loader import list_run_dirs, list_rounds, load_round_metrics_json
+from dashboard.data_loader import (
+    list_rounds,
+    list_run_dirs,
+    list_test_markets,
+    load_round_metrics_json,
+    market_tick_range,
+)
 
 
 PERSONA_COLORS = {
@@ -21,10 +27,14 @@ PERSONA_COLORS = {
 }
 
 
-def render_sidebar() -> tuple[Path | None, int]:
+def render_sidebar() -> tuple[Path | None, int, str | None]:
     """
-    Renders the sidebar and returns (run_dir, selected_round).
-    Returns (None, 0) if no runs are available.
+    Renders the sidebar and returns (run_dir, selected_round, selected_test_market).
+    Returns (None, 0, None) if no runs are available.
+
+    A round can contain several independently simulated test markets
+    ('test', 'test_1', ...). They are separate markets (each restarts from the
+    initial prices), so market-level views show one at a time.
     """
     with st.sidebar:
         st.markdown(
@@ -49,7 +59,7 @@ def render_sidebar() -> tuple[Path | None, int]:
         if not run_dirs:
             st.warning("No adversarial runs found in `data/runs/`.")
             st.info("Run the pipeline first:\n```\n.venv\\Scripts\\python.exe scripts/run_full_pipeline.py\n```")
-            return None, 0
+            return None, 0, None
 
         run_names = [d.name for d in run_dirs]
         selected_run_name = st.selectbox(
@@ -69,7 +79,7 @@ def render_sidebar() -> tuple[Path | None, int]:
 
         if not available_rounds:
             st.warning("No rounds found for this run.")
-            return run_dir, 0
+            return run_dir, 0, None
 
         default_round = st.session_state.get("sidebar_round_slider", available_rounds[0])
         if default_round not in available_rounds:
@@ -81,6 +91,25 @@ def render_sidebar() -> tuple[Path | None, int]:
             value=default_round,
             key="sidebar_round_slider",
         )
+
+        # ── Test market selector (each round may have several separate markets) ──
+        markets = list_test_markets(str(run_dir), selected_round)
+        selected_market = markets[0] if markets else None
+        if len(markets) > 1:
+            def _label(m: str) -> str:
+                idx = 1 if m == "test" else int(m.split("_")[1]) + 1
+                rng = market_tick_range(str(run_dir), selected_round, m)
+                span = f" · ticks {rng[0]:,}–{rng[1]:,}" if rng else ""
+                return f"Test market {idx} of {len(markets)}{span}"
+            selected_market = st.selectbox(
+                "Test market",
+                options=markets,
+                format_func=_label,
+                key="sidebar_test_market",
+                help="Each round is evaluated on several independently simulated test markets. "
+                     "They are separate markets, so price views show one at a time. "
+                     "Model Performance metrics combine all of them.",
+            )
 
         # ── Quick stats for selected round ───────────────────────────────
         st.markdown("---")
@@ -141,4 +170,4 @@ def render_sidebar() -> tuple[Path | None, int]:
             unsafe_allow_html=True,
         )
 
-    return run_dir, selected_round
+    return run_dir, selected_round, selected_market

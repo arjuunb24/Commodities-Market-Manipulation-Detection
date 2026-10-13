@@ -77,7 +77,7 @@ class NarrativeGenerator:
         }
         """
         input_data = {"flag": flag_row, "shap": shap_summary}
-        messages = [{"role": "user", "content": json.dumps(input_data)}]
+        messages = [{"role": "user", "content": json.dumps(input_data, separators=(",", ":"))}]
         
         attempts = 2
         narrative = ""
@@ -87,7 +87,10 @@ class NarrativeGenerator:
         for attempt in range(attempts):
             try:
                 response = self.client.complete(system=NARRATIVE_SYSTEM_PROMPT, messages=messages)
-                narrative = response["choices"][0]["message"]["content"]
+                narrative = (response["choices"][0].get("message") or {}).get("content") or ""
+                if not narrative.strip():
+                    logger.warning("Narrative model returned no text (token limit); not retrying.")
+                    break
                 
                 # Extract meta for audit trail
                 usage = response.get("usage", {})

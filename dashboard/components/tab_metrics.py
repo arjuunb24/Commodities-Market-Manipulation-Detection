@@ -24,7 +24,16 @@ from plotly.subplots import make_subplots
 import streamlit as st
 import yaml
 
-from dashboard.data_loader import load_cumulative_metrics, load_llm_reasoning, load_persona_config
+from dashboard.data_loader import load_cumulative_metrics, load_params_history, load_strategist_history
+
+
+def _rgba(hex_color: str, alpha: float) -> str:
+    """'#3b82f6' + alpha -> 'rgba(59,130,246,a)'. 8-digit hex is rejected by some Plotly versions."""
+    h = hex_color.lstrip("#")
+    if len(h) != 6:
+        return hex_color
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r},{g},{b},{alpha:.3f})"
 
 # ── Design tokens ────────────────────────────────────────────────────────────
 CHART_BG    = "rgba(10,14,26,0)"
@@ -119,7 +128,7 @@ def _build_fpr_chart(df: pd.DataFrame) -> go.Figure:
             marker=dict(size=8, symbol="diamond",
                         line=dict(width=2, color=color), color="rgba(10,14,26,1)"),
             fill="tozeroy",
-            fillcolor=f"{color}14",
+            fillcolor=_rgba(color, 0x14 / 255),
             hovertemplate=f"<b>{label}</b><br>Round %{{x}}<br>FPR=%{{y:.3f}}<extra></extra>",
         ))
 
@@ -166,7 +175,7 @@ def _build_radar_chart(df: pd.DataFrame) -> go.Figure:
             name=f"Round {rnd}",
             line=dict(color=c, width=2.5),
             fill="toself",
-            fillcolor=f"{c}22",
+            fillcolor=_rgba(c, 0x22 / 255),
             marker=dict(size=8, color=c),
         ))
 
@@ -271,7 +280,7 @@ def _build_pr_scatter(df: pd.DataFrame) -> go.Figure:
                 opacity=0.85,
                 line=dict(width=1.5, color="rgba(255,255,255,0.3)"),
             ),
-            line=dict(color=f"{color}55", width=1.5, dash="dot"),
+            line=dict(color=_rgba(color, 0x55 / 255), width=1.5, dash="dot"),
             hovertemplate=(
                 f"<b>{label}</b><br>Round %{{text}}<br>"
                 "Precision=%{x:.3f}<br>Recall=%{y:.3f}<extra></extra>"
@@ -310,41 +319,55 @@ def _build_pr_scatter(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def _build_parameter_table(persona_cfg: dict) -> pd.DataFrame | None:
-    """
-    Builds a tidy DataFrame showing how each persona's parameters evolved.
-    Columns: persona, parameter, round_0, round_1, …
-    """
-    personas = ["spoofing", "wash_trading", "pump_and_dump"]
-    ignore_keys = {"enabled", "start_tick", "end_tick"}
-
-    rows = []
-    rounds_found = sorted([
-        int(k.split("_")[1]) for k in persona_cfg if k.startswith("round_")
-    ])
-
-    for persona in personas:
-        # Collect all params across rounds
-        all_params: set[str] = set()
-        for r in rounds_found:
-            cfg_node = persona_cfg.get(f"round_{r}", {})
-            if persona in cfg_node:
-                for p in cfg_node[persona]:
-                    if p not in ignore_keys:
-                        all_params.add(p)
-
-        for param in sorted(all_params):
-            row: dict = {"Persona": persona.replace("_", " ").title(), "Parameter": param}
-            for r in rounds_found:
-                cfg_node = persona_cfg.get(f"round_{r}", {})
-                val = cfg_node.get(persona, {}).get(param, "—")
-                row[f"R{r}"] = str(val)
-            rows.append(row)
-
-    return pd.DataFrame(rows) if rows else None
+def _build_pre_post_chart(both: pd.DataFrame, metric: str) -> go.Figure:
+    """Pre-retrain (frozen detector, dashed) vs post-retrain (solid) per persona across rounds."""
+    fig = go.Figure()
+    palette = ["#ef4444", "#f59e0b", "#8b5cf6", "#06b6d4"]
+    for i, persona in enumerate(sorted(both["persona"].unique())):
+        color = palette[i % len(palette)]
+        for phase, dash, label in (("pre", "dash", "pre-retrain"), ("post", "solid", "post-retrain")):
+            d = both[(both["persona"] == persona) & (both["phase"] == phase)].sort_values("round")
+            if d.empty:
+                continue
+            fig.add_trace(go.Scatter(
+                x=d["round"], y=d[metric], mode="lines+markers",
+                name=f"{persona.replace('_', ' ')} · {label}",
+                line=dict(color=color, dash=dash, width=2),
+                marker=dict(symbol="circle-open" if phase == "pre" else "circle", size=8),
+            ))
+    fig.update_layout(
+        paper_bgcolor="rgba(10,14,26,0)", plot_bgcolor="rgba(10,14,26,0)",
+        font=dict(family="Inter, sans-serif", color="#94a3b8", size=11),
+        margin=dict(l=10, r=10, t=36, b=10), height=360,
+        title_text=f"{metric.upper()} — dashed: frozen detector vs. mutated personas · solid: after retraining",
+        xaxis=dict(title="Round", dtick=1, gridcolor="rgba(99,130,200,0.1)"),
+        yaxis=dict(range=[0, 1.05], gridcolor="rgba(99,130,200,0.1)"),
+        legend=dict(orientation="h", y=-0.25),
+    )
+    return fig
 
 
-# ── Main render ──────────────────────────────────────────────────────────────
+def _pre_post_summary(both: pd.DataFrame) -> str:
+    """One-sentence, number-derived summary of the largest evasion and its recovery (no LLM)."""
+    pre = both[both["phase"] == "pre"].set_index(["round", "persona"])["recall"]
+    post = both[both["phase"] == "post"].set_index(["round", "persona"])["recall"]
+    base = post.xs(0, level="round") if 0 in post.index.get_level_values("round") else None
+    if pre.empty or base is None:
+        return "Only the baseline round has been evaluated so far — pre/post-retrain comparison starts at round 1."
+    drops = []
+    for (rnd, persona), v in pre.items():
+        b = base.get(persona)
+        if b and b == b and v == v:
+            drops.append(((b - v) / b, rnd, persona, v, post.get((rnd, persona))))
+    if not drops:
+        return "Not enough data for a pre/post comparison yet."
+    drop, rnd, persona, v, rec = max(drops)
+    name = persona.replace("_", " ")
+    if drop <= 0:
+        return f"No mutation reduced recall below the round-0 baseline; the closest was {name} in round {rnd}."
+    tail = f" and recovered to {rec:.0%} after retraining" if rec == rec and rec is not None else ""
+    return f"Recall for {name} dropped {drop:.0%} below baseline under round {rnd}'s mutation (to {v:.0%}){tail}."
+
 
 def render_metrics_tab(run_dir: Path | None) -> None:
     if run_dir is None:
@@ -353,8 +376,6 @@ def render_metrics_tab(run_dir: Path | None) -> None:
 
     with st.spinner("Loading metrics…"):
         df = load_cumulative_metrics(str(run_dir))
-        persona_cfg = load_persona_config()
-        llm_log = load_llm_reasoning(str(run_dir))
 
     if df.empty:
         st.warning(
@@ -380,6 +401,25 @@ def render_metrics_tab(run_dir: Path | None) -> None:
     c4.metric("🔍 Avg Recall",        f"{avg_rec:.3f}")
     c5.metric("⚠️ Avg FPR",           f"{avg_fpr:.3f}", delta_color="inverse")
 
+    st.markdown("---")
+
+    # ── Section 0: Adversarial degrade / recover (pre vs post retrain) ────
+    both = load_cumulative_metrics(str(run_dir), phase=None)
+    st.caption("Metrics on this tab combine all test markets of each round (they are not split by the sidebar's test-market selector).")
+    st.markdown("<div class='section-title'>🥊 Evasion vs. Recovery</div>", unsafe_allow_html=True)
+    st.markdown(f"**{_pre_post_summary(both)}**")
+    st.caption(
+        "Pre-retrain = this round's mutated personas scored by the detector frozen at the end of the previous "
+        "round (how well the mutation evaded). Post-retrain = after retraining on all rounds so far (recovery)."
+    )
+    if (both["phase"] == "pre").any():
+        pr_tab, f1_tab = st.tabs(["Recall", "F1"])
+        with pr_tab:
+            st.plotly_chart(_build_pre_post_chart(both, "recall"), use_container_width=True,
+                            config={"displayModeBar": False}, key="perf_prepost_recall")
+        with f1_tab:
+            st.plotly_chart(_build_pre_post_chart(both, "f1"), use_container_width=True,
+                            config={"displayModeBar": False}, key="perf_prepost_f1")
     st.markdown("---")
 
     # ── Section 1: F1 Heatmap + Radar ────────────────────────────────────
@@ -429,7 +469,7 @@ def render_metrics_tab(run_dir: Path | None) -> None:
 
     # ── Section 4: Raw metrics table ─────────────────────────────────────
     st.markdown("<div class='section-title'>📋 Full Metrics Table</div>", unsafe_allow_html=True)
-    display_df = df.copy()
+    display_df = both.copy() if not both.empty else df.copy()
     display_df["persona"] = display_df["persona"].str.replace("_", " ").str.title()
     for col in ["precision", "recall", "f1", "fpr"]:
         if col in display_df.columns:
@@ -440,89 +480,107 @@ def render_metrics_tab(run_dir: Path | None) -> None:
 
     # ── Section 5: Parameter evolution ───────────────────────────────────
     st.markdown("<div class='section-title'>🧬 Adversarial Parameter Evolution</div>", unsafe_allow_html=True)
-    st.caption(
-        "The LLM Adversarial Strategist mutates persona parameters each round "
-        "to evade the detector. This table tracks how each parameter changed."
-    )
-
-    param_df = _build_parameter_table(persona_cfg)
-    if param_df is not None and not param_df.empty:
-        # Colour-code by persona
+    st.caption("Parameters actually used by each persona in each round of this run (from the round's metrics.json).")
+    param_df = load_params_history(str(run_dir))
+    if not param_df.empty:
         persona_filter_param = st.multiselect(
             "Filter by Persona",
             options=sorted(param_df["Persona"].unique()),
             default=sorted(param_df["Persona"].unique()),
             key="metrics_persona_filter",
         )
-        filtered_param = param_df[param_df["Persona"].isin(persona_filter_param)]
-        st.dataframe(filtered_param, use_container_width=True, hide_index=True)
+        view = param_df[param_df["Persona"].isin(persona_filter_param)].copy()
+        view["Persona"] = view["Persona"].str.replace("_", " ").str.title()
+        st.dataframe(view, use_container_width=True, hide_index=True)
     else:
-        st.info("No parameter evolution data found. Run multiple adversarial rounds to populate this table.")
+        st.info("This run has no recorded parameters (it predates parameter tracking). Re-run the pipeline to populate this table.")
 
     st.markdown("---")
 
-    # ── Section 6: LLM Reasoning Log ─────────────────────────────────────
-    st.markdown("<div class='section-title'>🤖 LLM Adversarial Strategist Reasoning</div>", unsafe_allow_html=True)
+    # ── Section 6: Strategist decisions ──────────────────────────────────
+    st.markdown("<div class='section-title'>🤖 Adversarial Strategist Decisions</div>", unsafe_allow_html=True)
     st.caption(
-        "The LLM strategist reads the previous round's metrics and reasons "
-        "about which parameters to mutate. Full reasoning log:"
+        "Before each round the strategist (LLM, or the hand-written library as fallback) changes each persona's "
+        "parameters. The outcome row shows how that mutation did in the same round: recall of the frozen detector "
+        "(lower = better evasion), recall after retraining, the manipulation's effect vs. round 0, and the score "
+        "(evasion × retained effect; 0 if the effect fell below half)."
     )
+    history = load_strategist_history(str(run_dir))
+    if not history:
+        st.info("No strategist rounds yet — mutations start from round 1.")
+        return
+    for entry in reversed(history):
+        rnd = entry["round"]
+        with st.expander(f"Round {rnd} — mutations tested in this round", expanded=(rnd == history[-1]["round"])):
+            personas = entry["personas"]
+            cols = st.columns(max(1, len(personas)))
+            for col, (persona, d) in zip(cols, personas.items()):
+                with col, st.container(border=True):
+                    _render_strategist_card(persona, d)
 
-    if llm_log:
-        # Split by round sections
-        sections = llm_log.split("=" * 60)
-        sections = [s.strip() for s in sections if s.strip()]
 
-        if sections:
-            for i, section in enumerate(sections):
-                if not section:
-                    continue
-                # Extract round header if present
-                lines = section.split("\n")
-                header = lines[0] if lines else f"Section {i+1}"
-                body   = "\n".join(lines[1:]).strip()
+SOURCE_BADGES = {
+    "agentic": "🤖 LLM strategist",
+    "hand_authored": "✍️ Hand-written fallback",
+    "baseline": "Baseline",
+    "unchanged": "— Unchanged",
+}
 
-                with st.expander(f"📝 {header}", expanded=(i == len(sections) - 1)):
-                    # Parse persona blocks within a section
-                    persona_blocks = {}
-                    current_persona = "General"
-                    current_lines   = []
 
-                    for line in body.split("\n"):
-                        stripped = line.strip()
-                        if stripped.startswith("[") and stripped.endswith("]") and stripped[1:-1].upper() in ["SPOOFING", "WASH_TRADING", "PUMP_AND_DUMP", "LAYERING"]:
-                            if current_lines:
-                                persona_blocks[current_persona] = "\n".join(current_lines)
-                            current_persona = stripped[1:-1]
-                            current_lines = []
-                        else:
-                            current_lines.append(line)
+def _fmt_num(v, pct: bool = False) -> str:
+    if v is None or (isinstance(v, float) and v != v):
+        return "–"
+    return f"{v:.0%}" if pct else f"{v:.2f}"
 
-                    if current_lines:
-                        persona_blocks[current_persona] = "\n".join(current_lines)
 
-                    for p_name, p_text in persona_blocks.items():
-                        if not p_text.strip():
-                            continue
-                        p_color = PERSONA_LINE_COLORS.get(p_name.lower(), "#94a3b8")
-                        st.markdown(
-                            f"""
-                            <div style="background:rgba(15,23,42,0.85); border-left:3px solid {p_color};
-                                        border-radius:0 10px 10px 0; padding:0.85rem 1rem;
-                                        margin-bottom:0.6rem;">
-                                <div style="font-size:0.7rem; color:{p_color}; font-weight:700;
-                                            text-transform:uppercase; letter-spacing:0.07em; margin-bottom:0.4rem;">
-                                    {p_name}
-                                </div>
-                                <div style="font-size:0.84rem; color:#94a3b8; white-space:pre-wrap; line-height:1.55;">
-                                    {p_text.strip()}
-                                </div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
+def _format_reasoning(text: str) -> str:
+    """LLM / library reasoning → clean Markdown: one numbered item per line, knobs as code."""
+    import re
+    if not text:
+        return "_No reasoning recorded._"
+    t = " ".join(text.replace("\r", " ").split())          # collapse stray newlines / indentation
+    t = t.replace("->", "→").replace("$", "\\$")
+    parts = re.split(r"(?:(?<=\s)|^)(\d{1,2})\.\s+(?=\S)", t)
+    lines = [parts[0].strip()] if parts[0].strip() else []
+    for i in range(1, len(parts) - 1, 2):
+        lines.append(f"{parts[i]}. {parts[i + 1].strip()}")
+    md = "\n".join(lines)
+    return re.sub(r"(?<![`\w])([a-z]+(?:_[a-z0-9]+)+)(?![`\w])", r"`\1`", md)
+
+
+def _render_strategist_card(persona: str, d: dict) -> None:
+    color = PERSONA_LINE_COLORS.get(persona, "#94a3b8")
+    st.markdown(
+        f"<div style='font-size:0.78rem; font-weight:700; color:{color}; text-transform:uppercase; "
+        f"letter-spacing:0.07em;'>{persona.replace('_', ' ')}</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(SOURCE_BADGES.get(d.get("source"), d.get("source") or "unknown"))
+
+    m1, m2 = st.columns(2)
+    m1.metric("Frozen recall", _fmt_num(d.get("frozen_recall"), pct=True),
+              help="Recall of the detector trained before it saw this mutation. Lower = the mutation evaded.")
+    m2.metric("Score", _fmt_num(d.get("score")),
+              help="(1 − frozen recall) × min(1, effect ratio); 0 when the effect fell below half of round 0.")
+    m3, m4 = st.columns(2)
+    m3.metric("Retrained recall", _fmt_num(d.get("retrained_recall"), pct=True),
+              help="Recall after retraining on this round's data (recovery).")
+    m4.metric("Effect vs R0", f"{_fmt_num(d.get('effect_ratio'))}×" if d.get("effect_ratio") is not None else "–",
+              help="Manipulation effectiveness relative to round 0 (spoof price impact, wash volume share, pump pressure).")
+
+    changes = d.get("changes") or {}
+    st.markdown("**Changes**")
+    if changes:
+        st.markdown("\n".join(f"- `{k}`: {_fmt_val(old)} → **{_fmt_val(new)}**" for k, (old, new) in changes.items()))
     else:
-        st.info(
-            "No LLM reasoning log found. The log is created when the Adversarial Strategist "
-            "runs for Round 1+ (`llm_reasoning.log`)."
-        )
+        st.markdown("_No parameter changes._")
+    with st.expander("Reasoning", expanded=False):
+        st.markdown(_format_reasoning(d.get("reasoning", "")))
+
+
+def _fmt_val(v) -> str:
+    if v is None:
+        return "–"
+    if isinstance(v, float):
+        return f"{v:g}"
+    return str(v)

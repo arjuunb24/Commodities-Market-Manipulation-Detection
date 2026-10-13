@@ -21,7 +21,14 @@ from src.utils.logging_config import setup_logging
 setup_logging()
 logger = logging.getLogger(__name__)
 
+import argparse
+
 def main():
+    parser = argparse.ArgumentParser(description="Run Adversarial Strategist loop.")
+    parser.add_argument("--persona", type=str, default="spoofing", help="Persona to mutate ('spoofing', 'wash_trading', 'pump_and_dump', or 'all')")
+    parser.add_argument("--round", type=int, default=1, help="Round number to mutate for (e.g., 1)")
+    args = parser.parse_args()
+
     logger.info("Loading LLM config...")
     config_path = REPO_ROOT / "configs" / "llm_config.yaml"
     with open(config_path, "r") as f:
@@ -32,16 +39,18 @@ def main():
     # Initialize the Agent
     strategist = AdversarialStrategist(strategist_config)
     
-    # Let's target the spoofing persona for round 1
-    target_persona = "spoofing"
-    round_num = 1
+    if args.persona == "all":
+        target_personas = ["spoofing", "wash_trading", "pump_and_dump"]
+    else:
+        target_personas = [args.persona]
+    round_num = args.round
     
     logger.info("==================================================")
-    logger.info(f"🚀 Launching Adversarial Strategist for {target_persona.upper()}")
+    logger.info(f"[*] Launching Adversarial Strategist for {', '.join(p.upper() for p in target_personas)}")
     logger.info("==================================================")
     
     # Run the loop! The LLM will call tools (get_round_metrics, get_shap_drift, propose_mutation)
-    result = strategist.run_strategist_round(round_num=round_num, persona=target_persona)
+    result = strategist.run_strategist_round(round_num=round_num, personas=target_personas)
     
     logger.info("\n=== STRATEGIST RESULTS ===")
     import json

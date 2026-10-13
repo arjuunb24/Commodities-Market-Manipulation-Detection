@@ -28,11 +28,12 @@ def main():
 
     print("Generating features...")
     fe = FeatureEngine(config)
-    features = fe.generate_features(trades, orders)
-    
-    # Extract data for the first commodity
-    commodity = features.index.get_level_values("commodity").unique()[0]
-    df = features.xs(commodity, level="commodity").copy()
+    market, _ = fe.compute(trades, orders)
+
+    # Extract market-level features for the first commodity, indexed by window end time
+    commodity = market.index.get_level_values("commodity").unique()[0]
+    df = market.xs(commodity, level="commodity").copy()
+    df.index = pd.Timestamp("2026-01-01 00:00:00") + pd.to_timedelta(df["window_end"], unit="s")
     
     # Get VWAP from the resampled dataframe (if possible, or just trades)
     base_time = pd.Timestamp("2026-01-01 00:00:00")
@@ -69,28 +70,20 @@ def main():
     by_label = dict(zip(labels, handles))
     ax.legend(by_label.values(), by_label.keys(), loc="upper left")
     
-    # 2. Spoofing Features (Short vs Long Window)
+    # 2. Order-flow pressure (market level)
     ax = axes[1]
-    if "cancel_rate_30s" in df.columns:
-        ax.plot(df.index, df["cancel_rate_30s"], color="red", label="cancel_rate_30s", linewidth=1.5)
-    if "cancel_rate_15min" in df.columns:
-        ax.plot(df.index, df["cancel_rate_15min"], color="blue", label="cancel_rate_15min", linewidth=1.5, alpha=0.6)
-    
-    ax.set_title("Spoofing Features (Cancel Rate) - Short vs Long Window")
-    ax.set_ylabel("Cancel Rate")
+    ax.plot(df.index, df["mkt_cancel_ratio"], color="red", label="cancel ratio", linewidth=1.5)
+    ax.plot(df.index, df["mkt_order_imbalance"], color="blue", label="placed-volume imbalance", linewidth=1.2, alpha=0.7)
+    ax.set_title("Order-flow features (market level)")
     ax.legend(loc="upper left")
-    
-    # 3. Pump & Dump Features (Volume Spike or Imbalance)
+
+    # 3. Volume / return shocks (market level)
     ax = axes[2]
-    if "abnormal_return_z_15min" in df.columns:
-        ax.plot(df.index, df["abnormal_return_z_15min"], color="orange", label="abnormal_return_z_15min", linewidth=1.5)
-    if "abnormal_return_z_60min" in df.columns:
-        ax.plot(df.index, df["abnormal_return_z_60min"], color="green", label="abnormal_return_z_60min", linewidth=1.5, alpha=0.6)
-        
-    ax.set_title("Pump & Dump Features (Abnormal Return Z-Score) - 15m vs 60m")
-    ax.set_ylabel("Z-Score")
+    ax.plot(df.index, df["mkt_volume_spike"], color="orange", label="volume spike ratio", linewidth=1.5)
+    ax.plot(df.index, df["mkt_abnormal_return_z"], color="green", label="abnormal return z", linewidth=1.2, alpha=0.7)
+    ax.set_title("Volume and return shocks (market level)")
     ax.legend(loc="upper left")
-    
+
     plt.tight_layout()
     plt.savefig(args.out)
     print(f"Plot saved to {args.out}")

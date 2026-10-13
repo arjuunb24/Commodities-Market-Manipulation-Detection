@@ -1,32 +1,172 @@
+pump_and_dump:
+  accumulation_size: 80
+  burst_duration_ticks: 400
+  decoy_rate: 0.4
+  dump_delay_ticks: 100
+  ignition_aggression: 0.002
+  n_coordinated_accounts: 12
+  stagger: 0.7
 round_0:
   layering:
-    cancellation_delay_ticks: 3
     enabled: false
-    end_tick: 5000
-    layer_spacing: 0.002
-    n_layers: 4
-    start_tick: 3000
   pump_and_dump:
     accumulation_size: 150
     burst_duration_ticks: 200
+    decoy_rate: 0.0
     dump_delay_ticks: 100
     enabled: true
-    end_tick: 7000
+    ignition_aggression: 0.002
     n_coordinated_accounts: 3
-    start_tick: 5000
+    stagger: 0.0
   spoofing:
+    cancel_jitter: 0.0
     cancellation_delay_ticks: 5
     enabled: true
-    end_tick: 4000
     frequency: 0.4
+    n_accounts: 1
+    n_split_orders: 1
     order_size_multiplier: 8.0
-    price_aggressiveness: 0.003
-    start_tick: 2000
+    price_aggressiveness: 0.0005
+    size_jitter: 0.0
   wash_trading:
+    camouflage_rate: 0.0
     enabled: true
-    end_tick: 3000
-    n_colluding_pairs: 1
-    price_deviation_from_mid: 0.001
-    start_tick: 1000
+    n_groups: 1
+    ring_size: 2
+    size_jitter: 0.0
     trade_frequency: 0.5
-round_1: {}
+round_1:
+  pump_and_dump:
+    accumulation_size: 150
+    burst_duration_ticks: 300
+    decoy_rate: 0.0
+    dump_delay_ticks: 100
+    ignition_aggression: 0.002
+    n_coordinated_accounts: 3
+    stagger: 0.4
+  spoofing:
+    cancel_jitter: 0.0
+    cancellation_delay_ticks: 5
+    frequency: 0.4
+    n_accounts: 1
+    n_split_orders: 1
+    order_size_multiplier: 6.0
+    price_aggressiveness: 0.0005
+    size_jitter: 0.3
+  wash_trading:
+    camouflage_rate: 0.2
+    n_groups: 1
+    ring_size: 2
+    size_jitter: 0.5
+    trade_frequency: 0.5
+round_2:
+  pump_and_dump:
+    accumulation_size: 120
+    burst_duration_ticks: 300
+    decoy_rate: 0.2
+    dump_delay_ticks: 100
+    ignition_aggression: 0.002
+    n_coordinated_accounts: 6
+    stagger: 0.4
+  spoofing:
+    cancel_jitter: 0.2
+    cancellation_delay_ticks: 5
+    frequency: 0.4
+    n_accounts: 1
+    n_split_orders: 1
+    order_size_multiplier: 4.0
+    price_aggressiveness: 0.0005
+    size_jitter: 0.6
+  wash_trading:
+    camouflage_rate: 0.35
+    n_groups: 1
+    ring_size: 4
+    size_jitter: 0.8
+    trade_frequency: 0.5
+round_3:
+  pump_and_dump:
+    accumulation_size: 80
+    burst_duration_ticks: 300
+    decoy_rate: 0.3
+    dump_delay_ticks: 100
+    ignition_aggression: 0.002
+    n_coordinated_accounts: 10
+    stagger: 0.4
+  spoofing:
+    cancel_jitter: 0.4
+    cancellation_delay_ticks: 10
+    frequency: 0.4
+    n_accounts: 1
+    n_split_orders: 2
+    order_size_multiplier: 4.0
+    price_aggressiveness: 0.0005
+    size_jitter: 0.6
+  wash_trading:
+    camouflage_rate: 0.45
+    n_groups: 1
+    ring_size: 6
+    size_jitter: 0.9
+    trade_frequency: 0.5
+round_4:
+  pump_and_dump:
+    accumulation_size: 80
+    burst_duration_ticks: 400
+    decoy_rate: 0.35
+    dump_delay_ticks: 100
+    ignition_aggression: 0.002
+    n_coordinated_accounts: 10
+    stagger: 0.5
+  spoofing:
+    cancel_jitter: 0.4
+    cancellation_delay_ticks: 10
+    frequency: 0.4
+    n_accounts: 1
+    n_split_orders: 3
+    order_size_multiplier: 3.0
+    price_aggressiveness: 0.0005
+    size_jitter: 0.8
+  wash_trading:
+    camouflage_rate: 0.5
+    n_groups: 2
+    ring_size: 6
+    size_jitter: 0.9
+    trade_frequency: 0.5
+round_5:
+  pump_and_dump:
+    accumulation_size: 80
+    burst_duration_ticks: 400
+    decoy_rate: 0.4
+    dump_delay_ticks: 100
+    ignition_aggression: 0.002
+    n_coordinated_accounts: 12
+    stagger: 0.7
+  spoofing:
+    cancel_jitter: 0.6
+    cancellation_delay_ticks: 15
+    frequency: 0.4
+    n_accounts: 2
+    n_split_orders: 3
+    order_size_multiplier: 3.0
+    price_aggressiveness: 0.0005
+    size_jitter: 0.8
+  wash_trading:
+    camouflage_rate: 0.5
+    n_groups: 3
+    ring_size: 6
+    size_jitter: 0.9
+    trade_frequency: 0.5
+spoofing:
+  cancel_jitter: 0.6
+  cancellation_delay_ticks: 15
+  frequency: 0.4
+  n_accounts: 2
+  n_split_orders: 3
+  order_size_multiplier: 3.0
+  price_aggressiveness: 0.0005
+  size_jitter: 0.8
+wash_trading:
+  camouflage_rate: 0.5
+  n_groups: 3
+  ring_size: 6
+  size_jitter: 0.9
+  trade_frequency: 0.5

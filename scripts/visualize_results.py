@@ -19,7 +19,16 @@ def plot_metrics(parquet_path: Path):
         logger.error(f"Cannot find metrics file at {parquet_path}")
         return None
 
-    df = pd.read_parquet(parquet_path)
+    # round_summary.parquet (next to round_metrics.parquet) has round/phase columns;
+    # plot the post-retrain rows.
+    summary = parquet_path.with_name("round_summary.parquet")
+    df = pd.read_parquet(summary if summary.exists() else parquet_path)
+    if "round_num" in df.columns and "round" not in df.columns:
+        df = df.rename(columns={"round_num": "round"})
+    if "phase" in df.columns:
+        df = df[df["phase"] == "post"]
+    elif "is_post_retrain" in df.columns:
+        df = df[df["is_post_retrain"]]
     if df.empty:
         logger.error("Metrics dataframe is empty.")
         return None

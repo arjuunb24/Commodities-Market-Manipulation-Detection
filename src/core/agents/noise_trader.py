@@ -15,11 +15,17 @@ Role in the simulation:
 Design principle:
   - All randomness from self.rng (seeded independently per agent)
   - No lookahead, no fundamentals view, no trend following
+  - Uninformed by default: direction is a fair coin. `imbalance_sensitivity`
+    can tilt it toward the visible book imbalance, but any value that makes the
+    whole retail crowd chase imbalance creates a self-reinforcing loop (buying
+    thins the asks → book looks bid-heavy → more buying) that inflated 30-second
+    volatility ~10x in testing, so it is off. Instead orders are centred on the
+    microprice (bounded imbalance adjustment, see decide()), and the market
+    maker leans its quotes on imbalance (see market_maker.py).
+  - Unfilled orders are cancelled after a geometric lifetime (mean_order_ttl).
 """
 
 from __future__ import annotations
-
-import uuid
 
 import numpy as np
 
@@ -29,19 +35,22 @@ from src.core.order_book import BookState, Order, Side
 
 class NoiseTrader(Agent):
     """
-    Uninformed trader that places random small limit orders near mid-price.
+    Uninformed trader that places small limit orders around mid-price.
 
-    Activation: Bernoulli(lambda_activation) per tick — simulates a Poisson
-    process with mean inter-arrival time of 1/λ ticks.
+    Activation: Bernoulli(lambda) per tick (discretised Poisson arrivals).
 
     Order placement:
-      - Side: uniform random (buy or sell)
-      - Price: mid_price ± Uniform(0, price_offset_ticks) price units
-      - Quantity: Uniform(order_size_min, order_size_max)
+      - Side: Bernoulli(0.5 + imbalance_sensitivity * book imbalance), default 0.5
+      - Price: mid ± Uniform(0, price_offset_ticks) price units (so roughly half
+        the orders are marketable and half rest passively)
+      - Quantity: log-normal (right-skewed, like real retail order sizes),
+        clipped to [order_size_min, order_size_max]
 
-    When book is empty (no mid-price), the trader uses the last known trade
-    price. If no trades have happened yet, the agent does not act this tick.
+    When there is no mid-price the trader uses the last trade price; if there
+    is no price information at all it does not act.
     """
+
+    mean_order_ttl = 40.0
 
     def __init__(
         self,
@@ -52,42 +61,38 @@ class NoiseTrader(Agent):
         order_size_min: int = 1,
         order_size_max: int = 50,
         price_offset_ticks: float = 2.0,
+        imbalance_sensitivity: float = 0.0,
+        microprice_weight: float = 1.5,
     ) -> None:
         super().__init__(trader_id, rng)
         self.arrival_rate_lambda = arrival_rate_lambda
         self.order_size_min = order_size_min
         self.order_size_max = order_size_max
         self.price_offset_ticks = price_offset_ticks
+        self.imbalance_sensitivity = imbalance_sensitivity
+        self.microprice_weight = microprice_weight
 
     def decide(self, book_state: BookState, tick: int) -> Order | None:
-        # --- Poisson activation (Bernoulli per tick) ---
         if self.rng.random() > self.arrival_rate_lambda:
-            return None  # not active this tick
+            return None
 
-        # --- Determine reference price ---
         ref_price = book_state.mid_price or book_state.last_trade_price
         if ref_price is None:
-            return None  # no price information yet; wait
+            return None
 
-        # --- Choose side and price ---
-        side = Side.BUY if self.rng.random() < 0.5 else Side.SELL
-        offset = self.rng.uniform(0, self.price_offset_ticks)
+        p_buy = float(np.clip(0.5 + self.imbalance_sensitivity * book_state.imbalance(), 0.15, 0.85))
+        side = Side.BUY if self.rng.random() < p_buy else Side.SELL
+        # Price around the microprice: mid shifted toward the heavier side of the
+        # visible book by at most ~half the spread (Stoikov 2018). Bounded, so it
+        # cannot run away, but it lets displayed depth (real or spoofed) nudge
+        # where uninformed flow trades.
+        if book_state.best_bid is not None and book_state.best_ask is not None:
+            half = (book_state.best_ask - book_state.best_bid) / 2 + self.tick_size
+            ref_price = ref_price + self.microprice_weight * book_state.imbalance() * half
+        price = ref_price + self.rng.uniform(-self.price_offset_ticks, self.price_offset_ticks)
+        price = max(price, self.tick_size)
 
-        if side == Side.BUY:
-            # Random limit price around mid: can be passive or aggressive
-            price = ref_price + self.rng.uniform(-self.price_offset_ticks, self.price_offset_ticks)
-        else:
-            price = ref_price + self.rng.uniform(-self.price_offset_ticks, self.price_offset_ticks)
-
-        price = round(max(price, 0.01), 4)  # floor at 0.01 (price must be > 0)
-        quantity = int(self.rng.integers(self.order_size_min, self.order_size_max + 1))
-
-        return Order(
-            order_id=str(uuid.uuid4()),
-            trader_id=self.trader_id,
-            side=side,
-            price=price,
-            quantity=quantity,
-            tick=tick,
-            order_type="limit",
-        )
+        median_size = max(1.0, (self.order_size_min + self.order_size_max) / 4)
+        quantity = int(np.clip(round(self.rng.lognormal(np.log(median_size), 0.7)),
+                               self.order_size_min, self.order_size_max))
+        return self.limit(side, price, quantity, tick)

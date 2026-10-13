@@ -121,6 +121,18 @@ COMMODITY_INITIAL_PRICES = {
     "corn": 4.30,
 }
 
+# Minimum price increments of the corresponding CME/ICE futures contracts.
+COMMODITY_TICK_SIZES = {
+    "crude_oil_wti": 0.01,
+    "brent_crude": 0.01,
+    "gold": 0.10,
+    "silver": 0.005,
+    "natural_gas": 0.001,
+    "copper": 0.0005,
+    "wheat": 0.0025,
+    "corn": 0.0025,
+}
+
 # Commodity-specific persona vulnerability profiles (affinity weights)
 COMMODITY_PERSONA_PROFILES = {
     "gold":          {"spoofing": 0.45, "layering": 0.35, "pump_and_dump": 0.10, "wash_trading": 0.10},

@@ -1,65 +1,63 @@
 """
 src/core/agents/manipulation/spoofing.py
 =========================================
-Spoofing Agent — places large passive orders to shift book imbalance,
-then cancels before fill.
+Spoofing persona — bid or offer with the intent to cancel before execution.
 
-CFTC Definition (Commodity Exchange Act §4c(a)(5)):
+CFTC Definition (Commodity Exchange Act §4c(a)(5)(C)):
   "Bidding or offering with the intent to cancel the bid or offer before execution."
 
-Grounded in enforcement cases:
-  - Coscia v. CFTC (2014): first criminal spoofing conviction
-  - Tower Research Capital (2019): $67.4M settlement for layering/spoofing
-  (see docs/enforcement_case_notes.md for full case summaries)
+How real spoofing makes money (Coscia 2015, Sarao 2015, see
+docs/enforcement_case_notes.md) — and how this agent reproduces it:
 
-Mechanism:
-  1. Agent places a large limit order on the book (far enough from mid to rest,
-     close enough to shift the bid-ask imbalance signal visibly).
-  2. After cancellation_delay_ticks ticks, the agent cancels the order.
-  3. The book imbalance signal (bid volume / ask volume) shifts during the
-     window when the spoof order is resting, potentially influencing other
-     agents' decisions (particularly MomentumTraders).
+  1. Place a SMALL genuine order on one side at the touch
+     (e.g. a sell at the best ask) — the order the spoofer actually wants filled.
+  2. Place a LARGE non-bona-fide order on the OTHER side, a few ticks behind the
+     best price (e.g. a big bid just under the best bid). It is far enough back
+     to be unlikely to trade, but close enough to sit in the visible depth.
+  3. Other participants read the fake depth as buying pressure (in this ABM the
+     market maker leans its quotes and noise traders tilt to buying, see
+     BookState.imbalance()), the price ticks up and the genuine sell is lifted.
+  4. Cancel the large order after `cancellation_delay_ticks`; cancel the genuine
+     order too if it has not filled. Repeat, sometimes in the other direction.
 
-Logging:
-  Every spoofing episode is logged to manipulation_events with:
-  - event_id, persona='spoofing', start_tick, end_tick, trader_ids, parameters
+The behavioural footprint this leaves is trader-level, not market-level:
+large orders with short lifetimes that are almost always cancelled, on the side
+OPPOSITE to where the same account's executions happen.
+
+Evasion knobs (each documented in docs/enforcement_case_notes.md):
+  size_jitter     ±random spoof size (CFTC 2020 advisory #1, Coscia round 2)
+  cancel_jitter   random cancel delay instead of a fixed one (advisory #2)
+  n_split_orders  spoof split into several smaller orders on consecutive ticks
+                  behind the touch (Coscia "split into batches", Tower layering)
+  n_accounts      >1 → the genuine order and the spoof come from DIFFERENT
+                  accounts (JPMorgan cross-trader spoofing, advisory #3)
+
+Order ids carry an audit tag ("s" spoof leg, "g" genuine leg) used only for
+effectiveness accounting, never by the detector.
 """
 
 from __future__ import annotations
 
-import uuid
-from dataclasses import dataclass, field
-
 import numpy as np
 
-from src.core.agents.base import Agent
+from src.core.agents.manipulation.common import ManipulationController, ManipulatorAccount
 from src.core.order_book import BookState, Order, Side
 
 
-@dataclass
-class SpoofingEvent:
-    """Tracks a single pending spoof order (placed, awaiting cancellation)."""
-    order_id: str
-    placed_tick: int
-    cancel_at_tick: int
-    side: Side
-
-
-class SpoofingAgent(Agent):
+class SpoofingAgent(ManipulationController):
     """
-    Single-account spoofing agent.
-
-    Places large one-sided limit orders to create false book imbalance,
-    then cancels them before they can be filled.
+    Spoofing persona (one or more accounts).
 
     Args:
-        order_size_multiplier: Multiplier on average book depth for spoof order size.
-        cancellation_delay_ticks: Ticks between spoof placement and cancel instruction.
-        frequency: Probability of initiating a new spoof on each active tick.
-        price_aggressiveness: Distance from mid as fraction of mid_price to place spoof.
-        start_tick: First tick the agent is active.
-        end_tick: Last tick the agent is active (inclusive).
-        spoof_side: Which side to spoof ('buy' inflates bid, 'sell' inflates ask).
+        order_size_multiplier: Total spoof size as a multiple of average visible level depth.
+        cancellation_delay_ticks: Mean ticks the spoof rests before it is cancelled.
+        frequency: Probability per tick of starting a new spoof cycle (when idle).
+        price_aggressiveness: Distance behind the same-side best price (fraction).
+        size_jitter: Spoof size is multiplied by U(1 - j, 1 + j).
+        cancel_jitter: Cancel delay drawn from delay * U(1 - j, 1 + j).
+        n_split_orders: Number of orders the spoof is split into (consecutive ticks).
+        n_accounts: Accounts used; with >= 2, genuine and spoof legs use different accounts.
+        spoof_side: "buy", "sell" or "both" (direction chosen per cycle).
     """
 
     PERSONA = "spoofing"
@@ -72,118 +70,94 @@ class SpoofingAgent(Agent):
         order_size_multiplier: float = 8.0,
         cancellation_delay_ticks: int = 5,
         frequency: float = 0.4,
-        price_aggressiveness: float = 0.003,
+        price_aggressiveness: float = 0.0005,
+        size_jitter: float = 0.0,
+        cancel_jitter: float = 0.0,
+        n_split_orders: int = 1,
+        n_accounts: int = 1,
         start_tick: int = 0,
         end_tick: int = 10000,
-        spoof_side: str = "buy",
+        spoof_side: str = "both",
+        background_rate: float = 0.05,
     ) -> None:
-        super().__init__(trader_id, rng)
+        n_accounts = max(1, int(n_accounts))
+        acct_rngs = rng.spawn(n_accounts)
+        names = [trader_id] + [f"{trader_id}_{k}" for k in range(1, n_accounts)]
+        accounts = [ManipulatorAccount(n, r, background_rate=background_rate) for n, r in zip(names, acct_rngs)]
+        super().__init__(accounts, start_tick, end_tick)
+        self.trader_id = trader_id
+        self.rng = rng
         self.order_size_multiplier = order_size_multiplier
-        self.cancellation_delay_ticks = cancellation_delay_ticks
+        self.cancellation_delay_ticks = max(1, int(cancellation_delay_ticks))
         self.frequency = frequency
         self.price_aggressiveness = price_aggressiveness
-        self.start_tick = start_tick
-        self.end_tick = end_tick
-        self.spoof_side = Side.BUY if spoof_side == "buy" else Side.SELL
+        self.size_jitter = float(np.clip(size_jitter, 0.0, 0.9))
+        self.cancel_jitter = float(np.clip(cancel_jitter, 0.0, 0.9))
+        self.n_split_orders = max(1, int(n_split_orders))
+        self.spoof_side = spoof_side
+        self._cycle_busy_until = -1
 
-        # Pending spoof orders awaiting cancellation
-        self._pending: list[SpoofingEvent] = []
-
-        # Episode tracking for manipulation_events log
-        self._episode_start: int | None = None
-        self._events_log: list[dict] = []  # collected by simulation loop
+    @property
+    def account(self) -> ManipulatorAccount:
+        return self.accounts[0]
 
     def parameters_snapshot(self) -> dict:
-        """Return a snapshot of current parameters for manipulation_events logging."""
         return {
             "order_size_multiplier": self.order_size_multiplier,
             "cancellation_delay_ticks": self.cancellation_delay_ticks,
             "frequency": self.frequency,
             "price_aggressiveness": self.price_aggressiveness,
-            "spoof_side": self.spoof_side.value,
+            "size_jitter": self.size_jitter,
+            "cancel_jitter": self.cancel_jitter,
+            "n_split_orders": self.n_split_orders,
+            "n_accounts": len(self.accounts),
+            "spoof_side": self.spoof_side,
         }
 
-    def decide(self, book_state: BookState, tick: int) -> Order | None:
-        """
-        On active ticks, occasionally places a large passive spoof order.
-        The simulation loop calls get_cancels() separately to retrieve
-        cancel instructions for pending spoof orders.
-        """
-        if tick < self.start_tick or tick > self.end_tick:
-            return None
+    def _pick_side(self) -> Side:
+        if self.spoof_side == "buy":
+            return Side.BUY
+        if self.spoof_side == "sell":
+            return Side.SELL
+        return Side.BUY if self.rng.random() < 0.5 else Side.SELL
 
+    def manipulate(self, state: BookState, tick: int) -> list[Order]:
+        if tick < self._cycle_busy_until:
+            return []  # current spoof is still resting
         if self.rng.random() > self.frequency:
-            return None
+            return []
+        if state.best_bid is None or state.best_ask is None:
+            return []
 
-        ref_price = book_state.mid_price or book_state.last_trade_price
-        if ref_price is None or ref_price <= 0:
-            return None
+        # Account roles: genuine leg and spoof leg come from different accounts when available.
+        idx = self.rng.permutation(len(self.accounts))
+        genuine_acct = self.accounts[idx[0]]
+        spoof_acct = self.accounts[idx[1]] if len(self.accounts) > 1 else genuine_acct
+        tick_size = spoof_acct.tick_size
+        spoof_side = self._pick_side()
 
-        # Compute spoof order size: ~8x average visible book depth
-        total_depth = sum(qty for _, qty in book_state.bid_depth + book_state.ask_depth)
-        avg_depth = total_depth / max(len(book_state.bid_depth) + len(book_state.ask_depth), 1)
-        spoof_qty = max(int(avg_depth * self.order_size_multiplier), 100)
+        levels = state.bid_depth + state.ask_depth
+        avg_level = sum(q for _, q in levels) / max(1, len(levels))
+        jitter = self.rng.uniform(1 - self.size_jitter, 1 + self.size_jitter)
+        total_qty = max(int(avg_level * self.order_size_multiplier * jitter), 50)
+        delay = max(1, int(round(self.cancellation_delay_ticks
+                                 * self.rng.uniform(1 - self.cancel_jitter, 1 + self.cancel_jitter))))
+        genuine_qty = int(self.rng.integers(5, 30))
 
-        # Spoof price: close to mid but not crossing (won't fill immediately)
-        if self.spoof_side == Side.BUY:
-            spoof_price = round(ref_price * (1 - self.price_aggressiveness), 4)
+        if spoof_side == Side.BUY:
+            base = min(state.best_bid * (1 - self.price_aggressiveness), state.best_ask - tick_size)
+            step = -tick_size
+            genuine = genuine_acct.limit(Side.SELL, state.best_ask, genuine_qty, tick, exact_ttl=delay + 2, tag="g")
         else:
-            spoof_price = round(ref_price * (1 + self.price_aggressiveness), 4)
+            base = max(state.best_ask * (1 + self.price_aggressiveness), state.best_bid + tick_size)
+            step = tick_size
+            genuine = genuine_acct.limit(Side.BUY, state.best_bid, genuine_qty, tick, exact_ttl=delay + 2, tag="g")
 
-        spoof_price = max(spoof_price, 0.01)
-        order_id = str(uuid.uuid4())
-
-        # Register for cancellation
-        self._pending.append(SpoofingEvent(
-            order_id=order_id,
-            placed_tick=tick,
-            cancel_at_tick=tick + self.cancellation_delay_ticks,
-            side=self.spoof_side,
-        ))
-
-        return Order(
-            order_id=order_id,
-            trader_id=self.trader_id,
-            side=self.spoof_side,
-            price=spoof_price,
-            quantity=spoof_qty,
-            tick=tick,
-            order_type="limit",
-        )
-
-    def get_cancels(self, tick: int) -> list[Order]:
-        """
-        Return cancel instructions for all spoof orders whose cancellation
-        delay has elapsed. Called by the simulation loop each tick.
-        """
-        due = [e for e in self._pending if e.cancel_at_tick <= tick]
-        self._pending = [e for e in self._pending if e.cancel_at_tick > tick]
-
-        cancel_orders = []
-        for event in due:
-            cancel_orders.append(Order(
-                order_id=event.order_id,
-                trader_id=self.trader_id,
-                side=event.side,
-                price=1.0,   # irrelevant for cancel
-                quantity=1,  # irrelevant for cancel
-                tick=tick,
-                order_type="cancel",
-            ))
-        return cancel_orders
-
-    def log_activity(self, tick: int) -> dict | None:
-        """
-        Called once per tick by simulation loop. Returns a manipulation_events
-        dict when a new episode starts (first active tick of the persona window).
-        """
-        if tick == self.start_tick:
-            return {
-                "event_id": str(uuid.uuid4()),
-                "persona": self.PERSONA,
-                "start_tick": self.start_tick,
-                "end_tick": self.end_tick,
-                "trader_ids": [self.trader_id],
-                "parameters": self.parameters_snapshot(),
-            }
-        return None
+        orders = [genuine]
+        k = self.n_split_orders
+        weights = self.rng.dirichlet(np.ones(k) * 3.0) if k > 1 else np.array([1.0])
+        for i in range(k):
+            qty = max(1, int(round(total_qty * weights[i])))
+            orders.append(spoof_acct.limit(spoof_side, base + i * step, qty, tick, exact_ttl=delay, tag="s"))
+        self._cycle_busy_until = tick + delay
+        return orders

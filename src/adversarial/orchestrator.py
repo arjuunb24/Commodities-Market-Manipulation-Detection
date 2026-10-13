@@ -9,6 +9,7 @@ The full multi-round loop is driven by scripts/run_full_pipeline.py.
 
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 import subprocess
@@ -20,10 +21,21 @@ import pandas as pd
 import numpy as np
 
 from src.adversarial.metrics import (
+    build_summary_table,
     compute_round_metrics,
-    save_round_metrics,
+    compute_shap_drift,
+    compute_unsupervised_metrics,
     load_round_metrics,
+    save_round_metrics,
+    write_round_metrics_parquet,
 )
+from src.adversarial.effectiveness import (
+    effectiveness_ratio,
+    episode_effectiveness,
+    mutation_score,
+    summarize,
+)
+from src.core.persona_params import effective_params, resolve_persona_config
 from src.detector.pipeline import DetectorPipeline
 from src.utils import io as io_utils
 
@@ -51,6 +63,8 @@ class RoundOrchestrator:
         sim_ticks: int = 5000,
         sim_seed: int = 42,
         commodity: str = "crude_oil_wti",
+        n_test_markets: int = 2,
+        persona_config_path: Path | None = None,
     ) -> None:
         self.master_run_dir = Path(master_run_dir)
         self.master_run_dir.mkdir(parents=True, exist_ok=True)
@@ -59,6 +73,8 @@ class RoundOrchestrator:
         self.sim_ticks = sim_ticks
         self.sim_seed = sim_seed
         self.commodity = commodity
+        self.n_test_markets = max(1, int(n_test_markets))
+        self.persona_config_path = Path(persona_config_path) if persona_config_path else REPO_ROOT / "configs" / "persona_config.yaml"
 
         self.pipeline = DetectorPipeline(detector_config)
         self.personas = detector_config.get("personas", ["spoofing", "wash_trading", "pump_and_dump"])
@@ -70,148 +86,138 @@ class RoundOrchestrator:
     # Public API
     # ------------------------------------------------------------------
 
-    def run_round(self, round_num: int) -> dict[str, dict[str, float]]:
-        """
-        Executes one full round:
-          1. Run the simulation twice (train and test) with different seeds
-          2. Train & score the detector on separate datasets
-          3. Compute metrics
-          4. Save everything to disk
+    def _test_dirs(self, round_dir: Path) -> list[Path]:
+        return [round_dir / ("test" if m == 0 else f"test_{m}") for m in range(self.n_test_markets)]
 
-        Returns the per-persona metrics dict for this round.
+    def _params_in_force(self) -> dict[str, dict[str, Any]]:
+        import yaml
+        cfg = yaml.safe_load(self.persona_config_path.read_text()) if self.persona_config_path.exists() else {}
+        active = resolve_persona_config(cfg or {})
+        return {p: effective_params(active, p) for p in self.personas}
+
+    def _baseline_effectiveness(self) -> dict:
+        path = self.master_run_dir / "round_0" / "metrics.json"
+        return json.loads(path.read_text()).get("effectiveness", {}) if path.exists() else {}
+
+    def run_round(self, round_num: int, mutation_source: dict[str, str] | None = None) -> dict[str, dict[str, float]]:
+        """
+        Executes one full round (SRS FR-3.1 / FR-3.2):
+          1. Simulate one training market and `n_test_markets` held-out test
+             markets (different seeds) under the current persona_config.
+          2. PRE-retrain: score the test markets with the detector frozen at the
+             end of the previous round — how well this round's mutation evaded.
+          3. Retrain on all training rounds 0..N and score again (POST-retrain).
+          4. Measure manipulation effectiveness on the test markets and the
+             strategist objective (evasion x retained effectiveness).
+          5. Persist metrics, flags (post-retrain) and SHAP importances.
+
+        Returns the post-retrain per-persona metrics.
         """
         round_dir = self.master_run_dir / f"round_{round_num}"
-        round_dir.mkdir(parents=True, exist_ok=True)
-        
         train_dir = round_dir / "train"
-        test_dir = round_dir / "test"
-        train_dir.mkdir(parents=True, exist_ok=True)
-        test_dir.mkdir(parents=True, exist_ok=True)
+        test_dirs = self._test_dirs(round_dir)
+        for d in [train_dir, *test_dirs]:
+            d.mkdir(parents=True, exist_ok=True)
+        params_used = self._params_in_force()
 
         logger.info("=" * 60)
-        logger.info(f"ROUND {round_num} — Simulating market (Training and Testing data concurrently)...")
-        
-        tick_offset = round_num * self.sim_ticks
+        logger.info(f"ROUND {round_num} — simulating 1 train + {len(test_dirs)} test markets...")
+        T = self.sim_ticks
+        jobs = [(train_dir, self.sim_seed + round_num * 10, round_num * T)]
+        for m, d in enumerate(test_dirs):
+            jobs.append((d, self.sim_seed + round_num * 10 + 1 + m, (round_num * self.n_test_markets + m) * T))
         import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            future_train = executor.submit(self._run_simulation, train_dir, self.sim_seed + round_num * 10, tick_offset)
-            future_test = executor.submit(self._run_simulation, test_dir, self.sim_seed + round_num * 10 + 1, tick_offset)
-            
-            # Wait for both to complete
-            future_train.result()
-            future_test.result()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+            for f in [executor.submit(self._run_simulation, *job) for job in jobs]:
+                f.result()
 
-        # Step 2: Load, train & score
-        logger.info(f"Round {round_num} — Training & scoring detector (Cumulative)...")
-        
-        import pandas as pd
-        X_train_list = []
-        y_train_list = []
-        for r in range(round_num + 1):
-            t_dir = self.master_run_dir / f"round_{r}" / "train"
-            X_r, y_r = self.pipeline.load_and_preprocess(t_dir)
-            if not X_r.empty:
-                X_train_list.append(X_r)
-                y_train_list.append(y_r)
-                
-        if X_train_list:
-            X_train = pd.concat(X_train_list)
-            y_train = pd.concat(y_train_list)
-        else:
-            X_train = pd.DataFrame()
-            y_train = pd.DataFrame()
-
-        X_test, y_test = self.pipeline.load_and_preprocess(test_dir)
-
-        if X_train.empty or X_test.empty:
-            logger.warning(f"Round {round_num}: empty feature matrix. Skipping.")
+        X_parts, y_parts, ev_parts, eff_parts = [], [], [], []
+        for d in test_dirs:
+            X_m, y_m = self.pipeline.load_and_preprocess(d)
+            ev_m = pd.read_parquet(d / "manipulation_events.parquet")
+            if not X_m.empty:
+                X_parts.append(X_m)
+                y_parts.append(y_m)
+            ev_parts.append(ev_m)
+            eff_parts.append(episode_effectiveness(
+                ev_m, pd.read_parquet(d / "trade_log.parquet"), pd.read_parquet(d / "order_log.parquet")))
+        if not X_parts:
+            logger.warning(f"Round {round_num}: empty test feature matrix. Skipping.")
             return {}
+        X_test, y_test = pd.concat(X_parts), pd.concat(y_parts)
+        events_test = pd.concat(ev_parts, ignore_index=True)
+        eff = summarize(pd.concat(eff_parts, ignore_index=True))
 
-        self.pipeline.train(X_train, y_train)
+        # --- Pre-retrain (frozen detector from previous round) ---
+        pre_metrics = None
+        if self.pipeline.is_trained:
+            logger.info(f"Round {round_num} — PRE-retrain scoring with frozen detector...")
+            pre_results = self.pipeline.score(X_test)
+            pre_metrics = compute_round_metrics(pre_results, y_test, self.personas, events=events_test)
+
+        # --- Retrain on cumulative training data ---
+        logger.info(f"Round {round_num} — retraining on rounds 0..{round_num}...")
+        X_tr, y_tr = [], []
+        for r in range(round_num + 1):
+            X_r, y_r = self.pipeline.load_and_preprocess(self.master_run_dir / f"round_{r}" / "train")
+            if not X_r.empty:
+                X_tr.append(X_r)
+                y_tr.append(y_r)
+        if not X_tr:
+            logger.warning(f"Round {round_num}: empty training data. Skipping.")
+            return {}
+        self.pipeline.train(pd.concat(X_tr), pd.concat(y_tr), save_dir=round_dir)
+
+        # --- Post-retrain ---
         results = self.pipeline.score(X_test)
+        post_metrics = compute_round_metrics(results, y_test, self.personas, events=events_test)
+        unsup = compute_unsupervised_metrics(results, y_test)
+        flags = self.pipeline.build_flags(X_test, results)
+        self.pipeline.write_flags(flags, round_dir / "flags.parquet")
 
-        # Step 3: Compute metrics on the test set
-        metrics = compute_round_metrics(results, y_test, self.personas)
+        # --- Effectiveness and strategist objective ---
+        baseline = eff if round_num == 0 else self._baseline_effectiveness()
+        ratios, scores = {}, {}
+        for p in self.personas:
+            ratios[p] = effectiveness_ratio(eff.get(p), baseline.get(p), p) if p in eff else None
+            pre_recall = (pre_metrics or {}).get(p, {}).get("recall")
+            scores[p] = mutation_score(pre_recall, ratios[p])
 
-        # Step 4: Save & accumulate multi-round datasets
-        save_round_metrics(metrics, round_num, round_dir)
-        self._all_metrics.append({"round": round_num, "personas": metrics})
+        save_round_metrics(
+            post_metrics, round_num, round_dir,
+            pre_retrain=pre_metrics,
+            unsupervised=unsup,
+            extra={
+                "thresholds": self.pipeline.supervised_detector.thresholds,
+                "n_flags": int(flags["final_flag"].sum()),
+                "n_test_markets": len(test_dirs),
+                "params_used": params_used,
+                "mutation_source": mutation_source or {p: ("baseline" if round_num == 0 else "unknown") for p in self.personas},
+                "effectiveness": eff,
+                "effectiveness_ratio": ratios,
+                "mutation_score": scores,
+            },
+        )
+        entry = {"round": round_num, "personas": post_metrics, "effectiveness_ratio": ratios, "mutation_score": scores}
+        if pre_metrics is not None:
+            entry["pre_retrain"] = pre_metrics
+        self._all_metrics.append(entry)
         self._save_cumulative_metrics()
-        self._accumulate_master_datasets(round_num)
+        return post_metrics
 
-        return metrics
-
-    def _accumulate_master_datasets(self, round_num: int) -> None:
-        """
-        Merges trading sim outputs across rounds into a master cumulative dataset
-        with continuous uninterrupted ticks.
-        """
-        for split in ["train", "test"]:
-            all_trades = []
-            all_orders = []
-            all_manips = []
-            all_bars = []
-            for r in range(round_num + 1):
-                split_dir = self.master_run_dir / f"round_{r}" / split
-                t_p = split_dir / "trade_log.parquet"
-                o_p = split_dir / "order_log.parquet"
-                m_p = split_dir / "manipulation_events.parquet"
-                b_p = split_dir / "ohlcv_bars.parquet"
-                if t_p.exists():
-                    all_trades.append(pd.read_parquet(t_p))
-                if o_p.exists():
-                    all_orders.append(pd.read_parquet(o_p))
-                if m_p.exists():
-                    all_manips.append(pd.read_parquet(m_p))
-                if b_p.exists():
-                    all_bars.append(pd.read_parquet(b_p))
-
-            if all_trades:
-                cum_dir = self.master_run_dir / "cumulative" / split
-                cum_dir.mkdir(parents=True, exist_ok=True)
-                io_utils.write_parquet(pd.concat(all_trades, ignore_index=True), cum_dir / "trade_log.parquet", "trade_log", overwrite=True)
-                io_utils.write_parquet(pd.concat(all_orders, ignore_index=True), cum_dir / "order_log.parquet", "order_log", overwrite=True)
-                if all_manips:
-                    final_manips = pd.concat(all_manips, ignore_index=True)
-                    if not final_manips.empty and "trader_ids" in final_manips.columns:
-                        final_manips["trader_ids"] = final_manips["trader_ids"].apply(
-                            lambda x: list(x) if isinstance(x, (list, np.ndarray)) else [x] if pd.notna(x) else []
-                        )
-                    io_utils.write_parquet(final_manips, cum_dir / "manipulation_events.parquet", "manipulation_events", overwrite=True)
-                if all_bars:
-                    io_utils.write_parquet(pd.concat(all_bars, ignore_index=True), cum_dir / "ohlcv_bars.parquet", "ohlcv_bars", overwrite=True)
-
-    def get_metrics_for_round(self, round_num: int) -> dict[str, dict[str, float]]:
+    def get_metrics_for_round(self, round_num: int, phase: str = "post") -> dict[str, dict[str, float]]:
         """Reads metrics for a specific round from disk (used by tools.py)."""
-        round_dir = self.master_run_dir / f"round_{round_num}"
-        return load_round_metrics(round_dir)
+        return load_round_metrics(self.master_run_dir / f"round_{round_num}", phase)
 
-    def get_shap_drift_for_persona(
-        self,
-        persona: str,
-        round_a: int,
-        round_b: int,
-    ) -> dict[str, float]:
-        """
-        Computes a simple feature importance drift between two rounds.
-        Currently uses precision/recall delta as a proxy for SHAP drift.
-        (Full SHAP integration requires storing shap_values.parquet per round — future work.)
-        """
-        metrics_a = self.get_metrics_for_round(round_a).get(persona, {})
-        metrics_b = self.get_metrics_for_round(round_b).get(persona, {})
-
-        if not metrics_a or not metrics_b:
-            return {"note": "Insufficient round data for SHAP drift."}
-
-        return {
-            "precision_delta": round(metrics_b.get("precision", 0) - metrics_a.get("precision", 0), 4),
-            "recall_delta":    round(metrics_b.get("recall", 0) - metrics_a.get("recall", 0), 4),
-            "f1_delta":        round(metrics_b.get("f1", 0) - metrics_a.get("f1", 0), 4),
-            "interpretation":  (
-                "Negative delta means the detector got WORSE at catching this persona (evasion worked). "
-                "Positive delta means the detector RECOVERED after retraining."
-            ),
-        }
+    def get_shap_drift_for_persona(self, persona: str, round_a: int, round_b: int) -> dict[str, float]:
+        """Mean-|SHAP| importance change for a persona's classifier between two rounds (FR-3.4)."""
+        def _load(r: int) -> dict:
+            path = self.master_run_dir / f"round_{r}" / "shap_importance.json"
+            return json.loads(path.read_text()).get(persona, {}) if path.exists() else {}
+        a, b = _load(round_a), _load(round_b)
+        if not a or not b:
+            return {"note": "SHAP importance not available for both rounds."}
+        return compute_shap_drift(a, b)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -291,8 +297,7 @@ class RoundOrchestrator:
 
     def _save_cumulative_metrics(self) -> None:
         """Saves all rounds' metrics to a single Parquet file for easy loading."""
-        from src.adversarial.metrics import build_summary_table
         df = build_summary_table(self._all_metrics)
-        out = self.master_run_dir / "round_metrics.parquet"
-        df.to_parquet(out, index=False)
-        logger.info(f"Cumulative metrics saved to {out}")
+        df.to_parquet(self.master_run_dir / "round_summary.parquet", index=False)
+        write_round_metrics_parquet(df, self.commodity, self.master_run_dir / "round_metrics.parquet")
+        logger.info("Cumulative metrics saved to %s", self.master_run_dir)

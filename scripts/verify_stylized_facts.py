@@ -95,7 +95,7 @@ def analyze_stylized_facts(output, commodity: str) -> dict:
         
         def calc_cancel_ratio(df):
             if df.empty: return 0.0
-            cancels = len(df[df['event_type'] == 'cancel'])
+            cancels = len(df[df['event_type'] == 'cancelled'])
             return cancels / len(df)
             
         cr_norm = calc_cancel_ratio(normal_log)
@@ -126,20 +126,12 @@ def run_single_commodity(commodity: str, n_ticks: int, tmp_path: str):
         n_ticks=n_ticks,
         ticks_per_bar=50,
         data_dir=Path(tmp_path) / run_id,
-        fundamental_value_initial=100.0,
         fundamental_value_drift=ou_target.drift,
         fundamental_value_vol=ou_target.volatility,
-        noise_lambda=agent_cfg["agents"]["noise_trader"]["arrival_rate_lambda"],
-        noise_price_offset_ticks=agent_cfg["agents"]["noise_trader"]["price_offset_ticks"],
-        momentum_lambda=agent_cfg["agents"]["momentum_trader"]["arrival_rate_lambda"],
-        momentum_lookback=agent_cfg["agents"]["momentum_trader"]["lookback_ticks"],
-        reversion_lambda=agent_cfg["agents"]["mean_reversion_trader"]["arrival_rate_lambda"],
-        reversion_threshold=agent_cfg["agents"]["mean_reversion_trader"]["reversion_threshold"],
-        market_maker_lambda=agent_cfg["agents"]["market_maker"]["arrival_rate_lambda"],
-        market_maker_spread=agent_cfg["agents"]["market_maker"]["spread_ticks"],
     )
     
-    seed = hash(commodity) % (2**32)
+    from src.core.simulation import multi_commodity_seed
+    seed = multi_commodity_seed(42, commodity)
     output = run_simulation(config, seed=seed)
     stats = analyze_stylized_facts(output, commodity)
     logger.info(f"Completed {commodity}")

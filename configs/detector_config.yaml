@@ -2,50 +2,61 @@
 # configs/detector_config.yaml
 #
 # Hyperparameters for the two-layer manipulation detector (Module 2).
+# Unit of detection: one (commodity, window, trader_id) row.
 # =============================================================================
 
 # --- Feature Engine ---
 feature_engine:
-  window: "5min"           # rolling window size (in simulated time units)
-  step: "1min"             # stride between windows
-  top_k_traders: 5         # volume concentration: top-k most active traders
+  window: "3min"           # rolling window length (1 tick = 1 second)
+  step: "30s"              # stride between windows
+  top_k_traders: 5
+  vol_spike_lookback: 10   # windows of history for volume / return baselines
+  # Designated liquidity providers are surveilled under separate quoting rules;
+  # their requote cancels would otherwise dominate every cancellation feature.
+  exclude_trader_prefixes: ["mm_"]
 
-# --- Unsupervised Layer: Isolation Forest ---
+# --- Unsupervised Layer: Isolation Forests ---
 isolation_forest:
-  contamination: 0.05      # default; swept 0.01–0.10 for sensitivity analysis
+  contamination: 0.01         # trader-level flag rate (percentile threshold = 1 - contamination)
+  market_contamination: 0.05  # market-regime forest (context feature only)
   n_estimators: 200
   max_samples: "auto"
-  random_state: 42         # deterministic
+  random_state: 42
 
-# --- Supervised Layer: XGBoost (per-persona binary classifiers) ---
+# --- Supervised Layer: per-persona XGBoost ---
 xgboost:
   n_estimators: 300
-  max_depth: 3
+  max_depth: 4
   min_child_weight: 1
-  n_estimators_small: 50
-  max_depth_small: 2
-  min_child_weight_small: 3
+  n_estimators_small: 150
+  max_depth_small: 3
+  min_child_weight_small: 1
   learning_rate: 0.05
-  subsample: 0.7
+  subsample: 0.8
   colsample_bytree: 0.8
   gamma: 0.5
   reg_alpha: 0.1
   reg_lambda: 2.0
   eval_metric: "logloss"
-  use_label_encoder: false
+  max_scale_pos_weight: 50.0   # scale_pos_weight = n_neg / n_pos, capped
   random_state: 42
-  # scale_pos_weight: computed dynamically = n_negative / n_positive per fold
+
+supervised:
+  min_positives: 5             # fewer positive rows → classifier skipped with a warning
+  require_all_personas: false  # true → raise InsufficientLabelsError instead (SRS FR-2.3 strict mode)
+  cv_folds: 3                  # GroupKFold folds for out-of-fold threshold tuning
+  cv_block_ticks: 600          # time-block size for CV groups (keeps overlapping windows together)
+  threshold_bounds: [0.25, 0.9]  # tuned thresholds are kept inside this range (few-episode robustness)
 
 # --- Ensemble Scorer ---
 ensemble:
-  # Combination rule: "or" | "weighted"
-  # "or" = flag if either layer fires (spec Section 4.4)
-  combination_rule: "or"
-  iso_weight: 0.4          # used only if combination_rule = "weighted"
-  supervised_weight: 0.6   # used only if combination_rule = "weighted"
-  supervised_threshold: 0.5  # probability threshold for binary classification
+  combination_rule: "or"       # "or": flag if a classifier OR the IsolationForest fires
+  iso_weight: 0.4              # used only if combination_rule = "weighted"
+  supervised_weight: 0.6
+  supervised_threshold: 0.5    # fallback when a threshold cannot be tuned
+  top_shap_features: 5
 
-# --- Personas to train classifiers for ---
+# --- Personas to train classifiers for (layering not maintained) ---
 personas:
   - spoofing
   - wash_trading

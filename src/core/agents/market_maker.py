@@ -19,11 +19,17 @@ Role in the simulation:
   - Primary provider of liquidity depth
   - Constrains the bid-ask spread (signals market quality)
   - Inventory accumulation under manipulation signals price impact
+
+Realism notes:
+  - Inventory skew is expressed in half-spreads (Avellaneda-Stoikov style), not
+    as a percentage of price, so a modest inventory cannot move quotes by %s.
+  - Quotes lean toward the visible order-book imbalance, as real liquidity
+    providers do. This is precisely why spoofed depth is profitable: it moves
+    the quotes other participants trade against.
 """
 
 from __future__ import annotations
 
-import uuid
 
 import numpy as np
 
@@ -33,14 +39,15 @@ from src.core.order_book import BookState, Order, Side
 
 class MarketMaker(Agent):
     """
-    Inventory-skewed two-sided market maker.
+    Inventory-skewed, imbalance-aware two-sided market maker.
 
     Args:
-        spread_ticks: Half-spread from mid-price in price units.
-        inventory_skew_factor: Per-unit inventory skew (shifts quotes toward inventory reduction).
-        max_inventory: Absolute inventory cap; above this, maker stops adding on one side.
-        order_size: Quote size per side per tick.
-        arrival_rate_lambda: Per-tick activation probability (default ~0.95 = near-always).
+        spread_ticks: Half-spread from the reference price, in price units.
+        inventory_skew_factor: Skew (in half-spreads) at |inventory| == max_inventory.
+        max_inventory: Absolute inventory cap; beyond it the maker quotes one side only.
+        order_size: Quote size per side.
+        arrival_rate_lambda: Per-tick requote probability.
+        imbalance_lean: Shift (in half-spreads) toward a fully one-sided book.
     """
 
     def __init__(
@@ -49,10 +56,11 @@ class MarketMaker(Agent):
         rng: np.random.Generator,
         *,
         spread_ticks: float = 2.0,
-        inventory_skew_factor: float = 0.1,
+        inventory_skew_factor: float = 1.0,
         max_inventory: int = 500,
-        order_size: int = 20,
+        order_size: int = 40,
         arrival_rate_lambda: float = 0.95,
+        imbalance_lean: float = 0.6,
     ) -> None:
         super().__init__(trader_id, rng)
         self.spread_ticks = spread_ticks
@@ -60,50 +68,38 @@ class MarketMaker(Agent):
         self.max_inventory = max_inventory
         self.order_size = order_size
         self.arrival_rate_lambda = arrival_rate_lambda
-
-        self.net_inventory: int = 0               # positive = net long
-        self._pending_bid_id: str | None = None   # track current resting bid for cancel
-        self._pending_ask_id: str | None = None   # track current resting ask for cancel
+        self.imbalance_lean = imbalance_lean
+        self.net_inventory: int = 0
+        self._pending_bid_id: str | None = None
+        self._pending_ask_id: str | None = None
 
     def update_inventory(self, trade_side: Side, quantity: int) -> None:
-        """
-        Update net inventory after a fill on this maker's resting order.
-        Called by the simulation loop after processing each Trade involving this maker.
-        """
+        """Update net inventory after a fill (called by the simulation loop)."""
         if trade_side == Side.BUY:
-            self.net_inventory += quantity   # maker was the resting buyer
+            self.net_inventory += quantity
         else:
-            self.net_inventory -= quantity   # maker was the resting seller
+            self.net_inventory -= quantity
 
     def decide(self, book_state: BookState, tick: int) -> Order | None:
-        """
-        Return a new bid order. The simulation loop calls this twice
-        (once for bid, once for ask) or calls the dedicated decide_pair() method.
+        """Single-order interface (bid only). The simulation uses decide_pair()."""
+        _, orders = self.decide_pair(book_state, tick)
+        return next((o for o in orders if o.side == Side.BUY), None)
 
-        NOTE: For the market maker, the simulation loop must use decide_pair()
-        to get both quotes atomically. This single decide() returns the bid.
-        """
-        if self.rng.random() > self.arrival_rate_lambda:
-            return None
-
-        ref_price = book_state.mid_price or book_state.last_trade_price
-        if ref_price is None or ref_price <= 0:
-            return None
-
-        return self._make_bid(ref_price, tick)
+    def _quote_center(self, ref_price: float, book_state: BookState) -> float:
+        inv_frac = float(np.clip(self.net_inventory / max(1, self.max_inventory), -1.0, 1.0))
+        skew = self.inventory_skew_factor * inv_frac * self.spread_ticks
+        lean = self.imbalance_lean * book_state.imbalance() * self.spread_ticks
+        return ref_price - skew + lean
 
     def decide_pair(
         self, book_state: BookState, tick: int
     ) -> tuple[list[str], list[Order]]:
         """
-        Atomic requote: cancel existing resting quotes, place new bid + ask.
+        Requote: cancel the existing resting quotes, place a new bid + ask.
 
         Returns:
-            cancel_ids: list of order_ids to cancel (at most 2: pending bid + ask)
-            new_orders: list of new Orders to submit (at most 2: new bid + ask)
-
-        The simulation loop processes cancels first, then new orders, in the
-        same tick — ensuring atomicity within the book for this tick.
+            cancel_ids: order_ids to cancel (previous bid/ask)
+            new_orders: new bid/ask Orders (one side is dropped at the inventory cap)
         """
         if self.rng.random() > self.arrival_rate_lambda:
             return [], []
@@ -112,73 +108,22 @@ class MarketMaker(Agent):
         if ref_price is None or ref_price <= 0:
             return [], []
 
-        # Collect cancel instructions for existing resting orders
-        cancel_ids: list[str] = []
-        if self._pending_bid_id is not None:
-            cancel_ids.append(self._pending_bid_id)
-        if self._pending_ask_id is not None:
-            cancel_ids.append(self._pending_ask_id)
+        cancel_ids = [oid for oid in (self._pending_bid_id, self._pending_ask_id) if oid is not None]
+        self._pending_bid_id = self._pending_ask_id = None
 
-        # Inventory decay / macro re-hedging: smoothly unwind inventory over time
-        if self.net_inventory != 0 and self.rng.random() < 0.25:
-            self.net_inventory = int(self.net_inventory * 0.95)
+        center = self._quote_center(ref_price, book_state)
+        bid_price = self.snap(max(center - self.spread_ticks, self.tick_size))
+        ask_price = self.snap(max(center + self.spread_ticks, bid_price + self.tick_size))
+        if ask_price <= bid_price:
+            ask_price = self.snap(bid_price + self.tick_size)
 
-        # Inventory skew: bounded shift relative to reference price to avoid negative quotes
-        raw_skew = self.inventory_skew_factor * self.net_inventory
-        max_allowed_skew = ref_price * 0.04  # Cap skew at 4% of price
-        skew = np.clip(raw_skew * 0.01 * ref_price, -max_allowed_skew, max_allowed_skew)
-        skewed_mid = ref_price - skew  # positive inventory → skew bids down, asks down
-
-        # Generate new bid
-        bid_id = str(uuid.uuid4())
-        bid_price = round(max(skewed_mid - self.spread_ticks, 0.01), 4)
-
-        # Generate new ask
-        ask_id = str(uuid.uuid4())
-        ask_price = round(max(skewed_mid + self.spread_ticks, bid_price + 0.01), 4)
-
-        # Do not quote if inventory is too extreme
         new_orders: list[Order] = []
-
         if self.net_inventory < self.max_inventory:
-            new_orders.append(Order(
-                order_id=bid_id,
-                trader_id=self.trader_id,
-                side=Side.BUY,
-                price=bid_price,
-                quantity=self.order_size,
-                tick=tick,
-                order_type="limit",
-            ))
-            self._pending_bid_id = bid_id
-
+            bid = self.limit(Side.BUY, bid_price, self.order_size, tick)
+            self._pending_bid_id = bid.order_id
+            new_orders.append(bid)
         if self.net_inventory > -self.max_inventory:
-            new_orders.append(Order(
-                order_id=ask_id,
-                trader_id=self.trader_id,
-                side=Side.SELL,
-                price=ask_price,
-                quantity=self.order_size,
-                tick=tick,
-                order_type="limit",
-            ))
-            self._pending_ask_id = ask_id
-
+            ask = self.limit(Side.SELL, ask_price, self.order_size, tick)
+            self._pending_ask_id = ask.order_id
+            new_orders.append(ask)
         return cancel_ids, new_orders
-
-    def _make_bid(self, ref_price: float, tick: int) -> Order | None:
-        if self.net_inventory >= self.max_inventory:
-            return None
-        skew = self.inventory_skew_factor * self.net_inventory
-        bid_price = round(max(ref_price - skew - self.spread_ticks, 0.01), 4)
-        bid_id = str(uuid.uuid4())
-        self._pending_bid_id = bid_id
-        return Order(
-            order_id=bid_id,
-            trader_id=self.trader_id,
-            side=Side.BUY,
-            price=bid_price,
-            quantity=self.order_size,
-            tick=tick,
-            order_type="limit",
-        )

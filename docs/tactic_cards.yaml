@@ -1,0 +1,90 @@
+# =============================================================================
+# docs/tactic_cards.yaml
+#
+# Compact evasion "tactic cards" for the Adversarial Strategist (Module 4B).
+# Each card maps a tactic documented in docs/enforcement_case_notes.md to the
+# simulator knobs that implement it, the detector features it is expected to
+# weaken, and what it costs the manipulator. Kept short on purpose: this is
+# sent to a paid LLM every round.
+# =============================================================================
+
+spoofing:
+  - tactic: Size randomisation
+    source: "CFTC 2020 staff advisory #1; Coscia round 2"
+    knobs: {size_jitter: up, order_size_multiplier: down}
+    weakens: [max_order_size_rel, large_order_share, order_size_cv]
+    cost: smaller/irregular fake depth moves the book less
+  - tactic: Cancel-timing randomisation
+    source: 'advisory #2; Coscia "introduce random delays"'
+    knobs: {cancel_jitter: up, cancellation_delay_ticks: up}
+    weakens: [fast_cancel_ratio, mean_cancel_lifetime]
+    cost: longer-resting spoofs risk being filled
+  - tactic: Split into batches / layers
+    source: Coscia evasion; Tower Research layering
+    knobs: {n_split_orders: 2-4}
+    weakens: [max_order_size_rel, large_cancel_ratio, n_large_cancels]
+    cost: more cancel events per cycle
+  - tactic: Cross-account (cross-trader) spoofing
+    source: JPMorgan 2020 — one account holds the genuine order, another spoofs
+    knobs: {n_accounts: 2-3}
+    weakens: [spoof_signature, cancel_exec_opposition]
+    cost: needs coordination; each account still cancels heavily
+  - tactic: Spoof further from the touch
+    source: generic
+    knobs: {price_aggressiveness: up}
+    weakens: [passive_distance_bp]
+    cost: STRONG — depth beyond ~0.2% barely moves prices (effectiveness collapses)
+
+wash_trading:
+  - tactic: Account rings instead of a fixed pair
+    source: Coinbase 2021 — cyclical A->B->C->A washes
+    knobs: {ring_size: 3-6}
+    weakens: [top_cpty_share, reciprocal_ratio]
+    cost: more accounts to control
+  - tactic: Account proliferation
+    source: "advisory #3; Kraft round 2 (3-5 accounts)"
+    knobs: {n_groups: 2-5}
+    weakens: [gross_volume_share, max_order_size_rel, activity_vs_history]
+    cost: none on total volume (the rate is split across groups)
+  - tactic: Irregular sizes
+    source: "advisory #1"
+    knobs: {size_jitter: up}
+    weakens: [trade_size_cv, max_order_size_rel]
+    cost: none
+  - tactic: Interleave genuine trades
+    source: "Kraft round 2; advisory #4"
+    knobs: {camouflage_rate: up}
+    weakens: [top_cpty_share, net_flatness, reciprocal_ratio]
+    cost: real market exposure and less wash volume
+  - tactic: Lower cross frequency
+    source: generic
+    knobs: {trade_frequency: down}
+    weakens: [gross_volume_share, activity_vs_history]
+    cost: STRONG — wash volume (the whole point) falls proportionally
+
+pump_and_dump:
+  - tactic: Staggered accumulation
+    source: Nefedova — accounts buy at different times, "appearing like independent decisions"
+    knobs: {stagger: up, burst_duration_ticks: up}
+    weakens: [coordinated_peers, activity_vs_history]
+    cost: a slower, less synchronised pump lifts the price less
+  - tactic: Account proliferation
+    source: "Nefedova round 2 (5-8 accounts); advisory #3"
+    knobs: {n_coordinated_accounts: up, accumulation_size: down}
+    weakens: [gross_volume_share, exec_vol, avg_order_size_rel]
+    cost: coordination; total size per account must stay meaningful
+  - tactic: Gentler ignition
+    source: generic
+    knobs: {ignition_aggression: down}
+    weakens: [aggressor_ratio, mkt_abnormal_return_z, signed_flow_return]
+    cost: STRONG — the ignition is what moves the price
+  - tactic: Interleave decoy trades
+    source: "advisory #4"
+    knobs: {decoy_rate: up}
+    weakens: [exec_side_imbalance, long_net_ratio, reversal_score]
+    cost: buys back some of what is sold and vice versa
+  - tactic: Slow, phased exit
+    source: Nefedova — dump over 2-3x the accumulation window
+    knobs: {dump_delay_ticks: up}
+    weakens: [reversal_score, vol_price_divergence]
+    cost: price may revert before the coalition has sold
