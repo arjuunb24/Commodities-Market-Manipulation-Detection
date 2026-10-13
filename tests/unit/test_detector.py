@@ -150,6 +150,10 @@ def test_pipeline_end_to_end_flags_schema(sim_features, tmp_path):
     flagged = back[back["final_flag"]]
     assert all(isinstance(d, dict) and None not in d.values() for d in back["top_shap_features"])
     assert (flagged["top_shap_features"].apply(len) > 0).all(), "every flag carries SHAP evidence"
+    trained = set(pipe.supervised_detector.models)
+    assert all(set(d) == trained for d in back["persona_scores"]), "every row carries all persona probabilities"
+    row = back[back["final_flag"] & back["predicted_persona"].isin(trained)].iloc[0]
+    assert row["persona_scores"][row["predicted_persona"]] == pytest.approx(row["final_score"], abs=1e-3)
     assert (tmp_path / "shap_importance.json").exists()
     metrics = compute_round_metrics(res, y, CFG["personas"], events=events)
     for p, m in metrics.items():

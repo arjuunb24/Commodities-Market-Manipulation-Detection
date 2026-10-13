@@ -300,6 +300,7 @@ class FlagsSchema(pa.DataFrameModel):
       per triggering classifier.
     """
 
+    # Schema version 2.1: adds persona_scores (all persona probabilities per row).
     # Schema version 2 (trader-level detector): adds window_end, iso_score and
     # predicted_persona. Module 4A / dashboard / analyst tools updated together.
     commodity: Series[str] = pa.Field(description="Commodity symbol (e.g. gold, crude_oil_wti)")
@@ -323,6 +324,9 @@ class FlagsSchema(pa.DataFrameModel):
     top_shap_features: Series[object] = pa.Field(
         description="Dict of {feature: shap_value} for the top SHAP contributors"
     )
+    persona_scores: Series[object] = pa.Field(
+        description="Dict of {persona: classifier probability} for every trained persona model"
+    )
 
     @pa.dataframe_check
     @classmethod
@@ -337,6 +341,13 @@ class FlagsSchema(pa.DataFrameModel):
         if df.empty:
             return True
         return bool(df["top_shap_features"].apply(lambda x: isinstance(x, dict)).all())
+
+    @pa.dataframe_check
+    @classmethod
+    def persona_scores_are_dicts(cls, df: pd.DataFrame) -> bool:
+        if df.empty:
+            return True
+        return bool(df["persona_scores"].apply(lambda x: isinstance(x, dict)).all())
 
     class Config:
         name = "flags"

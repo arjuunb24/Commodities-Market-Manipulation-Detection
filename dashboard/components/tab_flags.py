@@ -28,6 +28,7 @@ import streamlit as st
 import yaml
 
 from dashboard.data_loader import (
+    load_decision_thresholds,
     load_flags,
     load_manipulation_events,
     load_order_log,
@@ -54,24 +55,59 @@ PLOTLY_LAYOUT = dict(
     margin=dict(l=10, r=10, t=36, b=10),
 )
 FEATURE_DESCRIPTIONS = {
-    "spoof_signature": "Share of the account's large cancelled orders during whose life it was filled on the opposite side",
-    "large_cancel_ratio": "Share of the account's large orders that were cancelled",
-    "fast_cancel_ratio": "Share of order volume cancelled within 10 s of placement",
+    # Activity
+    "n_orders": "Number of orders the account placed in the window",
+    "n_trades": "Number of trades the account took part in",
+    "exec_vol": "Volume the account traded (bought + sold)",
+    "gross_volume_share": "Account's share of all market volume in the window",
+    "activity_vs_history": "Activity now vs. the account's own usual level (log ratio; high = sudden burst)",
+    # Order sizes
+    "avg_order_size_rel": "Average order size vs. the market's median order size",
     "max_order_size_rel": "Largest order vs. the market's median order size",
-    "n_large_cancels": "Number of large orders cancelled in the window",
+    "order_size_cv": "How much the account's order sizes vary (coefficient of variation)",
+    "large_order_share": "Share of placed volume in large orders (>= 4x the market median)",
+    # Cancellations (spoofing)
     "cancel_ratio": "Cancelled volume / placed volume",
-    "top_cpty_share": "Share of the account's volume done with a single counterparty",
-    "reciprocal_ratio": "Volume traded back and forth with the same counterparties",
-    "net_flatness": "1 − |net position / gross volume| (1 = no net position change)",
-    "price_dev_bp": "Average distance of the account's trades from VWAP (bp)",
+    "fast_cancel_ratio": "Share of order volume cancelled within 10 s of placement",
+    "large_cancel_ratio": "Share of the account's large orders that were cancelled",
+    "n_large_cancels": "Number of large orders cancelled in the window",
+    "mean_cancel_lifetime": "Average time a cancelled order rested before cancellation (ticks)",
+    "passive_distance_bp": "How far behind the market price the account's orders were placed (bp)",
+    "fill_ratio": "Traded volume / placed volume (low = orders mostly not meant to trade)",
+    "cancel_side_imbalance": "Whether cancellations were concentrated on the buy (+) or sell (−) side",
+    "cancel_exec_opposition": "Cancelling on one side while trading on the other (spoofing pattern)",
+    "spoof_signature": "Share of large cancelled orders during whose life the account was filled on the opposite side",
+    # Trading direction / position (pump-and-dump)
+    "exec_side_imbalance": "Net buying (+) or selling (−) as a share of the account's traded volume",
+    "aggressor_ratio": "Share of the account's volume where it crossed the spread (took liquidity)",
+    "prev_net_ratio": "Net buying (+) or selling (−) in the previous ~6 minutes",
+    "long_net_ratio": "Position built over ~12 minutes as a share of volume",
+    "reversal_score": "Net buyer before, net seller now (or vice versa) — a position flip",
+    "signed_flow_return": "Own net direction × market return (high = trading with the price move it pushes)",
     "coordinated_peers": "Other accounts bursting in the same direction in this window",
-    "long_net_ratio": "Net position built over ~12 minutes / gross volume",
-    "reversal_score": "Net buyer in prior windows, net seller now (or vice versa)",
-    "signed_flow_return": "Own net direction × market return (bp)",
-    "activity_vs_history": "Activity now vs. the account's own history (log ratio)",
-    "aggressor_ratio": "Share of the account's volume where it took liquidity",
-    "mkt_anomaly_score": "Market-regime anomaly percentile for the window",
+    # Counterparties (wash trading)
+    "net_flatness": "1 − |net position / gross volume| (1 = lots of volume, no net position change)",
+    "top_cpty_share": "Share of the account's volume done with a single counterparty",
+    "reciprocal_ratio": "Volume bought from and sold back to the same counterparties",
+    "n_counterparties": "Number of different accounts it traded with",
+    "trade_size_cv": "How much its trade sizes vary (low = scripted, uniform sizes)",
+    "price_dev_bp": "Average distance of its trade prices from the market VWAP (bp)",
+    # Market context (same for every account in the window)
+    "mkt_return_bp": "Market price change over the window (bp)",
+    "mkt_volatility_bp": "Market volatility in the window (bp)",
+    "mkt_range_bp": "High–low price range of the market in the window (bp)",
+    "mkt_volume_spike": "Market volume vs. its recent average",
+    "mkt_trade_imbalance": "Market-wide aggressive buying minus selling, as a share of volume",
+    "mkt_order_imbalance": "Market-wide placed buy volume minus sell volume, as a share",
+    "mkt_cancel_ratio": "Market-wide cancelled / placed orders",
+    "mkt_abnormal_return_z": "How unusual the market's price move was vs. recent history (z-score)",
+    "mkt_anomaly_score": "How unusual the whole market looked in this window (percentile)",
 }
+for _base in ("cancel_ratio", "fast_cancel_ratio", "avg_order_size_rel", "max_order_size_rel",
+              "gross_volume_share", "reciprocal_ratio", "aggressor_ratio", "large_order_share"):
+    FEATURE_DESCRIPTIONS[f"peer_z_{_base}"] = (
+        f"{FEATURE_DESCRIPTIONS[_base]} — compared with all other accounts in the same window (robust z-score)"
+    )
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -93,6 +129,8 @@ def _build_cases(flags: pd.DataFrame) -> pd.DataFrame:
                 if row["final_score"] > current["score"]:
                     current["score"] = float(row["final_score"])
                     current["top_shap_features"] = row["top_shap_features"]
+                    current["persona_scores"] = row.get("persona_scores") or {}
+                    current["iso_score"] = float(row.get("iso_score", 0.0))
                 continue
             if current is not None:
                 cases.append(current)
@@ -102,6 +140,8 @@ def _build_cases(flags: pd.DataFrame) -> pd.DataFrame:
                 "score": float(row["final_score"]), "n_windows": 1,
                 "triggered_by": set(row["triggered_by"]),
                 "top_shap_features": row["top_shap_features"],
+                "persona_scores": row.get("persona_scores") or {},
+                "iso_score": float(row.get("iso_score", 0.0)),
             }
         if current is not None:
             cases.append(current)
@@ -156,6 +196,118 @@ def _build_shap_chart(shap_values: dict[str, float], persona: str) -> go.Figure:
     return fig
 
 
+PERSONA_ORDER = ["spoofing", "wash_trading", "pump_and_dump"]
+
+
+def _confidence_label(margin: float) -> str:
+    if margin >= 0.4:
+        return "very high"
+    if margin >= 0.2:
+        return "high"
+    if margin >= 0.05:
+        return "moderate"
+    return "borderline"
+
+
+def _gauge_html(value: float, threshold: float | None, color: str, height: int = 10) -> str:
+    """Horizontal bar 0-1 with the decision threshold as a vertical marker (single-line HTML)."""
+    v = max(0.0, min(1.0, float(value)))
+    marker = ""
+    if threshold is not None:
+        t = max(0.0, min(1.0, float(threshold)))
+        marker = (f'<div title="threshold {t:.2f}" style="position:absolute; left:calc({t * 100:.1f}% - 1px); top:-3px; '
+                  f'width:2px; height:{height + 6}px; background:#e2e8f0;"></div>')
+    return (f'<div style="position:relative; background:rgba(255,255,255,0.08); border-radius:99px; height:{height}px; margin:4px 0;">'
+            f'<div style="width:{v * 100:.1f}%; height:{height}px; border-radius:99px; background:{color};"></div>{marker}</div>')
+
+
+def _render_confidence(case: pd.Series, thresholds: dict) -> None:
+    """
+    Prediction confidence for a case: the model output that drove the flag against
+    the decision threshold it had to clear, plus every persona classifier's view
+    of the same account-window (values from the case's strongest window).
+    """
+    persona = case["persona"]
+    scores = case.get("persona_scores") or {}
+    if persona == "anomaly":
+        value, thr = float(case.get("iso_score", case["score"])), thresholds.get("anomaly")
+        what = "IsolationForest anomaly percentile"
+    else:
+        value, thr = float(scores.get(persona, case["score"])), thresholds.get(persona)
+        what = f"{persona.replace('_', ' ')} classifier probability"
+    color = PERSONA_COLORS.get(persona, PERSONA_COLORS["anomaly"])[0]
+    margin = value - thr if thr is not None else None
+    verdict = f" · {_confidence_label(margin)} confidence" if margin is not None else ""
+    thr_txt = f"threshold {thr:.2f} · margin {margin:+.2f}" if thr is not None else "threshold not recorded for this run"
+
+    html = (
+        '<div style="margin-top:0.6rem; background:rgba(15,23,42,0.6); border:1px solid rgba(99,130,200,0.18); '
+        'border-radius:10px; padding:0.7rem 0.9rem;">'
+        '<div style="font-size:0.68rem; color:#94a3b8; text-transform:uppercase; font-weight:700; letter-spacing:0.06em;">'
+        f'Prediction confidence{verdict}</div>'
+        f'<div style="font-size:1.6rem; font-weight:700; color:{color}; line-height:1.3;">{value:.1%}</div>'
+        f'<div style="font-size:0.72rem; color:#94a3b8;">{what}</div>'
+        f'{_gauge_html(value, thr, color)}'
+        f'<div style="font-size:0.7rem; color:#64748b;">{thr_txt} (white tick = decision threshold)</div>'
+    )
+    others = [p for p in PERSONA_ORDER if p in scores]
+    if others:
+        html += ('<div style="font-size:0.68rem; color:#94a3b8; text-transform:uppercase; font-weight:700; '
+                 'letter-spacing:0.06em; margin-top:0.7rem;">All persona classifiers</div>')
+        for p in others:
+            pc = PERSONA_COLORS.get(p, PERSONA_COLORS["anomaly"])[0]
+            pv, pt = float(scores[p]), thresholds.get(p)
+            flag = " ✔" if pt is not None and pv >= pt else ""
+            html += (f'<div style="display:flex; justify-content:space-between; font-size:0.72rem; color:#cbd5e1; margin-top:0.35rem;">'
+                     f'<span>{PERSONA_ICONS.get(p, "")} {p.replace("_", " ")}{flag}</span><span>{pv:.1%}'
+                     f'{f" / {pt:.2f}" if pt is not None else ""}</span></div>{_gauge_html(pv, pt, pc, height=6)}')
+    elif persona != "anomaly":
+        html += ('<div style="font-size:0.68rem; color:#64748b; margin-top:0.5rem;">Per-persona probabilities are stored '
+                 'for runs produced after this update.</div>')
+    html += "</div>"
+    st.markdown(html, unsafe_allow_html=True)
+
+
+EVIDENCE_LABELS = {
+    "span_length_ticks": "Flagged span (ticks)",
+    "large_order_size_vs_market_median_x": "Large order size vs market median (×)",
+    "median_large_order_lifetime_ticks": "Median life of large orders before cancel (ticks)",
+    "large_orders_with_opposite_side_fill_while_resting": "Large orders during which the account was filled on the other side",
+    "avg_price_move_toward_filled_side_bp": "Avg price move toward the filled side while the large order rested (bp)",
+    "account_cancelled_volume_pct": "Share of placed volume cancelled (%)",
+    "net_position_vs_gross_pct": "Net position as % of gross volume",
+    "volume_with_top_counterparty_pct": "Volume with top counterparty (%)",
+    "pair_share_of_market_volume_pct": "Pair's share of all market volume (%)",
+    "median_price_distance_from_vwap_bp": "Median trade price distance from VWAP (bp)",
+    "aggressive_share_pct": "Volume taken aggressively (%)",
+    "burst_share_of_market_volume_pct": "Burst share of market volume (%)",
+    "other_accounts_flagged_for_pump_and_dump_in_same_span": "Other accounts flagged for pump-and-dump in the same span",
+}
+
+
+def _fmt_evidence_value(v) -> str:
+    if isinstance(v, dict):
+        return ", ".join(f"{k}: {x}" for k, x in v.items()) or "–"
+    if isinstance(v, (list, tuple)):
+        if v and all(isinstance(x, (int, float)) for x in v):
+            return " – ".join(str(x) for x in v)
+        return ", ".join(map(str, v)) or "none"
+    return str(v)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _case_evidence(run_dir_str: str, round_num: int, market: str | None, persona: str, trader: str,
+                   commodity: str, start: int, end: int) -> dict:
+    from src.agentic.case_evidence import build_case_evidence
+    trades = load_trade_log(run_dir_str, round_num, market)
+    if persona in ("spoofing", "anomaly"):
+        orders = load_order_log(run_dir_str, round_num, market)
+    else:
+        orders = pd.DataFrame(columns=["order_id", "trader_id", "side", "price", "quantity", "tick", "event_type", "commodity"])
+    flags = load_flags(run_dir_str, round_num) if persona == "pump_and_dump" else None
+    return build_case_evidence(persona, trader, commodity, start, end, trades, orders, flags)
+
+
 def _case_chart(trades: pd.DataFrame, case: pd.Series, pad: int = 120) -> go.Figure | None:
     """Market price around the case window, with the flagged account's own trades marked."""
     if trades.empty:
@@ -189,7 +341,7 @@ def _llm_config() -> dict:
     return yaml.safe_load(path.read_text()) if path.exists() else {}
 
 
-def _narrative(case: pd.Series, run_dir: Path) -> dict | None:
+def _narrative(case: pd.Series, run_dir: Path, evidence: dict | None = None) -> dict | None:
     cfg = _llm_config().get("narrative_generator", {})
     from src.agentic.llm_client import llm_unavailable_reason
     reason = llm_unavailable_reason(cfg)
@@ -208,7 +360,9 @@ def _narrative(case: pd.Series, run_dir: Path) -> dict | None:
             "triggered_by": list(case["triggered_by"]),
         }
         shap = {k: round(float(v), 3) for k, v in case["top_shap_features"].items()}
-        return gen.generate(flag_row=flag_row, shap_summary=shap)
+        from src.agentic.case_evidence import MECHANISMS
+        return gen.generate(flag_row=flag_row, shap_summary=shap, evidence=evidence,
+                            mechanism=MECHANISMS.get(case["persona"]))
     except Exception as exc:
         logger.warning("Narrative generation failed: %s", exc)
         return {"error": str(exc)}
@@ -296,11 +450,12 @@ def render_flags_tab(run_dir: Path | None, selected_round: int, market: str | No
     pages = max(1, (len(view) + PAGE - 1) // PAGE)
     page = st.selectbox("Page", list(range(1, pages + 1)), key="flags_page_sel") if pages > 1 else 1
     for idx, case in view.iloc[(page - 1) * PAGE: page * PAGE].iterrows():
-        _render_case(idx, case, trades, run_dir, selected_round, market)
+        _render_case(idx, case, trades, run_dir, selected_round, market,
+                     load_decision_thresholds(str(run_dir), selected_round))
 
 
 def _render_case(idx: int, case: pd.Series, trades: pd.DataFrame, run_dir: Path, selected_round: int,
-                 market: str | None = None) -> None:
+                 market: str | None = None, thresholds: dict | None = None) -> None:
     persona = case["persona"]
     color, bg, border = PERSONA_COLORS.get(persona, PERSONA_COLORS["anomaly"])
     icon = PERSONA_ICONS.get(persona, "•")
@@ -328,6 +483,7 @@ def _render_case(idx: int, case: pd.Series, trades: pd.DataFrame, run_dir: Path,
                 unsafe_allow_html=True,
             )
             st.caption(f"Simulator ground truth: {status_badge}")
+            _render_confidence(case, thresholds or {})
         with h2:
             fig = _case_chart(trades, case)
             if fig is not None:
@@ -346,12 +502,18 @@ def _render_case(idx: int, case: pd.Series, trades: pd.DataFrame, run_dir: Path,
                 ]), use_container_width=True, hide_index=True)
             else:
                 st.info("No SHAP attribution stored for this case.")
+        evidence = _case_evidence(str(run_dir), selected_round, market, persona, case["trader_id"],
+                                  case["commodity"], int(case["start_tick"]), int(case["end_tick"]))
         with n_col:
-            st.markdown("**🤖 Case note** · _AI-generated summary of detector output — simulation only_")
+            st.markdown("**🔎 What the account did** · _measured from its own orders and trades in this span_")
+            rows = [{"Fact": EVIDENCE_LABELS.get(k, k.replace("_", " ").capitalize()), "Value": _fmt_evidence_value(v)}
+                    for k, v in evidence.items() if k != "span_ticks"]
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.markdown("**🤖 Case note** · _AI-generated explanation of the mechanism — simulation only_")
             key = f"narr_{selected_round}_{market}_{idx}"
             if st.button("Generate case note", key=f"btn_{key}"):
                 with st.spinner("Writing and fact-checking the case note…"):
-                    st.session_state[key] = _narrative(case, run_dir)
+                    st.session_state[key] = _narrative(case, run_dir, evidence)
             res = st.session_state.get(key)
             if res:
                 if res.get("error"):

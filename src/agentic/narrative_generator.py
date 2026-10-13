@@ -14,13 +14,20 @@ from src.agentic.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
-NARRATIVE_SYSTEM_PROMPT = """You write short compliance-analyst case notes from  
-structured detector output. You are given: the persona classifier(s) that  
-fired, the numeric SHAP feature attributions, and summary statistics for the  
-flagged window. Write 2-4 sentences explaining WHY this window was flagged,  
-referencing the specific feature values you were given. Do not invent any  
-number, trader ID, or fact not present in the input. If the input is  
-insufficient to explain the flag, say so explicitly rather than guessing."""
+NARRATIVE_SYSTEM_PROMPT = """You write case notes for a compliance analyst reviewing a SIMULATED market (synthetic traders, not real people).
+
+Input JSON:
+- "flag": the flagged account, suspected manipulation type, tick span and detector score.
+- "mechanism": how this type of manipulation works.
+- "evidence": facts measured from the account's own orders and trades in the flagged span.
+- "detector_shap": which detector features pushed the score up (positive) or down (negative).
+
+Write 4-6 sentences of plain prose:
+1. What the account actually did, step by step, in market terms (orders placed, cancelled, filled; who it traded with; how its position and the price moved), using the evidence.
+2. Why that sequence matches (or does not match) the mechanism, and who in the market it would mislead.
+3. One closing sentence naming the two or three detector features that captured it.
+
+Rules: copy every number exactly as it appears in the input (no rounding, no unit conversions, no arithmetic, no new numbers). Refer to accounts by their ids. If the evidence does not support the mechanism, say so plainly instead of forcing the story. Do not describe SHAP mechanics; just name the features."""
 
 class NarrativeGenerator:
     def __init__(self, config: dict[str, Any], run_dir=None):
@@ -58,13 +65,15 @@ class NarrativeGenerator:
         
         # Allow small edge cases like "2" or "4" from "2-4 sentences" prompt leaking,
         # but strictly speaking, we want to flag any unexplained data.
+        self.last_unsupported = sorted(unsupported)
         if unsupported:
             logger.warning(f"[NarrativeGenerator] Grounding check failed! Unsupported numbers found: {unsupported}")
             return False
             
         return True
 
-    def generate(self, flag_row: dict, shap_summary: dict) -> dict:
+    def generate(self, flag_row: dict, shap_summary: dict, evidence: dict | None = None,
+                 mechanism: str | None = None) -> dict:
         """
         Generates a narrative. If grounding fails, it regenerates once with temp=0.0.
         Returns a dict matching the case_narratives.jsonl schema:
@@ -76,7 +85,12 @@ class NarrativeGenerator:
            "latency_ms": float
         }
         """
-        input_data = {"flag": flag_row, "shap": shap_summary}
+        input_data = {"flag": flag_row}
+        if mechanism:
+            input_data["mechanism"] = mechanism
+        if evidence:
+            input_data["evidence"] = evidence
+        input_data["detector_shap"] = shap_summary
         messages = [{"role": "user", "content": json.dumps(input_data, separators=(",", ":"))}]
         
         attempts = 2
@@ -106,7 +120,11 @@ class NarrativeGenerator:
                     logger.info(f"Attempt {attempt+1} failed grounding validation. Retrying...")
                     # Append a strict correction for the retry
                     messages.append({"role": "assistant", "content": narrative})
-                    messages.append({"role": "user", "content": "Your previous response contained numbers not present in the input. Rewrite it strictly using only the provided numbers. Do not round them."})
+                    bad = ", ".join(getattr(self, "last_unsupported", [])) or "some numbers"
+                    messages.append({"role": "user", "content": (
+                        f"These numbers in your note are not in the input: {bad}. Rewrite the note using only "
+                        "numbers that appear verbatim in the input JSON (copy them exactly; no rounding, sums or "
+                        "percent conversions). Remove any number you cannot copy.")})
                     
             except Exception as e:
                 logger.error(f"Narrative generation failed: {str(e)}")

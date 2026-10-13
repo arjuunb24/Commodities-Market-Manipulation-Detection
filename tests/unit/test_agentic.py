@@ -142,6 +142,7 @@ def test_query_flags_reads_flags_parquet(registry, tmp_path):
         "commodity": "gold", "window_start": 0, "trader_id": "spoofer_0", "window_end": 179,
         "final_flag": True, "final_score": 0.93, "iso_score": 0.5, "predicted_persona": "spoofing",
         "triggered_by": ["spoofing_classifier"], "top_shap_features": {"spoof_signature": 1.2},
+        "persona_scores": {"spoofing": 0.93, "wash_trading": 0.01, "pump_and_dump": 0.02},
     }])
     flags.to_parquet(registry.run_dir / "round_0" / "flags.parquet")
     out = registry.query_flags(round_num=0, persona="spoofing")

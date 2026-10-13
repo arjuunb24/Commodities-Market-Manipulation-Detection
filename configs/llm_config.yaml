@@ -34,7 +34,7 @@ cerebras_budget:
 
 # --- 4A: Narrative generator (one call per button click; 1 retry on grounding failure)
 narrative_generator:
-  max_tokens: {gemini: 2048, cerebras: 450}
+  max_tokens: {gemini: 2048, cerebras: 700}   # 4-6 sentence mechanism note
   max_retries: 1
   timeout_seconds: 45
 

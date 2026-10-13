@@ -43,6 +43,9 @@ def read_flags(path: Path) -> pd.DataFrame:
     """Read a flags.parquet with top_shap_features / triggered_by restored to plain Python objects."""
     df = pd.read_parquet(path)
     df["top_shap_features"] = df["top_shap_features"].apply(clean_shap_dict)
+    # persona_scores exists from flags schema v2.1 on; older files get an empty dict.
+    df["persona_scores"] = (df["persona_scores"].apply(clean_shap_dict) if "persona_scores" in df.columns
+                            else [{} for _ in range(len(df))])
     df["triggered_by"] = df["triggered_by"].apply(lambda x: list(x) if x is not None else [])
     return df
 
@@ -235,6 +238,11 @@ class DetectorPipeline:
         out["predicted_persona"] = results["predicted_persona"].to_numpy()
         out["triggered_by"] = list(results["triggered_by"])
         out["top_shap_features"] = list(top)
+        trained = [p for p in self.personas if p in self.supervised_detector.models]
+        probs = results[[f"prob_{p}" for p in trained]].to_numpy() if trained else None
+        out["persona_scores"] = [
+            {p: round(float(v), 4) for p, v in zip(trained, row)} for row in probs
+        ] if probs is not None else [{} for _ in range(len(out))]
         return out
 
     def write_flags(self, flags: pd.DataFrame, path: Path) -> Path:

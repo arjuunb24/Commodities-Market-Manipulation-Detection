@@ -248,6 +248,28 @@ def load_flags(run_dir_str: str, round_num: int) -> pd.DataFrame:
     return read_flags(path)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_decision_thresholds(run_dir_str: str, round_num: int) -> dict:
+    """
+    Decision thresholds used by that round's detector:
+      {persona: tuned probability threshold, "anomaly": IsolationForest percentile threshold}.
+    """
+    rd = Path(run_dir_str) / f"round_{round_num}"
+    out: dict = {}
+    for name in ("thresholds.json", "metrics.json"):
+        path = rd / name
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            out = data.get("thresholds", data) if name == "metrics.json" else data
+            if out:
+                break
+    cfg = Path(__file__).resolve().parent.parent / "configs" / "detector_config.yaml"
+    if cfg.exists():
+        contamination = (yaml.safe_load(cfg.read_text()) or {}).get("isolation_forest", {}).get("contamination", 0.01)
+        out = {**out, "anomaly": round(1.0 - float(contamination), 4)}
+    return {k: float(v) for k, v in out.items() if isinstance(v, (int, float))}
+
+
 # ── Feature matrix ──────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300, show_spinner=False)
