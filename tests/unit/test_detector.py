@@ -173,5 +173,29 @@ def test_event_detection_latency_nan_for_misses():
     y = pd.DataFrame({"spoofing": [0, 1]}, index=idx)
     m = compute_round_metrics(res, y, ["spoofing"], events=events)["spoofing"]
     assert m["events_detected"] == 1 and m["detection_latency_ticks"] == 49.0
+    # only the second row is labelled for the episode, and it was flagged → coverage 1.0
+    assert m["episode_coverage"] == pytest.approx(1.0)
     m_none = compute_round_metrics(res.assign(flag_spoofing=False), y, ["spoofing"], events=events)["spoofing"]
     assert np.isnan(m_none["detection_latency_ticks"])
+
+
+def test_layering_and_repricing_features():
+    orders = [
+        # layering: 3 buy orders at distinct prices in the same tick, cancelled later
+        _order("l1", "layer", "buy", 99.0, 40, 5), _order("l2", "layer", "buy", 98.9, 40, 5),
+        _order("l3", "layer", "buy", 98.8, 40, 5),
+        _order("l1", "layer", "buy", 99.0, 40, 9, "cancelled"),
+        # repricing: cancel and same-side re-place in the same tick
+        _order("r1", "repr", "sell", 101.0, 60, 4), _order("r1", "repr", "sell", 101.0, 60, 7, "cancelled"),
+        _order("r2", "repr", "sell", 101.1, 60, 7),
+        _order("n1", "noise", "buy", 100.0, 10, 3), _order("n2", "noise", "sell", 100.0, 10, 45),
+    ]
+    trades = [_trade("t1", 6, 100.0, 5, "noise", "repr", "buy")]
+    o = pd.DataFrame(orders); o["quantity"] = o["quantity"].astype("Int64")
+    feats = FeatureEngine(CFG).generate_features(pd.DataFrame(trades), o)
+    lay = feats.xs("layer", level="trader_id").iloc[0]
+    rep = feats.xs("repr", level="trader_id").iloc[0]
+    assert lay["layered_order_share"] == pytest.approx(1.0)
+    assert rep["layered_order_share"] == 0.0
+    assert rep["cancel_replace_ratio"] == pytest.approx(1.0)
+    assert lay["cancel_replace_ratio"] == 0.0

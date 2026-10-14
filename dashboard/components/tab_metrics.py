@@ -502,8 +502,8 @@ def render_metrics_tab(run_dir: Path | None) -> None:
     st.caption(
         "Before each round the strategist (LLM, or the hand-written library as fallback) changes each persona's "
         "parameters. The outcome row shows how that mutation did in the same round: recall of the frozen detector "
-        "(lower = better evasion), recall after retraining, the manipulation's effect vs. round 0, and the score "
-        "(evasion × retained effect; 0 if the effect fell below half)."
+        "(lower = better evasion), episodes caught and detection delay, recall after retraining, the manipulation's "
+        "effect vs. round 0, and the score (evasion × retained effect, capped at 1×; 0 if the effect fell below half)."
     )
     history = load_strategist_history(str(run_dir))
     if not history:
@@ -558,10 +558,24 @@ def _render_strategist_card(persona: str, d: dict) -> None:
     st.caption(SOURCE_BADGES.get(d.get("source"), d.get("source") or "unknown"))
 
     m1, m2 = st.columns(2)
-    m1.metric("Frozen recall", _fmt_num(d.get("frozen_recall"), pct=True),
-              help="Recall of the detector trained before it saw this mutation. Lower = the mutation evaded.")
+    cov = d.get("frozen_coverage")
+    m1.metric("Frozen coverage" if cov is not None else "Frozen recall",
+              _fmt_num(cov if cov is not None else d.get("frozen_recall"), pct=True),
+              help="Share of each episode's account-windows that raised ANY alert from the detector trained BEFORE it "
+                   "saw this mutation (lower = better evasion). Being flagged under another persona's label still "
+                   "counts as caught. Older runs show the persona's own classifier or row recall.")
     m2.metric("Score", _fmt_num(d.get("score")),
-              help="(1 − frozen recall) × min(1, effect ratio); 0 when the effect fell below half of round 0.")
+              help="(0.5×(1−coverage) + 0.3×episodes missed + 0.2×delay) × min(1, effect ratio); "
+                   "0 when the effect fell below half of round 0.")
+    own = d.get("own_label_coverage")
+    if cov is not None and own is not None and abs(own - cov) >= 0.05:
+        st.caption(f"Own-label coverage: {_fmt_num(own, pct=True)} (the rest was flagged under another persona's label)")
+    if d.get("effect_recovery_from_round") is not None:
+        st.caption(f"⚠ Effect had fallen below half of round 0 — parameters were reset to round "
+                   f"{d['effect_recovery_from_round']} before this mutation.")
+    if d.get("episodes_caught"):
+        st.caption(f"Episodes caught by frozen detector: {d['episodes_caught']} · "
+                   f"mean detection delay: {_fmt_num(d.get('frozen_delay'))} ticks")
     m3, m4 = st.columns(2)
     m3.metric("Retrained recall", _fmt_num(d.get("retrained_recall"), pct=True),
               help="Recall after retraining on this round's data (recovery).")

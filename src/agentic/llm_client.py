@@ -464,7 +464,7 @@ class LLMClient:
                     raise LLMUnavailableError(f"Cerebras rejected the request: {str(exc)[:200]}") from exc
                 if kind == "bad_request" or attempt == attempts:
                     raise LLMUnavailableError(f"Cerebras call failed: {str(exc)[:200]}") from exc
-                time.sleep(_retry_after(exc, 8.0 * attempt) if kind == "rate" else 2.0 * attempt)
+                time.sleep(_retry_after(exc, 20.0 * attempt) if kind == "rate" else 2.0 * attempt)
                 continue
             usage = response.get("usage") or {}
             cost = ledger.record(int(usage.get("prompt_tokens") or est_in),

@@ -41,6 +41,12 @@ MECHANISMS = {
         "of aggressive buy orders to push the price up and trigger trend-following traders. While those followers keep "
         "buying, the coalition sells its inventory into the demand it created, and the price falls back."
     ),
+    "layering": (
+        "Layering: the trader rests a small genuine order on one side, then stacks several moderate orders on "
+        "consecutive price levels of the OTHER side. The stack makes that side of the book look deep, nudging prices "
+        "toward the genuine order, which then fills; the whole stack is cancelled together within seconds. No single "
+        "order is extreme — the deception is the depth profile."
+    ),
     "anomaly": (
         "No specific manipulation type was identified: the unsupervised detector found this account's behaviour "
         "unusual compared with all other accounts. It may be legitimate but atypical activity."
@@ -97,7 +103,25 @@ def _spoofing(trader, start, end, trades, orders, px) -> dict:
     placed_vol = float(placed["quantity"].sum())
     cancel_vol = float(acct[(acct["event_type"] == "cancelled") & acct["tick"].between(start, end)]["quantity"].sum())
     small = placed[~placed["order_id"].isin(large["order_id"])]
+
+    # Sarao-style repricing: a large order cancelled and a same-side order placed in the same tick.
+    acct_span = acct[acct["tick"].between(start, end)]
+    placed_keys = set(zip(acct_span[acct_span["event_type"] == "placed"]["tick"], acct_span[acct_span["event_type"] == "placed"]["side"]))
+    large_cancels = cancelled.assign(ctick=cancelled["cancel_tick"].astype(int))
+    replaced = int(sum((t, sd) in placed_keys for t, sd in zip(large_cancels["ctick"], large_cancels["side"])))
+    # Oystacher-style flips: aggressive trades in the opposite direction within 2 ticks after a large cancel.
+    flips, flip_vol = 0, 0
+    if not legs.empty:
+        for _, o in large_cancels.iterrows():
+            f = legs[(legs["tick"] >= o["ctick"]) & (legs["tick"] <= o["ctick"] + 2)
+                     & (legs["side"] != o["side"]) & legs["aggressive"]]
+            if not f.empty:
+                flips += 1
+                flip_vol += int(f["quantity"].sum())
     return {
+        "large_orders_cancelled_and_replaced_same_tick": replaced,
+        "aggressive_opposite_trades_right_after_cancel": flips,
+        "aggressive_volume_right_after_cancel": flip_vol,
         "orders_placed": int(len(placed)),
         "large_orders_placed": int(len(large)),
         "large_orders_cancelled": int(len(cancelled)),
@@ -112,6 +136,46 @@ def _spoofing(trader, start, end, trades, orders, px) -> dict:
         "opposite_side_volume_filled": int(opp_vol),
         "avg_price_move_toward_filled_side_bp": round(float(np.mean(moves)), 2) if moves else 0.0,
         "account_cancelled_volume_pct": round(100 * cancel_vol / placed_vol, 1) if placed_vol else 0.0,
+    }
+
+
+def _layering(trader, start, end, trades, orders, px) -> dict:
+    span_orders = orders[orders["tick"].between(start, end)]
+    placed_all = span_orders[span_orders["event_type"] == "placed"]
+    median_size = float(placed_all["quantity"].median()) if not placed_all.empty else 1.0
+    acct = orders[orders["trader_id"] == trader]
+    placed = acct[(acct["event_type"] == "placed") & acct["tick"].between(start, end)]
+    batches = placed.groupby(["tick", "side"]).filter(lambda g: g["price"].nunique() >= 3)
+    if batches.empty:
+        return {"orders_placed": int(len(placed)), "multi_level_batches": 0}
+    layer_ids = set(batches["order_id"])
+    cancels = acct[(acct["event_type"] == "cancelled") & acct["order_id"].isin(layer_ids)]
+    life = cancels.groupby("order_id")["tick"].min()
+    b = batches.assign(cancel_tick=batches["order_id"].map(life))
+    gaps = (b.sort_values("price").groupby(["tick", "side"])["price"].diff().abs().dropna())
+    legs = _account_legs(trades[trades["tick"].between(start, end + 2)], trader)
+    with_opp, moves = 0, []
+    for (t0, side), g in b.groupby(["tick", "side"]):
+        t1 = int(g["cancel_tick"].max()) if g["cancel_tick"].notna().any() else int(t0) + 5
+        if not legs.empty and not legs[(legs["tick"] >= t0) & (legs["tick"] <= t1 + 2) & (legs["side"] != side)].empty:
+            with_opp += 1
+        p0, p1 = px.get(int(t0) - 1, np.nan), px.get(t1, np.nan)
+        if p0 == p0 and p1 == p1:
+            moves.append((1.0 if side == "buy" else -1.0) * (p1 - p0) / p0 * 1e4)
+    first = b.sort_values(["tick", "price"]).groupby(["tick", "side"])["quantity"]
+    return {
+        "orders_placed": int(len(placed)),
+        "multi_level_batches": int(b.groupby(["tick", "side"]).ngroups),
+        "median_levels_per_batch": int(b.groupby(["tick", "side"]).size().median()),
+        "median_layer_size": int(b["quantity"].median()),
+        "market_median_order_size": int(round(median_size)),
+        "layer_size_vs_market_median_x": round(float(b["quantity"].median()) / median_size, 1) if median_size else 0.0,
+        "median_price_gap_between_layers": round(float(gaps.median()), 4) if len(gaps) else 0.0,
+        "layer_orders_cancelled_pct": round(100 * b["cancel_tick"].notna().mean(), 1),
+        "median_layer_lifetime_ticks": int((b["cancel_tick"] - b["tick"]).median()) if b["cancel_tick"].notna().any() else None,
+        "batch_sides": {k: int(v) for k, v in b.drop_duplicates(["tick", "side"])["side"].value_counts().items()},
+        "batches_with_opposite_side_fill_while_resting": int(with_opp),
+        "avg_price_move_toward_filled_side_bp": round(float(np.mean(moves)), 2) if moves else 0.0,
     }
 
 
@@ -238,6 +302,8 @@ def build_case_evidence(
             facts = _spoofing(trader_id, start, end, t, o, px)
         elif persona == "wash_trading":
             facts = _wash(trader_id, start, end, t)
+        elif persona == "layering":
+            facts = _layering(trader_id, start, end, t, o, px)
         elif persona == "pump_and_dump":
             fl = flags[flags["commodity"] == commodity] if flags is not None and "commodity" in flags else flags
             facts = _pump(trader_id, start, end, t, px, fl)

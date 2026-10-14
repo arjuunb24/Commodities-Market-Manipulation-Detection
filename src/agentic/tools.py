@@ -21,12 +21,15 @@ ranges) before anything is written to configs/persona_config.yaml (FR-4.2).
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 from src.detector.pipeline import read_flags
+
+logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 TACTIC_CARDS_PATH = REPO_ROOT / "docs" / "tactic_cards.yaml"
@@ -48,6 +51,9 @@ PARAM_BOUNDS: dict[str, dict[str, tuple[type, float, float, str]]] = {
         "n_accounts": (int, 1, 3, ">=2: genuine and spoof legs from different accounts"),
         "frequency": (float, 0.05, 1.0, "chance per tick to start a new spoof cycle"),
         "price_aggressiveness": (float, 0.0001, 0.01, "distance behind best price; >0.002 loses impact"),
+        "reprice_to_touch": (int, 0, 1, "1 = keep the resting spoof pinned behind the moving best price (Sarao)"),
+        "flip_after_cancel": (float, 0.0, 1.0, "chance of trading aggressively in the genuine direction when the spoof is pulled (Oystacher)"),
+        "busy_period_bias": (float, 0.0, 1.0, "skip quiet periods; act mainly when the market is busy (advisory #5)"),
     },
     "wash_trading": {
         "trade_frequency": (float, 0.05, 1.0, "total cross rate per tick (split across groups)"),
@@ -55,6 +61,7 @@ PARAM_BOUNDS: dict[str, dict[str, tuple[type, float, float, str]]] = {
         "ring_size": (int, 2, 6, "accounts per group; crosses rotate A->B->C->A"),
         "size_jitter": (float, 0.0, 0.9, "0 = fixed scripted lot; higher = varied sizes"),
         "camouflage_rate": (float, 0.0, 0.5, "share of cycles replaced by a genuine market trade"),
+        "busy_period_bias": (float, 0.0, 1.0, "skip quiet periods; act mainly when the market is busy (advisory #5)"),
     },
     "pump_and_dump": {
         "n_coordinated_accounts": (int, 2, 15, "colluding accounts"),
@@ -64,6 +71,17 @@ PARAM_BOUNDS: dict[str, dict[str, tuple[type, float, float, str]]] = {
         "stagger": (float, 0.0, 1.0, "per-account random start delay, x burst duration"),
         "ignition_aggression": (float, 0.0002, 0.005, "how far through the ask ignition buys go"),
         "decoy_rate": (float, 0.0, 0.4, "chance per tick of a small opposite-side trade"),
+        "busy_period_bias": (float, 0.0, 1.0, "skip quiet periods; act mainly when the market is busy (advisory #5)"),
+    },
+    "layering": {
+        "n_layers": (int, 2, 8, "orders stacked on consecutive levels per cycle (Tower: 3-8)"),
+        "layer_spacing": (float, 0.00005, 0.003, "gap between layers as a fraction of price (min one tick)"),
+        "layer_size_multiplier": (float, 0.5, 6.0, "layer size vs. average visible level depth"),
+        "size_taper": (float, 0.0, 0.9, "0 = equal layers; higher = smaller layers deeper in the book"),
+        "cancellation_delay_ticks": (int, 1, 30, "mean ticks the layers rest before being cancelled"),
+        "cancel_jitter": (float, 0.0, 0.8, "cancel delay drawn from delay x U(1-j, 1+j)"),
+        "frequency": (float, 0.05, 1.0, "chance per tick to start a new layering cycle"),
+        "busy_period_bias": (float, 0.0, 1.0, "skip quiet periods; act mainly when the market is busy (advisory #5)"),
     },
 }
 MUTABLE_PERSONAS = tuple(PARAM_BOUNDS)
@@ -302,18 +320,100 @@ class ToolRegistry:
             post = (m.get("personas") or {}).get(persona, {})
             eff = (m.get("effectiveness") or {}).get(persona, {})
             key = eff.get("primary_metric")
+            from src.adversarial.effectiveness import evasion_components
             rows.append({
                 "round": r,
                 "source": (m.get("mutation_source") or {}).get(persona),
                 "params": (m.get("params_used") or {}).get(persona, {}),
                 "frozen_recall": pre.get("recall"),
                 "frozen_f1": pre.get("f1"),
+                "frozen_coverage": pre.get("caught_coverage", pre.get("episode_coverage")),
+                "own_label_coverage": pre.get("episode_coverage"),
+                "episodes": (f"{pre.get('caught_events_detected', pre.get('events_detected'))}/{pre.get('events_total')}"
+                             if pre else None),
+                "frozen_delay_ticks": pre.get("caught_latency_ticks", pre.get("detection_latency_ticks")),
+                "evasion_parts": evasion_components(pre) if pre else None,
                 "retrained_recall": post.get("recall"),
                 "effect": {key: eff.get(key)} if key else {},
                 "effect_ratio": (m.get("effectiveness_ratio") or {}).get(persona),
                 "score": (m.get("mutation_score") or {}).get(persona),
             })
         return rows
+
+    def effect_status(self, persona: str) -> dict:
+        """
+        Is the persona's last evaluated parameter set still manipulating?
+          status  "failed"  effect ratio < EFFECTIVENESS_FLOOR (score is 0)
+                  "at_risk" effect ratio < EFFECT_AT_RISK
+                  "ok"      otherwise (or no ratio yet)
+          anchor  failed: the best effective past round (highest score among rounds
+                  whose effect ratio cleared the floor; round 0 counts as
+                  effective, ties go to the most recent) — the reset target.
+                  at_risk: the latest earlier round with effect >= EFFECT_AT_RISK.
+                  Returned with its params and the knob changes from it to the
+                  last parameters.
+        """
+        from src.adversarial.effectiveness import EFFECT_AT_RISK, EFFECTIVENESS_FLOOR
+        rows = [r for r in self.get_track_record(persona, max_rounds=50) if r["params"]]
+        if not rows:
+            return {"status": "ok"}
+        last = rows[-1]
+        ratio = last.get("effect_ratio")
+        status = "ok"
+        if ratio is not None and ratio < EFFECTIVENESS_FLOOR:
+            status = "failed"
+        elif ratio is not None and ratio < EFFECT_AT_RISK:
+            status = "at_risk"
+        out = {"status": status, "round": last["round"], "effect_ratio": ratio}
+        if status == "failed":   # reset target: best score among sets that still manipulated
+            effective = [r for r in rows if r["round"] == 0 or (r.get("effect_ratio") or 0) >= EFFECTIVENESS_FLOOR]
+            pick = lambda c: max(c, key=lambda r: ((r.get("score") or 0.0), r["round"]))  # noqa: E731
+        else:                    # at risk: the latest set that was comfortably effective
+            effective = [r for r in rows[:-1] if r["round"] == 0 or (r.get("effect_ratio") or 0) >= EFFECT_AT_RISK]
+            pick = lambda c: max(c, key=lambda r: r["round"])  # noqa: E731
+        if effective and status != "ok":
+            anchor = pick(effective)
+            out.update({
+                "anchor_round": anchor["round"],
+                "anchor_effect_ratio": anchor.get("effect_ratio") if anchor["round"] else 1.0,
+                "anchor_params": anchor["params"],
+                "changes_since_anchor": {k: [anchor["params"].get(k), v] for k, v in last["params"].items()
+                                         if anchor["params"].get(k) != v},
+            })
+        return out
+
+    def recover_effect(self, persona: str) -> dict | None:
+        """
+        Code-enforced recovery: when the last round's effect fell below the floor,
+        reset the persona's parameters to its best effective past set (see
+        effect_status) BEFORE the next mutation is applied on top. Returns the
+        status dict when a reset happened, else None.
+        """
+        st = self.effect_status(persona)
+        if st["status"] != "failed" or "anchor_params" not in st:
+            return None
+        res = self.propose_mutation(persona, st["anchor_params"], reasoning="effect recovery")
+        if "error" in res:
+            logger.warning(f"[Tools] effect recovery for {persona} failed: {res['error']}")
+            return None
+        logger.info(f"[Tools] {persona}: effect {st['effect_ratio']}x < floor in round {st['round']}; "
+                    f"parameters reset to round {st['anchor_round']}")
+        return st
+
+    def knob_usage(self, persona: str) -> dict[str, list[str]]:
+        """Knobs never changed from round 0, and knobs currently at a bound (exploration hints)."""
+        history = [row["params"] for row in self.get_track_record(persona, max_rounds=50) if row["params"]]
+        bounds = PARAM_BOUNDS.get(persona, {})
+        if not history:
+            return {"never_changed": list(bounds), "at_bound": []}
+        first, last = history[0], history[-1]
+        never = [k for k in bounds if all(h.get(k) == first.get(k) for h in history)]
+        at_bound = []
+        for k, (_typ, lo, hi, _d) in bounds.items():
+            v = last.get(k)
+            if isinstance(v, (int, float)) and (v <= lo or v >= hi):
+                at_bound.append(f"{k}={v} ({'min' if v <= lo else 'max'})")
+        return {"never_changed": never, "at_bound": at_bound}
 
     def get_tactic_cards(self, persona: str) -> list[str]:
         """Compact one-line tactic cards (docs/tactic_cards.yaml)."""

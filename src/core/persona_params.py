@@ -24,6 +24,9 @@ PERSONA_PARAM_MAP: dict[str, dict[str, tuple[str, type]]] = {
         "cancel_jitter": ("spoof_cancel_jitter", float),
         "n_split_orders": ("spoof_n_split", int),
         "n_accounts": ("spoof_n_accounts", int),
+        "reprice_to_touch": ("spoof_reprice", int),
+        "flip_after_cancel": ("spoof_flip", float),
+        "busy_period_bias": ("spoof_busy_bias", float),
     },
     "wash_trading": {
         "trade_frequency": ("wash_frequency", float),
@@ -33,6 +36,7 @@ PERSONA_PARAM_MAP: dict[str, dict[str, tuple[str, type]]] = {
         "ring_size": ("wash_ring_size", int),
         "size_jitter": ("wash_size_jitter", float),
         "camouflage_rate": ("wash_camouflage_rate", float),
+        "busy_period_bias": ("wash_busy_bias", float),
     },
     "pump_and_dump": {
         "burst_duration_ticks": ("pnd_burst_duration", int),
@@ -42,11 +46,17 @@ PERSONA_PARAM_MAP: dict[str, dict[str, tuple[str, type]]] = {
         "stagger": ("pnd_stagger", float),
         "ignition_aggression": ("pnd_ignition_aggression", float),
         "decoy_rate": ("pnd_decoy_rate", float),
+        "busy_period_bias": ("pnd_busy_bias", float),
     },
     "layering": {
         "n_layers": ("layer_n_layers", int),
         "layer_spacing": ("layer_spacing", float),
+        "layer_size_multiplier": ("layer_size_multiplier", float),
+        "size_taper": ("layer_size_taper", float),
         "cancellation_delay_ticks": ("layer_cancel_delay", int),
+        "cancel_jitter": ("layer_cancel_jitter", float),
+        "frequency": ("layer_frequency", float),
+        "busy_period_bias": ("layer_busy_bias", float),
     },
 }
 ENABLE_FLAGS = {
@@ -72,8 +82,9 @@ def resolve_persona_config(p_cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def apply_persona_config(config: Any, active: dict[str, dict[str, Any]]) -> Any:
     """Write resolved persona parameters (and enabled flags) onto a SimConfig."""
     for persona, params in active.items():
-        if params.get("enabled") is False and persona in ENABLE_FLAGS:
-            setattr(config, ENABLE_FLAGS[persona], False)
+        # `enabled` is honoured in both directions (layering is off by default in SimConfig).
+        if "enabled" in params and persona in ENABLE_FLAGS:
+            setattr(config, ENABLE_FLAGS[persona], bool(params["enabled"]))
         for name, (attr, cast) in PERSONA_PARAM_MAP.get(persona, {}).items():
             if name in params and params[name] is not None:
                 setattr(config, attr, cast(params[name]))

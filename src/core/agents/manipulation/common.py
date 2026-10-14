@@ -56,6 +56,24 @@ class ManipulatorAccount(Agent):
         return self.limit(side, price, qty, tick)
 
 
+BAND = 0.002   # same ±0.2% near-touch band the book uses for its imbalance signal
+
+
+def fake_depth_share(state: BookState, side: Side, legs: list[tuple[float, int]]) -> float:
+    """
+    Share of the visible near-touch depth on `side` that the given (price, qty) legs
+    make up at placement time: q_in_band / (existing band volume + q_in_band).
+    This is the lever spoofing/layering pull — fake displayed depth — measured
+    directly (realised price impact per cycle is too noisy to judge a mutation).
+    """
+    mid = state.mid_price
+    if not mid:
+        return 0.0
+    q = sum(qty for price, qty in legs if abs(price - mid) / mid <= BAND)
+    existing = state.bid_band_volume if side == Side.BUY else state.ask_band_volume
+    return q / (existing + q) if (existing + q) > 0 else 0.0
+
+
 class ManipulationController(ABC):
     """
     Coordinates one or more ManipulatorAccounts for a single episode.
@@ -67,17 +85,26 @@ class ManipulationController(ABC):
 
     PERSONA: str = ""
 
-    def __init__(self, accounts: list[ManipulatorAccount], start_tick: int, end_tick: int) -> None:
+    def __init__(self, accounts: list[ManipulatorAccount], start_tick: int, end_tick: int,
+                 busy_period_bias: float = 0.0) -> None:
         self.accounts = accounts
         self.agents: list[Agent] = list(accounts)
         self.start_tick = start_tick
         self.end_tick = end_tick
+        # CFTC 2020 staff advisory #5: act mainly when the market is busy, so the
+        # manipulation hides among elevated, naturally explainable activity.
+        # 0 = ignore market activity; 1 = never act in quiet periods.
+        self.busy_period_bias = float(busy_period_bias)
 
     def in_window(self, tick: int) -> bool:
         return self.start_tick <= tick <= self.end_tick
 
     def decide_batch(self, state: BookState, tick: int) -> list[Order]:
         if self.in_window(tick):
+            if self.busy_period_bias > 0 and state.baseline_volume > 0 and not state.is_busy():
+                rng = getattr(self, "rng", None) or self.accounts[0].rng
+                if rng.random() < self.busy_period_bias:
+                    return []   # quiet market: wait for cover
             return self.manipulate(state, tick)
         orders = []
         for acct in self.accounts:

@@ -65,8 +65,9 @@ class WashTradingRing(ManipulationController):
         size_jitter: float = 0.0,
         camouflage_rate: float = 0.0,
         n_groups: int = 1,
+        busy_period_bias: float = 0.0,
     ) -> None:
-        super().__init__(accounts, start_tick, end_tick)
+        super().__init__(accounts, start_tick, end_tick, busy_period_bias=busy_period_bias)
         self.rng = rng
         self.trade_frequency = trade_frequency
         self.price_deviation_from_mid = price_deviation_from_mid
@@ -90,6 +91,7 @@ class WashTradingRing(ManipulationController):
         size_jitter: float = 0.0,
         camouflage_rate: float = 0.0,
         n_groups: int = 1,
+        busy_period_bias: float = 0.0,
     ) -> "WashTradingRing":
         ring_size = max(2, int(ring_size))
         ctrl_rng, *acct_rngs = rng.spawn(ring_size + 1)
@@ -103,6 +105,7 @@ class WashTradingRing(ManipulationController):
             price_deviation_from_mid=price_deviation_from_mid,
             start_tick=start_tick, end_tick=end_tick,
             size_jitter=size_jitter, camouflage_rate=camouflage_rate, n_groups=n_groups,
+            busy_period_bias=busy_period_bias,
         )
 
     @property
@@ -121,6 +124,7 @@ class WashTradingRing(ManipulationController):
             "ring_size": len(self.accounts),
             "size_jitter": self.size_jitter,
             "camouflage_rate": self.camouflage_rate,
+            "busy_period_bias": self.busy_period_bias,
         }
 
     def _lot(self) -> int:

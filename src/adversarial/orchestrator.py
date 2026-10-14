@@ -180,8 +180,7 @@ class RoundOrchestrator:
         ratios, scores = {}, {}
         for p in self.personas:
             ratios[p] = effectiveness_ratio(eff.get(p), baseline.get(p), p) if p in eff else None
-            pre_recall = (pre_metrics or {}).get(p, {}).get("recall")
-            scores[p] = mutation_score(pre_recall, ratios[p])
+            scores[p] = mutation_score((pre_metrics or {}).get(p), ratios[p])
 
         save_round_metrics(
             post_metrics, round_num, round_dir,

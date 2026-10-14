@@ -74,8 +74,9 @@ class PumpDumpCoalition(ManipulationController):
         stagger: float = 0.0,
         ignition_aggression: float = 0.002,
         decoy_rate: float = 0.0,
+        busy_period_bias: float = 0.0,
     ) -> None:
-        super().__init__(accounts, start_tick, end_tick)
+        super().__init__(accounts, start_tick, end_tick, busy_period_bias=busy_period_bias)
         self.rng = rng
         self.burst_duration_ticks = max(10, int(burst_duration_ticks))
         self.dump_delay_ticks = max(1, int(dump_delay_ticks))
@@ -103,6 +104,7 @@ class PumpDumpCoalition(ManipulationController):
         stagger: float = 0.0,
         ignition_aggression: float = 0.002,
         decoy_rate: float = 0.0,
+        busy_period_bias: float = 0.0,
     ) -> "PumpDumpCoalition":
         n = max(1, int(n_coordinated_accounts))
         ctrl_rng, *acct_rngs = rng.spawn(n + 1)
@@ -120,6 +122,7 @@ class PumpDumpCoalition(ManipulationController):
             stagger=stagger,
             ignition_aggression=ignition_aggression,
             decoy_rate=decoy_rate,
+            busy_period_bias=busy_period_bias,
         )
 
     def parameters_snapshot(self) -> dict:
@@ -131,6 +134,7 @@ class PumpDumpCoalition(ManipulationController):
             "stagger": self.stagger,
             "ignition_aggression": self.ignition_aggression,
             "decoy_rate": self.decoy_rate,
+            "busy_period_bias": self.busy_period_bias,
         }
 
     def ground_truth_end(self) -> int:

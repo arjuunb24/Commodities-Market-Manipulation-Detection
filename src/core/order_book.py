@@ -201,6 +201,12 @@ class BookState:
     tick: int                        # current simulation tick
     bid_band_volume: int = 0
     ask_band_volume: int = 0
+    recent_volume: int = 0          # volume traded over the last minute (set by the simulation)
+    baseline_volume: float = 0.0    # slow moving average of recent_volume ("normal" activity)
+
+    def is_busy(self) -> bool:
+        """True when the market is currently more active than usual."""
+        return self.baseline_volume > 0 and self.recent_volume >= self.baseline_volume
 
     def imbalance(self) -> float:
         """Visible order-book imbalance in [-1, 1]; positive = bid-heavy."""

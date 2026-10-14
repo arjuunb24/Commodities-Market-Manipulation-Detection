@@ -55,7 +55,8 @@ def test_validate_mutation_rules():
     assert "outside" in validate_mutation("spoofing", {"frequency": 3.0})[1]
     assert "not a spoofing parameter" in validate_mutation("spoofing", {"n_layers": 3})[1]
     assert "integer" in validate_mutation("spoofing", {"cancellation_delay_ticks": 2.5})[1]
-    assert "non-mutable" in validate_mutation("layering", {"n_layers": 3})[1]
+    assert "non-mutable" in validate_mutation("cornering", {"n_layers": 3})[1]
+    assert validate_mutation("layering", {"n_layers": 3, "size_taper": 0.5})[1] is None
     assert validate_mutation("wash_trading", {})[1] is not None
 
 

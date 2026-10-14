@@ -135,6 +135,9 @@ class SimConfig:
     spoof_cancel_jitter: float = 0.0
     spoof_n_split: int = 1
     spoof_n_accounts: int = 1
+    spoof_reprice: int = 0
+    spoof_flip: float = 0.0
+    spoof_busy_bias: float = 0.0
 
     # Wash trading parameters
     wash_frequency: float = 0.5
@@ -143,6 +146,7 @@ class SimConfig:
     wash_ring_size: int = 2
     wash_size_jitter: float = 0.0
     wash_camouflage_rate: float = 0.0
+    wash_busy_bias: float = 0.0
 
     # Pump-and-dump parameters
     pnd_burst_duration: int = 200
@@ -152,11 +156,17 @@ class SimConfig:
     pnd_stagger: float = 0.0
     pnd_ignition_aggression: float = 0.002
     pnd_decoy_rate: float = 0.0
+    pnd_busy_bias: float = 0.0
 
-    # Layering parameters (layering persona is not maintained in this revision)
+    # Layering parameters (Tower Research pattern)
     layer_n_layers: int = 4
-    layer_spacing: float = 0.002
-    layer_cancel_delay: int = 3
+    layer_spacing: float = 0.0002
+    layer_size_multiplier: float = 2.0
+    layer_size_taper: float = 0.0
+    layer_cancel_delay: int = 5
+    layer_cancel_jitter: float = 0.0
+    layer_frequency: float = 0.3
+    layer_busy_bias: float = 0.0
 
     # Output
     data_dir: Path = Path("data")
@@ -260,10 +270,14 @@ def _make_persona(
             cancel_jitter=config.spoof_cancel_jitter,
             n_split_orders=int(config.spoof_n_split),
             n_accounts=int(config.spoof_n_accounts),
+            reprice_to_touch=int(config.spoof_reprice),
+            flip_after_cancel=float(config.spoof_flip),
+            busy_period_bias=float(config.spoof_busy_bias),
             start_tick=start, end_tick=end, background_rate=bg,
         )]
     if persona == "wash_trading":
         n_groups = max(1, int(config.wash_n_pairs))
+        busy = float(config.wash_busy_bias)
         # The persona's total cross rate is split across groups: more groups dilute
         # per-account activity instead of multiplying wash volume.
         freq = min(1.0, jit(config.wash_frequency)) / n_groups
@@ -277,6 +291,7 @@ def _make_persona(
                 size_jitter=config.wash_size_jitter,
                 camouflage_rate=config.wash_camouflage_rate,
                 n_groups=n_groups,
+                busy_period_bias=busy,
             )
             for g_idx in range(n_groups)
         ]
@@ -291,14 +306,20 @@ def _make_persona(
             stagger=config.pnd_stagger,
             ignition_aggression=config.pnd_ignition_aggression,
             decoy_rate=config.pnd_decoy_rate,
+            busy_period_bias=config.pnd_busy_bias,
         )]
     if persona == "layering":
         return [LayeringAgent(
             f"layerer_{ep_idx}", next(sub_rngs),
             n_layers=int(config.layer_n_layers),
             layer_spacing=float(config.layer_spacing),
+            layer_size_multiplier=float(config.layer_size_multiplier),
+            size_taper=float(config.layer_size_taper),
             cancellation_delay_ticks=int(config.layer_cancel_delay),
-            start_tick=start, end_tick=end,
+            cancel_jitter=float(config.layer_cancel_jitter),
+            frequency=float(config.layer_frequency),
+            busy_period_bias=float(config.layer_busy_bias),
+            start_tick=start, end_tick=end, background_rate=bg,
         )]
     raise ValueError(f"Unknown persona {persona!r}")
 
@@ -526,7 +547,6 @@ def run_simulation(
     market_makers = [a for a in agents if isinstance(a, MarketMaker)]
     momentum_traders = [a for a in agents if isinstance(a, MomentumTrader)]
     mean_rev_traders = [a for a in agents if isinstance(a, MeanReversionTrader)]
-    layering_agents = [c for c in controllers if isinstance(c, LayeringAgent)]
     persona_controllers = [c for c in controllers if isinstance(c, ManipulationController)]
     expiring = [a for a in agents if not isinstance(a, MarketMaker)]
 
@@ -534,6 +554,18 @@ def run_simulation(
     actors: list[Any] = [a for a in agents if not isinstance(a, MarketMaker)] + persona_controllers
 
     book = OrderBook(initial_price=init_price, id_prefix=id_prefix)
+    # Market-activity signal (advisory #5 "busy period" tactic): volume over the
+    # last minute and a slow moving baseline of it.
+    from collections import deque
+    tick_volumes: deque[int] = deque(maxlen=60)
+    activity = {"recent": 0, "baseline": 0.0}
+
+    def _book_snapshot(book: OrderBook, tick: int) -> BookState:
+        state = _book_snapshot(book, tick)
+        state.recent_volume = activity["recent"]
+        state.baseline_volume = activity["baseline"]
+        return state
+
     all_trades: list[dict] = []
     all_order_events: list[dict] = []
 
@@ -542,6 +574,7 @@ def run_simulation(
         _collect(trades, events, all_trades, all_order_events, agent_map, momentum_traders)
         return True
 
+    n_trades_before = 0
     for tick in range(config.n_ticks):
         fv = fundamental.step()
         for agent in mean_rev_traders:
@@ -553,8 +586,6 @@ def run_simulation(
             cancels.extend(agent.expire_orders(tick, book.is_resting))
         for ctrl in persona_controllers:
             cancels.extend(ctrl.expire_orders(tick, book.is_resting))
-        for layerer in layering_agents:
-            cancels.extend(layerer.get_cancels(tick))
         for c in cancels:
             _, events = book.submit(c, simulation_mode=True)
             all_order_events.extend(e.to_dict() for e in events)
@@ -565,11 +596,6 @@ def run_simulation(
             for cid in cancel_ids:
                 all_order_events.extend(e.to_dict() for e in book.cancel_order(cid, mm.trader_id, tick))
             for order in new_orders:
-                submit(order)
-
-        # --- Layering (legacy persona, disabled by default) ---
-        for layerer in layering_agents:
-            for order in layerer.decide_batch(_snapshot(book, tick), tick):
                 submit(order)
 
         # --- Everyone else, in a seeded random arrival order ---
@@ -585,6 +611,15 @@ def run_simulation(
                 for order in orders:
                     submit(order)
                 state = _snapshot(book, tick)
+
+        # Update the activity signal with this tick's traded volume.
+        traded = sum(t["quantity"] for t in all_trades[n_trades_before:])
+        n_trades_before = len(all_trades)
+        tick_volumes.append(traded)
+        activity["recent"] = sum(tick_volumes)
+        if len(tick_volumes) == tick_volumes.maxlen:
+            b = activity["baseline"]
+            activity["baseline"] = float(activity["recent"]) if b == 0 else 0.995 * b + 0.005 * activity["recent"]
 
         # Trend followers sample the last traded price once per second.
         if state.last_trade_price is not None:

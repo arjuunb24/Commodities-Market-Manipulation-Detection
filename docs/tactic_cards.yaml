@@ -29,6 +29,21 @@ spoofing:
     knobs: {n_accounts: 2-3}
     weakens: [spoof_signature, cancel_exec_opposition]
     cost: needs coordination; each account still cancels heavily
+  - tactic: Reprice to stay behind the touch
+    source: Sarao 2015 — orders auto-modified to stay a few ticks from the best price, avoiding execution
+    knobs: {reprice_to_touch: 1}
+    weakens: [spoof_signature (fewer fills), passive_distance_bp drift]
+    cost: every re-place is a cancel, so orders live ~1 tick — cancel_replace_ratio and fast_cancel_ratio RISE (trades detectability for fewer fills)
+  - tactic: Flip after cancel
+    source: Oystacher 2015 — cancel the spoof, then immediately trade aggressively the other way
+    knobs: {flip_after_cancel: up}
+    weakens: [fill_ratio, cancel_ratio (more real executions)]
+    cost: real aggressive trades (execution cost, visible aggressor flow)
+  - tactic: Trade in busy periods
+    source: "CFTC 2020 staff advisory #5 — manipulate when high activity explains the noise"
+    knobs: {busy_period_bias: up}
+    weakens: [activity_vs_history, peer_z features, mkt-relative signals]
+    cost: fewer cycles (less effect) when the market is quiet
   - tactic: Spoof further from the touch
     source: generic
     knobs: {price_aggressiveness: up}
@@ -36,6 +51,11 @@ spoofing:
     cost: STRONG — depth beyond ~0.2% barely moves prices (effectiveness collapses)
 
 wash_trading:
+  - tactic: Trade in busy periods
+    source: "CFTC 2020 staff advisory #5; Kraft: timing trades to coincide with genuine high volume"
+    knobs: {busy_period_bias: up}
+    weakens: [gross_volume_share, activity_vs_history, mkt_volume_spike]
+    cost: fewer crosses when the market is quiet (less wash volume)
   - tactic: Account rings instead of a fixed pair
     source: Coinbase 2021 — cyclical A->B->C->A washes
     knobs: {ring_size: 3-6}
@@ -63,6 +83,11 @@ wash_trading:
     cost: STRONG — wash volume (the whole point) falls proportionally
 
 pump_and_dump:
+  - tactic: Ignite during busy periods
+    source: "CFTC 2020 staff advisory #5"
+    knobs: {busy_period_bias: up}
+    weakens: [mkt_abnormal_return_z, activity_vs_history]
+    cost: schedule drifts while waiting for activity
   - tactic: Staggered accumulation
     source: Nefedova — accounts buy at different times, "appearing like independent decisions"
     knobs: {stagger: up, burst_duration_ticks: up}
@@ -88,3 +113,30 @@ pump_and_dump:
     knobs: {dump_delay_ticks: up}
     weakens: [reversal_score, vol_price_divergence]
     cost: price may revert before the coalition has sold
+
+layering:
+  - tactic: Taper layer sizes
+    source: "Tower Research 2019 — decreasing volume deeper in the book to appear natural"
+    knobs: {size_taper: up}
+    weakens: [max_order_size_rel, order_size_cv, large_order_share]
+    cost: deeper layers add less fake depth
+  - tactic: Fewer, wider layers
+    source: Tower round 2 — 2-6 layers, varied spacing
+    knobs: {n_layers: down, layer_spacing: up}
+    weakens: [layered_order_share (needs >= 3 levels), n_orders]
+    cost: below 3 levels it is just split spoofing; wide spacing moves depth away from the touch
+  - tactic: Randomised, longer cancel timing
+    source: "advisory #2; Tower round 2 (timing staggered across 5-15 ticks)"
+    knobs: {cancel_jitter: up, cancellation_delay_ticks: up}
+    weakens: [fast_cancel_ratio, mean_cancel_lifetime]
+    cost: layers rest longer and may get filled
+  - tactic: Smaller layers
+    source: advisory #1
+    knobs: {layer_size_multiplier: down}
+    weakens: [avg_order_size_rel, max_order_size_rel]
+    cost: STRONG — thin layers barely change the visible depth (effect falls)
+  - tactic: Trade in busy periods
+    source: "CFTC 2020 staff advisory #5"
+    knobs: {busy_period_bias: up}
+    weakens: [activity_vs_history, peer_z features]
+    cost: fewer cycles when the market is quiet

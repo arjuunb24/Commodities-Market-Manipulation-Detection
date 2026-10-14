@@ -338,6 +338,13 @@ def load_strategist_history(run_dir_str: str) -> list[dict]:
                 "changes": changes,
                 "reasoning": r.get("reasoning") or legacy.get(rnd, {}).get(p, ""),
                 "frozen_recall": pre.get("recall"),
+                # any alert (caught_*) when the run has it; older runs: the persona's own classifier
+                "frozen_coverage": pre.get("caught_coverage", pre.get("episode_coverage")),
+                "own_label_coverage": pre.get("episode_coverage"),
+                "episodes_caught": (f"{pre.get('caught_events_detected', pre.get('events_detected'))}/{pre.get('events_total')}"
+                                    if pre else None),
+                "frozen_delay": pre.get("caught_latency_ticks", pre.get("detection_latency_ticks")),
+                "effect_recovery_from_round": r.get("effect_recovery_from_round"),
                 "retrained_recall": post.get("recall"),
                 "effect_ratio": (m.get("effectiveness_ratio") or {}).get(p),
                 "score": (m.get("mutation_score") or {}).get(p),

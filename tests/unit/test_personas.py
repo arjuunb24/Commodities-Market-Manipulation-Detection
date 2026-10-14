@@ -94,3 +94,51 @@ def test_episode_trader_ids_unique(sim):
 def test_prices_on_tick_grid(sim):
     ticks = (sim.trade_log.price / 0.01).round(6)
     assert np.allclose(ticks, ticks.round())
+
+
+# ---------------------------------------------------------------- new tactics
+def test_spoof_reprice_follows_moving_touch():
+    from src.core.order_book import Side as S
+    agent = SpoofingAgent("sp", np.random.default_rng(0), frequency=1.0, spoof_side="buy", reprice_to_touch=1,
+                          cancellation_delay_ticks=10, start_tick=0, end_tick=100)
+    agent.decide_batch(_state(), 10)
+    moved = agent.decide_batch(_state(bid=100.0, ask=102.0), 11)       # best bid moved up by 1.0
+    cancels = [o for o in moved if o.order_type == "cancel"]
+    new = [o for o in moved if o.order_type == "limit"]
+    assert len(cancels) == 1 and len(new) == 1
+    assert new[0].side == S.BUY and new[0].price > 99.0 - 1e-9 - 0.06 and new[0].order_id.endswith("s")
+    assert agent.decide_batch(_state(bid=100.0, ask=102.0), 12) == []  # no move -> no reprice
+
+
+def test_spoof_flip_after_cancel():
+    from src.core.order_book import Side as S
+    agent = SpoofingAgent("sp", np.random.default_rng(0), frequency=1.0, spoof_side="buy", flip_after_cancel=1.0,
+                          cancellation_delay_ticks=3, start_tick=0, end_tick=100)
+    agent.decide_batch(_state(), 10)
+    after = agent.decide_batch(_state(), 13)                            # spoof pulled at tick 13
+    flips = [o for o in after if o.order_id.endswith("f")]
+    assert len(flips) == 1 and flips[0].side == S.SELL and flips[0].price == 99.0   # sells into the bid
+
+
+def test_busy_period_bias_waits_for_activity():
+    agent = SpoofingAgent("sp", np.random.default_rng(0), frequency=1.0, busy_period_bias=1.0,
+                          start_tick=0, end_tick=100)
+    quiet = _state(); quiet.recent_volume, quiet.baseline_volume = 50, 100.0
+    busy = _state(); busy.recent_volume, busy.baseline_volume = 150, 100.0
+    assert agent.decide_batch(quiet, 10) == []
+    assert agent.decide_batch(busy, 11) != []
+
+
+def test_layering_stacks_distinct_levels_opposite_genuine():
+    from src.core.agents.manipulation.layering import LayeringAgent
+    from src.core.order_book import Side as S
+    agent = LayeringAgent("ly", np.random.default_rng(1), n_layers=5, size_taper=0.6, frequency=1.0,
+                          layer_side="buy", start_tick=0, end_tick=100)
+    orders = agent.decide_batch(_state(), 10)
+    genuine = [o for o in orders if o.order_id.endswith("g")]
+    layers = [o for o in orders if o.order_id.endswith("l")]
+    assert len(genuine) == 1 and genuine[0].side == S.SELL
+    assert len(layers) == 5 and all(o.side == S.BUY for o in layers)
+    assert len({o.price for o in layers}) == 5 and max(o.price for o in layers) < 99.0 + 1e-9
+    sizes = [o.quantity for o in sorted(layers, key=lambda o: -o.price)]
+    assert sizes[0] > sizes[-1]                                         # tapered: smaller deeper in the book

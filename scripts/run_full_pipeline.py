@@ -62,7 +62,8 @@ def _print_rows(df) -> None:
 
 
 def write_strategist_record(run_dir: Path, round_num: int, personas: list[str],
-                            source: dict[str, str], reasoning: dict[str, str]) -> None:
+                            source: dict[str, str], reasoning: dict[str, str],
+                            recovered: dict[str, int] | None = None) -> None:
     """
     round_N/strategist.json: who chose each persona's parameters for round N, the
     exact changes (old -> new, versus the parameters used in round N-1) and the
@@ -84,6 +85,9 @@ def write_strategist_record(run_dir: Path, round_num: int, personas: list[str],
             "params": new,
             "reasoning": reasoning.get(p, ""),
         }
+        if (recovered or {}).get(p) is not None:
+            # effect fell below the floor last round: parameters were reset to this round's set first
+            record["personas"][p]["effect_recovery_from_round"] = recovered[p]
     out = run_dir / f"round_{round_num}"
     out.mkdir(parents=True, exist_ok=True)
     (out / "strategist.json").write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -115,7 +119,7 @@ def print_parameter_dashboard(current_round: int):
     print(f"[*] PARAMETER EVOLUTION: UP TO ROUND {current_round}".center(72))
     print("*" * 72)
     
-    personas = ["spoofing", "wash_trading", "pump_and_dump"]
+    personas = ["spoofing", "wash_trading", "pump_and_dump", "layering"]
     
     for persona in personas:
         # Collect all parameters ever used for this persona up to current_round
@@ -199,14 +203,17 @@ def main():
 
     # Reset persona_config.yaml to baseline (remove top-level mutations)
     persona_config_path = REPO_ROOT / "configs" / "persona_config.yaml"
+    original_persona_config = persona_config_path.read_text(encoding="utf-8") if persona_config_path.exists() else None
     if persona_config_path.exists():
         with open(persona_config_path) as f:
             p_cfg = yaml.safe_load(f) or {}
-        # Keep only round_0 baseline
-        baseline = {"round_0": p_cfg.get("round_0", {})}
-        with open(persona_config_path, "w") as f:
-            yaml.dump(baseline, f, default_flow_style=False)
-        logger.info("Reset persona_config.yaml to baseline for Round 0.")
+        if set(p_cfg) - {"round_0"}:
+            # Keep only round_0 baseline (a previous run was interrupted mid-way)
+            baseline = {"round_0": p_cfg.get("round_0", {})}
+            with open(persona_config_path, "w") as f:
+                yaml.dump(baseline, f, default_flow_style=False)
+            original_persona_config = persona_config_path.read_text(encoding="utf-8")
+            logger.info("Reset persona_config.yaml to baseline for Round 0.")
 
     # Initialise orchestrator (runs the simulation + detector each round)
     orchestrator = RoundOrchestrator(
@@ -228,93 +235,108 @@ def main():
     # ----------------------------------------------------------------
     # Main Loop
     # ----------------------------------------------------------------
-    for round_num in range(args.rounds):
+    try:
+        for round_num in range(args.rounds):
         
-        # --- Step 0: Print Baseline Parameters for Round 0 ---
-        if round_num == 0:
-            print_parameter_dashboard(round_num)
+            # --- Step 0: Print Baseline Parameters for Round 0 ---
+            if round_num == 0:
+                print_parameter_dashboard(round_num)
         
-        # --- Step 1: LLM Mutation (skip for Round 0 — it's the baseline) ---
-        if round_num > 0:
-            personas_to_mutate = (
-                detector_config.get("personas", ["spoofing", "wash_trading", "pump_and_dump"]) 
-                if args.persona.lower() == "all" else [args.persona]
-            )
+            # --- Step 1: LLM Mutation (skip for Round 0 — it's the baseline) ---
+            if round_num > 0:
+                personas_to_mutate = (
+                    detector_config.get("personas", ["spoofing", "wash_trading", "pump_and_dump"]) 
+                    if args.persona.lower() == "all" else [args.persona]
+                )
 
-            logger.info(f"\nRound {round_num}: mutating {personas_to_mutate} ({args.mutations})...")
-            try:
-                if args.mutations == "hand":
-                    from src.agentic.mutation_library import get_fallback_mutation
-                    result = {"status": "success", "source": {}, "reasoning": {}}
-                    for p in personas_to_mutate:
-                        fb = get_fallback_mutation(p, round_num)
-                        res = strategist.tools.propose_mutation(p, fb["parameters"], fb["reasoning"])
-                        if "error" not in res:
-                            result["source"][p] = "hand_authored"
-                            result["reasoning"][p] = fb["reasoning"]
-                else:
-                    result = strategist.run_strategist_round(
-                        round_num=round_num - 1,  # Strategist reads the PREVIOUS round's metrics
-                        personas=personas_to_mutate,
-                        target_round=round_num,   # ...and mutates for THIS round
-                    )
-                mutation_source = {p: result.get("source", {}).get(p, "unchanged") for p in personas_to_mutate}
+                logger.info(f"\nRound {round_num}: mutating {personas_to_mutate} ({args.mutations})...")
+                try:
+                    if args.mutations == "hand":
+                        from src.agentic.mutation_library import get_fallback_mutation
+                        result = {"status": "success", "source": {}, "reasoning": {}}
+                        result["recovered"] = {}
+                        for p in personas_to_mutate:
+                            st = strategist.tools.recover_effect(p)
+                            if st:
+                                result["recovered"][p] = st.get("anchor_round")
+                            fb = get_fallback_mutation(p, round_num)
+                            res = strategist.tools.propose_mutation(p, fb["parameters"], fb["reasoning"])
+                            if "error" not in res:
+                                result["source"][p] = "hand_authored"
+                                result["reasoning"][p] = fb["reasoning"]
+                    else:
+                        result = strategist.run_strategist_round(
+                            round_num=round_num - 1,  # Strategist reads the PREVIOUS round's metrics
+                            personas=personas_to_mutate,
+                            target_round=round_num,   # ...and mutates for THIS round
+                        )
+                    mutation_source = {p: result.get("source", {}).get(p, "unchanged") for p in personas_to_mutate}
 
-                # --- Structured record of this round's mutation (read by the dashboard) ---
-                write_strategist_record(master_run_dir, round_num, personas_to_mutate, mutation_source,
-                                        result.get("reasoning", {}))
+                    # --- Structured record of this round's mutation (read by the dashboard) ---
+                    write_strategist_record(master_run_dir, round_num, personas_to_mutate, mutation_source,
+                                            result.get("reasoning", {}), result.get("recovered", {}))
 
-                # --- Print and Log Reasoning ---
-                reasonings = result.get("reasoning", {})
-                if reasonings:
-                    reasoning_log_path = master_run_dir / "llm_reasoning.log"
-                    with open(reasoning_log_path, "a", encoding="utf-8") as rf:
-                        rf.write(f"\n{'='*60}\nROUND {round_num} STRATEGIST REASONING\n{'='*60}\n")
-                        for persona, rationale in reasonings.items():
-                            formatted_reasoning = f"\n[{persona.upper()}]\n{rationale}\n"
-                            print(formatted_reasoning)
-                            rf.write(formatted_reasoning)
+                    # --- Print and Log Reasoning ---
+                    reasonings = result.get("reasoning", {})
+                    if reasonings:
+                        reasoning_log_path = master_run_dir / "llm_reasoning.log"
+                        with open(reasoning_log_path, "a", encoding="utf-8") as rf:
+                            rf.write(f"\n{'='*60}\nROUND {round_num} STRATEGIST REASONING\n{'='*60}\n")
+                            for persona, anchor in (result.get("recovered") or {}).items():
+                                rf.write(f"\n[{persona.upper()}] effect below floor -> parameters reset to round {anchor} before mutating\n")
+                            for persona, rationale in reasonings.items():
+                                formatted_reasoning = f"\n[{persona.upper()}]\n{rationale}\n"
+                                print(formatted_reasoning)
+                                rf.write(formatted_reasoning)
                             
-                if result.get("status") == "success":
-                    logger.info(f"LLM mutation applied for {personas_to_mutate} in Round {round_num}!")
-                elif result.get("status") == "partial_success":
-                    logger.warning(f"LLM mutation partially applied for: {result.get('mutated')}. Using existing config for the rest.")
-                else:
-                    logger.warning(f"LLM mutation failed: {result}. Using existing config.")
-            except Exception as e:
-                logger.error(f"Strategist failed: {e}. Continuing with current config.")
-                mutation_source = {p: "unchanged" for p in personas_to_mutate}
+                    if result.get("status") == "success":
+                        logger.info(f"LLM mutation applied for {personas_to_mutate} in Round {round_num}!")
+                    elif result.get("status") == "partial_success":
+                        logger.warning(f"LLM mutation partially applied for: {result.get('mutated')}. Using existing config for the rest.")
+                    else:
+                        logger.warning(f"LLM mutation failed: {result}. Using existing config.")
+                except Exception as e:
+                    logger.error(f"Strategist failed: {e}. Continuing with current config.")
+                    mutation_source = {p: "unchanged" for p in personas_to_mutate}
                 
-            # --- Save History for Dashboard ---
-            persona_config_path = REPO_ROOT / "configs" / "persona_config.yaml"
-            if persona_config_path.exists():
-                with open(persona_config_path, "r") as f:
-                    p_cfg_hist = yaml.safe_load(f) or {}
+                # --- Save History for Dashboard ---
+                persona_config_path = REPO_ROOT / "configs" / "persona_config.yaml"
+                if persona_config_path.exists():
+                    with open(persona_config_path, "r") as f:
+                        p_cfg_hist = yaml.safe_load(f) or {}
                 
-                # Copy current top-level mutated parameters into round_{round_num} for historic tracking
-                p_cfg_hist[f"round_{round_num}"] = {}
-                for p_name in ["spoofing", "wash_trading", "pump_and_dump"]:
-                    if p_name in p_cfg_hist:
-                        p_cfg_hist[f"round_{round_num}"][p_name] = p_cfg_hist[p_name].copy()
+                    # Copy current top-level mutated parameters into round_{round_num} for historic tracking
+                    p_cfg_hist[f"round_{round_num}"] = {}
+                    for p_name in personas_to_mutate:
+                        if p_name in p_cfg_hist:
+                            p_cfg_hist[f"round_{round_num}"][p_name] = p_cfg_hist[p_name].copy()
                         
-                with open(persona_config_path, "w") as f:
-                    yaml.dump(p_cfg_hist, f, default_flow_style=False)
+                    with open(persona_config_path, "w") as f:
+                        yaml.dump(p_cfg_hist, f, default_flow_style=False)
                     
-            # Print the NEWly mutated parameters
-            print_parameter_dashboard(round_num)
+                # Print the NEWly mutated parameters
+                print_parameter_dashboard(round_num)
 
-        # --- Step 2: Run the simulation + detector for this round ---
-        logger.info(f"\nRound {round_num}: Running simulation + detection...")
-        metrics = orchestrator.run_round(
-            round_num, mutation_source=None if round_num == 0 else mutation_source)
+            # --- Step 2: Run the simulation + detector for this round ---
+            logger.info(f"\nRound {round_num}: Running simulation + detection...")
+            metrics = orchestrator.run_round(
+                round_num, mutation_source=None if round_num == 0 else mutation_source)
 
-        if not metrics:
-            logger.warning(f"Round {round_num} produced no metrics. Check simulation output.")
-            continue
+            if not metrics:
+                logger.warning(f"Round {round_num} produced no metrics. Check simulation output.")
+                continue
 
-        # --- Step 3: Print running summary ---
-        summary_df = build_summary_table(orchestrator._all_metrics)
-        print_metrics_table(summary_df, round_num)
+            # --- Step 3: Print running summary ---
+            summary_df = build_summary_table(orchestrator._all_metrics)
+            print_metrics_table(summary_df, round_num)
+
+    finally:
+        # Restore the baseline config (also when a run is interrupted): this run's
+        # mutations live in its metrics.json files.
+        if original_persona_config is not None:
+            persona_config_path.write_text(original_persona_config, encoding="utf-8")
+            logger.info("Restored configs/persona_config.yaml to its baseline.")
+
 
     # ----------------------------------------------------------------
     # Final output

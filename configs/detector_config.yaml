@@ -56,8 +56,9 @@ ensemble:
   supervised_threshold: 0.5    # fallback when a threshold cannot be tuned
   top_shap_features: 5
 
-# --- Personas to train classifiers for (layering not maintained) ---
+# --- Personas to train classifiers for ---
 personas:
   - spoofing
   - wash_trading
   - pump_and_dump
+  - layering

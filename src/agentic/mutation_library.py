@@ -38,10 +38,12 @@ FALLBACK_MUTATIONS: dict[str, list[dict[str, Any]]] = {
         },
         {
             "parameters": {"order_size_multiplier": 6.0, "size_jitter": 0.5, "cancel_jitter": 0.6,
-                           "cancellation_delay_ticks": 10, "n_split_orders": 3, "n_accounts": 2},
+                           "cancellation_delay_ticks": 10, "n_split_orders": 3, "n_accounts": 2,
+                           "reprice_to_touch": 1},
             "reasoning": (
-                "Round 3+ (JPMorgan cross-trader spoofing): the genuine order and the spoof come from different "
-                "accounts, breaking the per-account spoof_signature and cancel/execution opposition."
+                "Round 3+ (JPMorgan cross-trader spoofing; Sarao repricing): the genuine order and the spoof come "
+                "from different accounts, breaking the per-account spoof_signature, and the spoof is kept pinned "
+                "behind the moving touch so it keeps its effect while avoiding fills."
             ),
         },
     ],
@@ -90,6 +92,30 @@ FALLBACK_MUTATIONS: dict[str, list[dict[str, Any]]] = {
             "reasoning": (
                 "Round 3+ (Nefedova round 2: 8 accounts, 600-tick accumulation, staggered exit): spread smaller "
                 "per-account positions across 8 accounts."
+            ),
+        },
+    ],
+    "layering": [
+        {
+            "parameters": {"size_taper": 0.5, "layer_spacing": 0.0003},
+            "reasoning": (
+                "Round 1 (Tower evasion: 'decreasing volume deeper in the book to appear more natural'): taper layer "
+                "sizes and widen the spacing slightly so the depth profile looks organic."
+            ),
+        },
+        {
+            "parameters": {"size_taper": 0.6, "n_layers": 3, "cancel_jitter": 0.5, "cancellation_delay_ticks": 8},
+            "reasoning": (
+                "Round 2 (Tower round 2; advisory #2): fewer layers per cycle and randomised, longer cancel timing to "
+                "blunt fast_cancel_ratio and the same-tick multi-level batch signature."
+            ),
+        },
+        {
+            "parameters": {"size_taper": 0.6, "n_layers": 3, "cancel_jitter": 0.6, "cancellation_delay_ticks": 10,
+                           "busy_period_bias": 0.6},
+            "reasoning": (
+                "Round 3+ (advisory #5): concentrate layering in busy periods so the cancellation burst hides among "
+                "elevated legitimate activity."
             ),
         },
     ],

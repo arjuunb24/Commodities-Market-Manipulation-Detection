@@ -45,9 +45,10 @@ PERSONA_COLORS = {
     "spoofing":      ("#ef4444", "rgba(239,68,68,0.12)", "rgba(239,68,68,0.35)"),
     "wash_trading":  ("#f59e0b", "rgba(245,158,11,0.12)", "rgba(245,158,11,0.35)"),
     "pump_and_dump": ("#8b5cf6", "rgba(139,92,246,0.12)", "rgba(139,92,246,0.35)"),
-    "anomaly":       ("#06b6d4", "rgba(6,182,212,0.12)", "rgba(6,182,212,0.35)"),
+    "layering":      ("#06b6d4", "rgba(6,182,212,0.12)", "rgba(6,182,212,0.35)"),
+    "anomaly":       ("#94a3b8", "rgba(148,163,184,0.12)", "rgba(148,163,184,0.35)"),
 }
-PERSONA_ICONS = {"spoofing": "🎭", "wash_trading": "🔁", "pump_and_dump": "🚀", "anomaly": "❓"}
+PERSONA_ICONS = {"spoofing": "🎭", "wash_trading": "🔁", "pump_and_dump": "🚀", "layering": "🧱", "anomaly": "❓"}
 PLOTLY_LAYOUT = dict(
     paper_bgcolor="rgba(10,14,26,0)",
     plot_bgcolor="rgba(10,14,26,0)",
@@ -66,6 +67,8 @@ FEATURE_DESCRIPTIONS = {
     "max_order_size_rel": "Largest order vs. the market's median order size",
     "order_size_cv": "How much the account's order sizes vary (coefficient of variation)",
     "large_order_share": "Share of placed volume in large orders (>= 4x the market median)",
+    "layered_order_share": "Share of placed volume in same-tick, same-side batches on 3+ price levels (layering)",
+    "cancel_replace_ratio": "Share of cancels immediately replaced by a same-side order in the same tick (repricing)",
     # Cancellations (spoofing)
     "cancel_ratio": "Cancelled volume / placed volume",
     "fast_cancel_ratio": "Share of order volume cancelled within 10 s of placement",
@@ -196,7 +199,7 @@ def _build_shap_chart(shap_values: dict[str, float], persona: str) -> go.Figure:
     return fig
 
 
-PERSONA_ORDER = ["spoofing", "wash_trading", "pump_and_dump"]
+PERSONA_ORDER = ["spoofing", "layering", "wash_trading", "pump_and_dump"]
 
 
 def _confidence_label(margin: float) -> str:
@@ -282,6 +285,11 @@ EVIDENCE_LABELS = {
     "aggressive_share_pct": "Volume taken aggressively (%)",
     "burst_share_of_market_volume_pct": "Burst share of market volume (%)",
     "other_accounts_flagged_for_pump_and_dump_in_same_span": "Other accounts flagged for pump-and-dump in the same span",
+    "large_orders_cancelled_and_replaced_same_tick": "Large orders cancelled and re-placed in the same tick (repricing)",
+    "aggressive_opposite_trades_right_after_cancel": "Aggressive trades the other way right after a cancel (flips)",
+    "multi_level_batches": "Batches of orders stacked on 3+ price levels",
+    "layer_size_vs_market_median_x": "Layer size vs market median (×)",
+    "batches_with_opposite_side_fill_while_resting": "Batches during which the account was filled on the other side",
 }
 
 

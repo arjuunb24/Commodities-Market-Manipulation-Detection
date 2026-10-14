@@ -18,6 +18,10 @@ windows (tick-based; 1 tick = 1 second):
 
 Trader-level behavioural features, grouped by the persona they target:
 
+  Layering     layered_order_share (volume placed as same-tick, same-side
+               batches on >= 3 distinct price levels — the Tower pattern)
+  Repricing    cancel_replace_ratio (cancels immediately replaced on the same
+               side in the same tick — Sarao-style spoof repricing)
   Spoofing     spoof_signature (share of the account's large cancelled orders
                during whose life it was filled on the opposite side),
                cancel_ratio, fast_cancel_ratio, mean_cancel_lifetime,
@@ -215,6 +219,9 @@ class FeatureEngine:
         placed["q2"] = placed["quantity"] ** 2
         placed["large_q"] = np.where(placed["is_large"], placed["quantity"], 0.0)
         placed["dist_q"] = placed["dist_bp"] * placed["quantity"]
+        # Layering fingerprint: same account, same tick, same side, >= 3 distinct price levels.
+        batch = placed.groupby(["trader_id", "tick", "side"])["price"]
+        placed["layer_q"] = np.where(batch.transform("nunique") >= 3, placed["quantity"], 0.0)
 
         cancels = orders[orders["event_type"] == "cancelled"][["order_id", "trader_id", "quantity", "tick", "step"]].copy()
         cancels["quantity"] = cancels["quantity"].astype(float)
@@ -228,19 +235,24 @@ class FeatureEngine:
         cancels["c_sell"] = np.where(cancels["side"] == "sell", cancels["quantity"], 0.0)
         cancels["fast_q"] = np.where(cancels["lifetime"] <= FAST_CANCEL_TICKS, cancels["quantity"], 0.0)
         cancels["large_c"] = np.where(cancels["is_large"], cancels["quantity"], 0.0)
+        # Cancel-and-replace: a new order on the same side placed by the same account in the
+        # same tick as the cancel (Sarao-style repricing; market makers are excluded upstream).
+        replaced_keys = placed[["trader_id", "tick", "side"]].drop_duplicates().assign(_replaced=1.0)
+        cancels = cancels.merge(replaced_keys, on=["trader_id", "tick", "side"], how="left")
+        cancels["replaced"] = cancels["_replaced"].fillna(0.0)
 
         # ---------------- trader per-step aggregates ----------------
         p_step = placed.groupby(["step", "trader_id"]).agg(
             n_placed=("quantity", "size"), placed_vol=("quantity", "sum"),
             placed_buy=("buy_q", "sum"), placed_sell=("sell_q", "sum"),
             placed_q2=("q2", "sum"), placed_max=("quantity", "max"),
-            large_vol=("large_q", "sum"), dist_q=("dist_q", "sum"),
+            large_vol=("large_q", "sum"), dist_q=("dist_q", "sum"), layer_vol=("layer_q", "sum"),
         ).reset_index()
         c_step = cancels.groupby(["step", "trader_id"]).agg(
             n_cancel=("quantity", "size"), cancel_vol=("quantity", "sum"),
             cancel_buy=("c_buy", "sum"), cancel_sell=("c_sell", "sum"),
             fast_cancel=("fast_q", "sum"), large_cancel=("large_c", "sum"),
-            lifetime_sum=("lifetime", "sum"),
+            lifetime_sum=("lifetime", "sum"), n_replaced=("replaced", "sum"),
         ).reset_index()
 
         if not trades.empty:
@@ -291,10 +303,10 @@ class FeatureEngine:
 
         # ---------------- roll into windows ----------------
         p_win = _to_windows(p_step, ["trader_id"],
-                            ["n_placed", "placed_vol", "placed_buy", "placed_sell", "placed_q2", "large_vol", "dist_q"],
+                            ["n_placed", "placed_vol", "placed_buy", "placed_sell", "placed_q2", "large_vol", "dist_q", "layer_vol"],
                             ["placed_max"], W, first_step, last_step)
         c_win = _to_windows(c_step, ["trader_id"],
-                            ["n_cancel", "cancel_vol", "cancel_buy", "cancel_sell", "fast_cancel", "large_cancel", "lifetime_sum"],
+                            ["n_cancel", "cancel_vol", "cancel_buy", "cancel_sell", "fast_cancel", "large_cancel", "lifetime_sum", "n_replaced"],
                             [], W, first_step, last_step)
         t_win = _to_windows(t_step, ["trader_id"],
                             ["n_exec", "exec_buy", "exec_sell", "aggr_vol", "dev_sum", "exec_q2"],
@@ -390,6 +402,8 @@ class FeatureEngine:
         f["max_order_size_rel"] = tw["placed_max"] / median_size
         f["order_size_cv"] = np.sqrt(np.clip(_safe_div(tw["placed_q2"], tw["n_placed"]) - avg_size ** 2, 0, None)) / np.where(avg_size > 0, avg_size, 1.0)
         f["large_order_share"] = _safe_div(tw["large_vol"], tw["placed_vol"])
+        f["layered_order_share"] = _safe_div(tw["layer_vol"], tw["placed_vol"])
+        f["cancel_replace_ratio"] = np.clip(_safe_div(tw["n_replaced"], tw["n_cancel"]), 0, 1)
         # Cancels of orders placed before the window with no new orders → ratio 1.
         no_new = np.where(tw["cancel_vol"] > 0, 1.0, 0.0)
         f["cancel_ratio"] = np.where(tw["placed_vol"] > 0,

@@ -37,7 +37,8 @@ Nothing in this overhaul has been committed yet; all changes are in the working 
 | Adversarial loop | Retrained before scoring (no measure of evasion); one test market per round | Scores with the *frozen* detector first (evasion), then retrains (recovery); 2 test markets per round; effectiveness of each manipulation measured |
 | LLM | Gemini only; strategist saw only last round's metrics; no bounds enforcement; analyst tools returned invented numbers | One switch for Gemini or Cerebras (gpt-oss-120b); budget-guarded; strategist sees full track record, effectiveness, SHAP reliance and tactic cards; strict bounds; analyst tools read real data |
 | Dashboard "Flagged Trades" | Showed simulator ground truth with hard-coded confidence values | Shows real detector flags with stored SHAP, ground-truth confirmation, missed episodes |
-| Tests | 69 | 104 (all passing) |
+| Personas | 3 maintained (layering disabled, legacy code) | 4: spoofing, wash trading, pump-and-dump, **layering** (Tower Research), plus real-case tactics: Sarao repricing, Oystacher flipping, trading in busy periods (CFTC advisory #5) |
+| Tests | 69 | 111 (all passing) |
 
 ---
 
@@ -120,7 +121,7 @@ All three personas now share `ManipulatorAccount` / `ManipulationController` (`s
 - **One ground-truth event per episode** (wash groups of one episode are merged).
 - **Audit tags in order ids** (`s` spoof leg, `g` genuine leg, `w` wash leg, `c` camouflage, `d` decoy). Used only for effectiveness accounting; the detector never parses order ids.
 
-Layering was not changed (per instruction) and stays disabled.
+Layering was initially left disabled (per instruction); it was later rebuilt and re-enabled as a fourth persona (§3.4) together with three tactics from further real cases (§3.5).
 
 ### 3.1 Spoofing (`spoofing.py`)
 - **From:** one large order placed 0.3% behind mid on a fixed side, no genuine order, frequency 0.4 per tick (overlapping spoofs). Measured price impact: **−0.03 bp, t = −0.37** (none).
@@ -165,6 +166,23 @@ Layering was not changed (per instruction) and stays disabled.
 
 ---
 
+### 3.4 Layering (`layering.py`, rebuilt)
+- **From:** a legacy agent outside the shared persona framework (random `uuid4` ids, its own cancel bookkeeping, no background activity, no genuine opposite order), disabled by default and special-cased in the simulation loop.
+- **To:** the Tower Research (2019) pattern on the shared `ManipulationController`: each cycle a small genuine order rests at the best price on one side and `n_layers` moderate orders are stacked on consecutive price levels of the other side (at least one tick apart), then cancelled together after `cancellation_delay_ticks`. Deterministic ids, audit tags (`l` layer leg, `g` genuine leg), background activity like the other personas. Enabled in the baseline config.
+- **Knobs:** `n_layers` (2–8), `layer_spacing`, `layer_size_multiplier`, `size_taper` (smaller layers deeper in the book — Tower's own evasion), `cancellation_delay_ticks`, `cancel_jitter`, `frequency`, `busy_period_bias`.
+- **Why separate from spoofing:** spoofing shows one large order (or a few splits) near the touch; layering spreads moderate orders across levels, so no single order is extreme — the deception is the depth profile.
+
+### 3.5 New real-case tactics
+| Tactic | Real case | Knob | Mechanism in the simulator | Trade-off |
+|---|---|---|---|---|
+| Reprice to stay behind the touch | Sarao (2015): orders auto-modified to stay a few ticks from the best price | `reprice_to_touch` (spoofing, 0/1) | While a spoof rests, each leg that drifted from its target distance is cancelled and re-placed at the new target | Fewer accidental fills, but every re-place is a cancel: orders live ~1 tick, so `cancel_replace_ratio` and `fast_cancel_ratio` rise |
+| Flip after cancel | Oystacher (2015): cancel the spoof, then trade aggressively the other way | `flip_after_cancel` (spoofing, probability) | When the spoof is pulled, an aggressive order in the genuine direction (e.g. sell into the inflated bid), tag `f` | Real aggressive executions (cost, visible aggressor flow) |
+| Trade in busy periods | CFTC 2020 staff advisory #5; Kraft (timing washes to genuine high volume) | `busy_period_bias` (all four personas) | The simulation tracks volume over the last minute and a slow baseline (`BookState.recent_volume`, `baseline_volume`, `is_busy()`); in quiet periods the persona skips a tick with probability = bias | Fewer manipulation cycles when the market is quiet |
+
+Validated in isolation: with repricing on, 80 spoof legs for 25 cycles (the extra legs are re-places); with flipping at 0.8, 18 flips; layering placed 4 distinct-level layers per cycle; a busy-period bias of 1 suppresses all cycles in quiet states and none in busy states (unit tests in `test_personas.py`).
+
+---
+
 ## 4. Detector (prediction methods)
 
 ### 4.1 Unit of detection
@@ -182,6 +200,7 @@ Computed fully vectorised (~0.7 s per 5,000-tick run). Per-step aggregates are r
 | Spoofing | `spoof_signature` (share of the account's large cancelled orders during whose life it was filled on the **opposite** side — the Coscia/Sarao signature, computed per order), `fast_cancel_ratio` (cancelled within 10 s), `large_cancel_ratio`, `n_large_cancels`, `max_order_size_rel`, `avg_order_size_rel`, `large_order_share`, `cancel_ratio`, `mean_cancel_lifetime`, `passive_distance_bp`, `cancel_side_imbalance`, `cancel_exec_opposition`, `order_size_cv`, `fill_ratio` |
 | Wash trading | `top_cpty_share` (share of volume with one counterparty), `reciprocal_ratio` (volume traded back and forth with the same accounts), `net_flatness`, `n_counterparties`, `trade_size_cv`, `price_dev_bp` |
 | Pump-and-dump | `exec_side_imbalance`, `aggressor_ratio`, `signed_flow_return` (own direction × market return), `prev_net_ratio`, `long_net_ratio` (~12-minute position build-up), `reversal_score` (net buyer before, net seller now), `activity_vs_history`, `coordinated_peers` (other accounts bursting in the same direction in the same window) |
+| Layering / repricing (added with the new tactics) | `layered_order_share` (share of placed volume in same-tick, same-side batches on ≥ 3 distinct price levels — the Tower fingerprint), `cancel_replace_ratio` (share of cancels immediately replaced by a same-side order in the same tick — Sarao-style repricing) |
 | Activity | `n_orders`, `n_trades`, `exec_vol`, `gross_volume_share` |
 
 **Peer-relative features:** robust z-scores (`peer_z_*`, median/MAD) of key features against all other accounts in the same window — normalises for market regime.
@@ -192,6 +211,8 @@ Computed fully vectorised (~0.7 s per 5,000-tick run). Per-step aggregates are r
 - `order_book_imbalance` compared sides to `"BUY"`/`"SELL"` while logs store `"buy"`/`"sell"` → it was **always 0**. Fixed (`mkt_order_imbalance`).
 - Market-maker exclusion by `startswith("mm")` hacks inside features → replaced by an explicit, documented rule: designated market makers (`exclude_trader_prefixes: ["mm_"]`) are not scored, as real surveillance monitors registered liquidity providers under separate rules (their requote cancels would dominate cancellation features).
 - The O(n) graph/iterrows features (circular volume via networkx per step) → replaced by the reciprocal/counterparty features.
+
+**Measured separation (means, crude oil run with all tactics):** layering windows `layered_order_share` 0.94 vs 0.00 for every other group; repricing spoofers `cancel_replace_ratio` 0.60 vs 0.16 for legitimate accounts.
 
 **Measured separation (medians, crude oil run):** spoofing windows `fast_cancel_ratio` 0.97 vs noise traders 0.06; `spoof_signature` 0.87 mean vs 0.02 for legitimate accounts; wash windows `top_cpty_share` 0.98 vs 0.08.
 
@@ -209,7 +230,7 @@ Computed fully vectorised (~0.7 s per 5,000-tick run). Per-step aggregates are r
 ### 4.5 Supervised layer (`src/detector/classifiers.py`, rewritten)
 - **From:** XGBoost for spoofing, LightGBM for wash and pump, each on a **hand-picked subset of market features**; `scale_pos_weight` capped at 15–20; fixed 0.5 threshold; zero-positive personas silently skipped; no SHAP at prediction time (only gain importance saved).
 - **To:**
-  - One **XGBoost** binary classifier per persona on **all** trader, peer and market-context features (SHAP shows what each model actually uses; subsets hid cross-signals).
+  - One **XGBoost** binary classifier per persona (four, including layering) on **all** trader, peer and market-context features (SHAP shows what each model actually uses; subsets hid cross-signals).
   - Class imbalance via `scale_pos_weight = n_neg / n_pos` (cap 50), no resampling — so SHAP explains the true distribution.
   - **Out-of-fold threshold tuning:** `GroupKFold` over time blocks (600 ticks) so overlapping windows never straddle train/validation; threshold chosen to maximise F1, kept within **[0.25, 0.9]** (without the floor, single-episode folds pushed thresholds to 0.1–0.125 and precision collapsed).
   - `InsufficientLabelsError` (FR-2.3): raised in strict mode (`require_all_personas: true`), otherwise an explicit warning.
@@ -251,16 +272,67 @@ All episodes detected. For comparison, the old market-level detector's last run 
 
 | Persona | Primary measure | Also reported |
 |---|---|---|
-| Spoofing | `favorable_move_bp` — price move toward the genuine order while the spoof rested | `genuine_fill_rate` |
+| Spoofing | `fake_depth_share` — share of the visible near-touch depth (±0.2% band) on the spoofed side that the spoof made up when placed (recorded by the agent) | `favorable_move_bp`, `genuine_fill_rate` |
+| Layering | `fake_depth_share` — same, for the stacked layers | `favorable_move_bp`, `genuine_fill_rate` |
 | Wash trading | `wash_volume_share` — self-crossed share of market volume in the window | `wash_volume` |
 | Pump-and-dump | `ignition_pressure` — peak share of market volume taken by the coalition's marketable buying in any 60-tick window | `price_lift_bp`, `pnl_bp` |
 
 - **Objective:** `score = (1 − frozen recall) × min(1, effectiveness / round-0 effectiveness)`; **0 if effectiveness < 50% of round 0**.
 - **Validation:** "neutered" settings (spoof far from the touch, rare washes, tiny pump) fall below 0.5× for all three personas; e.g. wash share 0.039 vs 0.21 baseline, pump pressure 0.024 vs 0.089.
+- **Spoofing/layering measure history:** the first primary measure was the price move toward the genuine order while the spoof rested. Per-cycle impact in this market (~0.2–1 bp) is small next to noise, and with ~2 episodes per round the ratio swung between 5.3×, 0.57× and −0.25× in successive rounds of one run. The fake-depth share — the lever the scheme pulls — is stable (±0.02 across seeds), is unchanged by evasions that keep the spoof near the touch (0.52 → 0.52 with repricing), and falls to 0.00 when the spoof is pulled far from the touch or shrunk. Price impact is still reported.
+- **Robust aggregation:** per-persona effectiveness is the **median** across episodes (was the mean).
 - **Pump measure history:** the first version (90th-percentile price over the episode) was noise-dominated (a neutered pump scored 1.1×). The ignition-span lift was too weak to separate (5.4 vs 3.8 bp). The span-relative share mis-scored a tiny pump. The peak 60-tick pressure is stable (±0.01) and separates correctly.
 
 ### 5.5 Persisted outputs per round
 `metrics.json` now holds: post metrics (`personas`), `pre_retrain`, `unsupervised`, `thresholds`, `n_flags`, `n_test_markets`, `params_used` (exact parameters in force), `mutation_source` (baseline / agentic / hand_authored / unchanged), `effectiveness`, `effectiveness_ratio`, `mutation_score`. Run level: `round_summary.parquet` (all columns) and schema-validated `round_metrics.parquet`.
+
+---
+
+### 5.6 Strategist objective v2 (after reviewing the 8-commodity run)
+- **From:** score = (1 − frozen row recall) × min(1, effect). Row recall rose and fell with how many accounts a mutation added, and the score ignored whether whole episodes escaped or how late they were caught. Every episode was always caught.
+- **To:** evasion = 0.5 × (1 − **episode coverage**) + 0.3 × **episodes missed** + 0.2 × **detection delay** (÷ 300 ticks, capped), all against the frozen detector; score = evasion × min(1, effect), 0 below half the round-0 effect. Episode coverage (share of each episode's own windows flagged, averaged over episodes) is new in `metrics.py` and does not inflate when accounts are added. Effectiveness summaries use medians across episodes (less noisy). The strategist sees the evasion parts per past round, knobs it has never changed and knobs stuck at a bound, and is told that effect above 1× earns nothing (bigger schemes are easier to catch).
+- **Observed (4-round crude-oil LLM run):** first complete escapes: in round 1 the frozen detector caught only 1 of 2 spoofing episodes (coverage 0.18, delay 336 ticks, score 0.76) and 1 of 2 pump-and-dumps (coverage 0.006, score 0.74, using the previously untouched `dump_delay_ticks` without adding accounts). The detector then adapted; wash trading kept eroding (frozen coverage 0.63 by round 3). Cost $0.016.
+
+### 5.7 Validation of the new tactics (final 4-round LLM run, crude oil, all four personas)
+All mutations came from the LLM (no fallbacks, no rate-limit errors). The strategist used the new tactics: `busy_period_bias` for wash trading, pump-and-dump, layering and spoofing; repricing and flipping in an earlier validation run; layering taper, fewer layers and jittered cancels.
+
+| Persona | Round 1 | Round 2 | Round 3 |
+|---|---|---|---|
+| Spoofing | **0/2 episodes caught**, score 0.79 (split + cancel jitter) | coverage 0.79, delay 67, score 0.11 | coverage 0.74, score 0.12 |
+| Layering | coverage 0.97, score 0.03 | coverage 0.93, score 0.05 | coverage 0.79 but effect 0.35× (layers pushed 0.1% from the touch) → **score 0** |
+| Wash trading | coverage 0.95 | coverage **0.54**, score 0.20 | coverage 0.68, score 0.12 |
+| Pump-and-dump | coverage 0.37, score 0.36 | coverage **0.25**, delay 90, score 0.44 | coverage 0.52, delay 120, score 0.32 |
+
+The effectiveness floor correctly zeroed the layering mutation that widened the spacing until the layers no longer added near-touch depth. Spoofing effectiveness stayed in 0.74–0.79× (was swinging −0.25× to 5.3× under the price-move measure). Detector post-retrain F1: spoofing 0.95–1.00, layering 0.93–0.98, wash 0.85–0.99, pump-and-dump 0.63–0.75.
+
+### 5.8 Any-alert evasion and the effect guard (after reviewing the 5-round run `adversarial_20261014T033432Z_seed42`)
+That run looked like pump-and-dump was the only persona challenging the detector. Against the frozen detector it showed three different problems (rounds 1–4; the run stopped in round 5):
+
+| Persona | Frozen coverage r1→r4 | Effect r1→r4 | What was really happening |
+|---|---|---|---|
+| Spoofing | 0.96 → 0.77 → 0.77 → **0.00** | 1.01× → 0.64× | Round 4 "complete escape" (score 0.63) was a relabel: with `n_split_orders: 3` the spoof legs sit on 3 levels in one tick, i.e. the layering fingerprint. Rescoring round 4 with the round-3 detector: spoofing classifier 0 %, layering classifier 91 %, any alert **92 %** of spoofer windows. Layering's frozen precision fell to 0.27 the same round (those were the spoofers). |
+| Wash trading | 0.97 → 0.74 → 0.77 → 0.75 | 0.84× → 0.55× | Genuine evasion (rings + groups + camouflage dilute `top_cpty_share`, `net_flatness`); retrained coverage also fell to 0.75. But the effect was sliding toward the floor. |
+| Layering | 0.84 → 0.96 → 0.92 → 0.98 | **0.44× → 0.40×** | Round 1 widened `layer_spacing` 0.0002 → 0.001 and cut layers to 3, pushing layers out of the ±0.2 % band. Every later round scored 0; the LLM never reverted the spacing (round-4 reasoning even called the effect "within target range"). |
+| Pump-and-dump | 0.46 → 0.62 | 1.10× → 2.02× | Busy periods + staggering improve evasion and ignition pressure together. |
+
+The round-1 spoofing "0/2 caught" in §5.7 was likely the same relabel effect (split + cancel jitter).
+
+Fixes:
+- **Any-alert evasion (`metrics.py`, `effectiveness.py`).**
+  - **From:** coverage, missed episodes and delay were counted on the persona's own classifier (`flag_<persona>`).
+  - **To:** `compute_round_metrics` also records `caught_coverage`, `caught_events_detected` and `caught_latency_ticks`, counted on `final_flag` (any persona classifier or the anomaly model). `evasion_components` uses these when present, falling back to the own-label numbers for older runs.
+  - **Why:** an account flagged under another persona's label is still caught. Per-persona precision, recall and F1 are unchanged; they still measure classifier quality.
+- **Effect guard (`tools.py`: `effect_status`, `recover_effect`; `EFFECT_AT_RISK = 0.65` in `effectiveness.py`).**
+  - **Failed (effect < 0.5×):** before the next mutation, the persona's parameters are reset in code to its best effective past set (highest score among rounds that cleared the floor; round 0 counts). The strategist's context says "EFFECT FAILED", names the reset round and lists the knob changes that broke it, with "do not re-apply".
+  - **At risk (0.5×–0.65×):** no reset. The context says "EFFECT AT RISK" and lists changes since the latest comfortably effective round. Prompt rule 5 forbids lowering the effect further.
+  - Also applied in `--mutations hand` mode. Recorded as `effect_recovery_from_round` in `strategist.json`, the reasoning log and the dashboard strategist card.
+  - On the run above, the guard would have reset layering to round 0 before round 2, and flagged spoofing (changes since round 3: splits 2→3, size 5→4) and wash trading (camouflage 0.3→0.4, rings 4→5) as at risk.
+- **Strategist prompt:** coverage and missed are defined on any alert, and "flagged under another persona's label is still caught" is stated explicitly.
+- **Dashboard:** strategist-card coverage, episodes and delay use the any-alert numbers. A caption shows own-label coverage when it differs by ≥ 5 points, plus a warning when parameters were reset.
+- **Pipeline (`run_full_pipeline.py`):**
+  - The round loop is wrapped in `try/finally`, so `persona_config.yaml` is restored even when a run is interrupted (the last run had left it dirty).
+  - The per-round parameter history and the console parameter table now include layering.
+- **Tests (+3, 114 total):** any-alert evasion versus own label; failed-effect reset to the best effective round; at-risk warns without resetting.
 
 ---
 
@@ -283,9 +355,11 @@ All episodes detected. For comparison, the old market-level detector's last run 
 
 | Component | Output cap (Cerebras) | Reasoning effort | Other limits | Typical / worst cost |
 |---|---|---|---|---|
-| Strategist | 2,500 | medium | ≤ 4 model turns; only `propose_mutation` offered | ~3,500 input tokens per turn; ~$0.005 per round |
+| Strategist | 2,500 | medium | ≤ 5 model turns (four personas); only `propose_mutation` offered | ~4,100 input tokens per turn; ~$0.006–0.008 per round |
 | Analyst chat | 600 | low | ≤ 3 tool turns; each tool result ≤ 3,000 chars; last 3 Q&A kept | < $0.005 per question |
-| Case narrative | 450 | low | ≤ 2 calls (1 retry on grounding failure) | < $0.001 |
+| Case narrative | 700 (was 450; mechanism notes are 4–6 sentences) | low | ≤ 2 calls (1 retry on grounding failure, naming the unsupported numbers) | < $0.001 |
+
+Rate limits: after a "requests per minute" error from Cerebras during a validation run, calls are spaced ≥ 6 s apart (was 2 s) and a rate-limit retry waits 20 s × attempt (was 8 s). A round with five strategist turns takes ~30 s longer; the failed call had fallen back to the hand-written mutation as designed.
 
 Measured: with "low" reasoning the strategist thought for ~10 tokens and made a self-contradicting proposal; "medium" (~1,100 reasoning tokens on the first turn) produced coherent reasoning, so only the strategist uses it.
 
@@ -296,6 +370,7 @@ Measured: with "low" reasoning the strategist thought for ~10 tokens and made a 
   - **Method:** start from the best-scoring set, change 1–3 knobs aimed at features the detector currently relies on, never resubmit a past set, and switch tactic after a failure.
   - **Context per persona (compact):** knob bounds with current values; the **track record** for every past round (parameters → frozen recall/F1 → retrained recall → effectiveness and its ratio → score, plus who chose them); the detector's current mean |SHAP| reliance and rising features; and **tactic cards** (`docs/tactic_cards.yaml`) mapping each documented tactic to its knobs, the features it weakens and its cost.
   - **Validation:** every proposal is checked against `PARAM_BOUNDS` (persona allow-list, known names, types, ranges). One re-prompt with the exact error; a second rejection, an LLM failure, or an unavailable/over-budget provider → the hand-written variant **for the target round**.
+- **Later additions:** the objective v2 (§5.6); the context lists knobs never changed and knobs at a bound; tactic cards and bounds cover the new tactics and the layering persona (§3.4–3.5).
 - **Observed in the live run:** all four rounds' mutations came from the LLM except the last round's pump-and-dump (turns ran out → fallback). Out-of-range proposals (`size_jitter` 0.95, `decoy_rate` 0.45) were rejected and corrected on the re-prompt.
 
 ### 6.4 Tools (`src/agentic/tools.py`)
@@ -304,14 +379,14 @@ Measured: with "low" reasoning the strategist thought for ~10 tokens and made a 
 
 ### 6.5 Mutation library (`src/agentic/mutation_library.py`, new file)
 - **From:** variants that lowered frequency and pulled spoofs away from the touch (neutering the manipulation) and claimed extra wash pairs "dilute" volume (they multiplied it).
-- **To:** three variants per persona following the case progressions (Coscia/Tower/JPMorgan; Coinbase/Kraft; Nefedova), all validated against the bounds; indexed by target round and clamped at the last variant.
+- **To:** three variants per persona following the case progressions (Coscia/Tower/JPMorgan; Coinbase/Kraft; Nefedova), all validated against the bounds; indexed by target round and clamped at the last variant. Later: layering variants (taper → fewer layers + jittered cancels → busy periods, after Tower and advisory #2/#5) and repricing added to the third spoofing variant (Sarao).
 
 ### 6.6 Analyst Assistant (`src/agentic/analyst_assistant.py`)
 - **From:** mocked tools; no sources; no availability check.
 - **To:** fails fast if the provider is unavailable; `ask()` returns `{"answer", "sources"}` listing every tool call used; prompt requires citing tools, relaying errors and declining out-of-scope questions (FR-4.3); bounded turns and context.
 
 ### 6.7 Narrative Generator (`src/agentic/narrative_generator.py`)
-Input is now the real flag case (account, persona, window, score, triggered layers) plus its stored SHAP values; compact JSON; an empty reply (token limit) stops instead of retrying blindly. The fact-grounding check (every number must appear in the input) is unchanged and still enforced.
+Input is now the real flag case (account, persona, window, score, triggered layers), a plain-language **mechanism** description and deterministic **behavioural evidence** from `src/agentic/case_evidence.py`, plus the SHAP values. The prompt asks for what the account did → why it matches the mechanism and whom it misleads → which features caught it, quoting numbers verbatim. An empty reply (token limit) stops instead of retrying blindly. The fact-grounding check (every number must appear in the input) is unchanged; its single retry now names the unsupported numbers. Evidence covers all four personas: spoofing also reports same-tick cancel-and-replace events (repricing) and aggressive opposite trades right after cancels (flips); layering reports multi-level batches, levels per batch, layer size vs market, price gap between layers, cancel share and lifetime, opposite-side fills and price move.
 
 ---
 
@@ -330,6 +405,8 @@ Input is now the real flag case (account, persona, window, score, triggered laye
 | **Strategist reasoning / parameter evolution** | Parsed the free-text `llm_reasoning.log` with the wrong encoding (garbled `â€'`, `Ã—`), mis-grouped personas (empty round headers, everything under "[SPOOFING]"/"GENERAL"), indented HTML rendered as code blocks; the parameter table read the *current* `persona_config.yaml`, not the selected run | The pipeline writes `round_N/strategist.json` (source, old → new changes, reasoning); the dashboard shows one expander per round with a card per persona: source badge, outcome (frozen recall, retrained recall, effect vs round 0, score), parameter changes and the reasoning as a clean numbered list. Older runs fall back to `metrics.json` + a corrected UTF-8 log parser. The parameter table comes from each round's recorded `params_used` |
 | **Prediction confidence** | A case showed only a bare score | Each case has a confidence panel: the probability (or IsolationForest percentile) that drove the flag, a gauge with that round's tuned decision threshold marked, the margin over the threshold with a verbal level (borderline / moderate / high / very high), and every persona classifier's probability for the same account-window. Flags schema v2.1 adds `persona_scores`; runs made before this show the main gauge only |
 | **Case notes explain the mechanism** | The LLM only received the flag and SHAP values, so notes restated SHAP numbers already shown on screen; the SHAP table's Meaning column was blank for most features | `src/agentic/case_evidence.py` measures what the account did from its own orders/trades (spoofing: large orders placed/cancelled, size vs market, lifetime, opposite-side fills, price move; wash: top counterparty share, round trips, net vs gross, VWAP distance; pump-and-dump: build-up, aggressive burst and its market share, position peak/unwind, prices, other flagged accounts). Shown as a "What the account did" table and sent to the LLM with a plain-language mechanism description; the prompt asks for what happened → why it matches the mechanism → which features caught it, with the same number-level grounding check (the retry now names the unsupported numbers). Every model feature has a plain-English meaning |
+| **Fourth persona** | Three personas | Layering has its own colour and icon (🧱), confidence bar, evidence table rows and SHAP feature meanings (`layered_order_share`, `cancel_replace_ratio`); IsolationForest-only "anomaly" cases moved to grey so they no longer share layering's cyan |
+| **Strategist cards (objective v2)** | Frozen recall only | Frozen episode coverage, episodes caught and mean detection delay alongside the score |
 | **Colours** | 8-digit hex colours (`#3b82f622`) crashed the radar chart on older Plotly versions | Converted to `rgba(...)` |
 
 Launch command (Streamlit is installed in `.venv` without a launcher `.exe`):
@@ -342,6 +419,8 @@ Launch command (Streamlit is installed in `.venv` without a launcher `.exe`):
 `src/utils/schemas.py`:
 - **trade_log:** new required column `aggressor_side` (`buy`/`sell`).
 - **flags (v2):** adds `window_end`, `iso_score`, `predicted_persona` (nullable). Parquet stores the SHAP dict as a struct padded with the union of keys; `read_flags()` / `clean_shap_dict()` strip the padding on read.
+- **flags (v2.1):** adds `persona_scores` (every persona classifier's probability per row) for the confidence panel.
+- **BookState** (in-memory, not persisted): `recent_volume`, `baseline_volume`, `is_busy()` for the busy-period tactic.
 - **round_metrics:** now actually written and validated (`round_num`, `commodity`, `persona`, precision, recall, F1, FPR, `detection_latency_ticks`, `is_post_retrain`).
 
 ---
@@ -350,11 +429,11 @@ Launch command (Streamlit is installed in `.venv` without a launcher `.exe`):
 
 | File | Change |
 |---|---|
-| `configs/detector_config.yaml` | Window 3 min / step 30 s; `exclude_trader_prefixes`; IsolationForest contamination 0.01, `market_contamination` 0.05; XGBoost `max_scale_pos_weight`; new `supervised` block (`min_positives`, `require_all_personas`, `cv_folds`, `cv_block_ticks`, `threshold_bounds`); `top_shap_features`; personas limited to the three maintained ones |
-| `configs/persona_config.yaml` | Clean `round_0` baseline with every new knob at its "obvious" value; spoof distance 0.0005; unused start/end ticks removed (timing is sampled per commodity); stale top-level mutations removed |
-| `configs/llm_config.yaml` | Provider switch, provider profiles, `cerebras_budget`, per-component caps (see §6.2) |
+| `configs/detector_config.yaml` | Window 3 min / step 30 s; `exclude_trader_prefixes`; IsolationForest contamination 0.01, `market_contamination` 0.05; XGBoost `max_scale_pos_weight`; new `supervised` block (`min_positives`, `require_all_personas`, `cv_folds`, `cv_block_ticks`, `threshold_bounds`); `top_shap_features`; personas: spoofing, wash trading, pump-and-dump and (later) layering |
+| `configs/persona_config.yaml` | Clean `round_0` baseline with every knob at its "obvious" value (including `reprice_to_touch`, `flip_after_cancel`, `busy_period_bias` and the layering block, enabled); spoof distance 0.0005; unused start/end ticks removed (timing is sampled per commodity). The pipeline now restores this file when a run finishes (it used to be left holding the last run's mutations, with comments stripped) |
+| `configs/llm_config.yaml` | Provider switch, provider profiles, `cerebras_budget` (≥ 6 s between calls), per-component caps (see §6.2), strategist `max_tool_calls` 5 |
 | `.env` / `.env.example` | `LLM_PROVIDER`, `CEREBRAS_API_KEY` (real key only in `.env`, gitignored) |
-| `docs/tactic_cards.yaml` | New: evasion tactics → knobs → weakened features → cost |
+| `docs/tactic_cards.yaml` | New: evasion tactics → knobs → weakened features → cost; later extended with Sarao repricing, Oystacher flipping, busy-period trading (all personas) and a layering section |
 
 ---
 
@@ -362,27 +441,27 @@ Launch command (Streamlit is installed in `.venv` without a launcher `.exe`):
 
 | Script | Change |
 |---|---|
-| `scripts/run_full_pipeline.py` | `--mutations llm\|hand` (hand = no API, baseline for comparisons), `--test-markets`, `--run-name`, default `--persona all`; strategist given the target round; mutation source recorded; console table shows pre/post, events, latency, effectiveness ratio and score; UTF-8 reasoning log; a syntax error introduced earlier in this work was fixed |
+| `scripts/run_full_pipeline.py` | `--mutations llm\|hand` (hand = no API, baseline for comparisons), `--test-markets`, `--run-name`, default `--persona all`; strategist given the target round; mutation source recorded; console table shows pre/post, events, latency, effectiveness ratio and score; UTF-8 reasoning log; writes `round_N/strategist.json`; restores `persona_config.yaml` at the end of a run; a syntax error introduced earlier in this work was fixed |
 | `scripts/run_simulation.py` | Persona parameters via the shared `src/core/persona_params.py` mapping; deterministic multi-commodity seeds |
 | `scripts/verify_stylized_facts.py` | Counts `cancelled` (was `cancel`, so cancel ratios always read 0%); deterministic seeds; uses current simulator defaults |
 | `scripts/test_pipeline.py`, `plot_windows.py`, `test_module_4.py` | Updated to trader-level outputs / market feature names / flag format |
 | `scripts/visualize_results.py` | Reads `round_summary.parquet` (post rows) |
 
-New shared module: `src/core/persona_params.py` — one mapping from `persona_config.yaml` names to `SimConfig` fields, used by the run script and by the orchestrator to record `params_used`.
+New shared module: `src/core/persona_params.py` — one mapping from `persona_config.yaml` names to `SimConfig` fields, used by the run script and by the orchestrator to record `params_used`. Its `enabled` flag is honoured in both directions (it could previously only disable a persona — see §12).
 
 ---
 
 ## 11. Tests
 
-69 → **104** tests, all passing. New or rewritten:
+69 → **111** tests, all passing. New or rewritten:
 
 | File | Covers |
 |---|---|
-| `tests/unit/test_detector.py` | Exact feature values on hand-built logs (spoof signature, fast cancels, wash counterparty features), MM exclusion, no NaN, trader-level labels, IsolationForest percentiles and SHAP, strict zero-positive error, flags schema round-trip, event detection and NaN latency |
-| `tests/unit/test_personas.py` | Spoof cycle structure, wash crosses inside the spread (and waiting at one-tick spreads), pump-and-dump phases, ≥90% self-cross in simulation, background activity, unique ids, tick grid |
+| `tests/unit/test_detector.py` | Exact feature values on hand-built logs (spoof signature, fast cancels, wash counterparty features, `layered_order_share`, `cancel_replace_ratio`), MM exclusion, no NaN, trader-level labels, IsolationForest percentiles and SHAP, strict zero-positive error, flags schema round-trip incl. `persona_scores`, event detection, NaN latency and episode coverage |
+| `tests/unit/test_personas.py` | Spoof cycle structure, wash crosses inside the spread (and waiting at one-tick spreads), pump-and-dump phases, ≥90% self-cross in simulation, background activity, unique ids, tick grid; repricing follows a moving touch (and does nothing when it doesn't move), flipping sells into the bid after the spoof is pulled, busy-period bias waits for activity, layering stacks distinct tapered levels with an opposite genuine order |
 | `tests/unit/test_agentic.py` | Bounds validation, no write on rejection, fallback indexing/clamping, all library variants valid, one re-prompt then fallback for the target round, LLM failure → fallback, tools report missing data, `query_flags` on real parquet, grounding check rejects invented numbers (all hermetic: real LLM calls would fail the test) |
 | `tests/unit/test_llm_client.py` | Routing to Cerebras only, no hidden SDK retries, cost recorded, key not logged, cache prevents re-billing, budget refusal sends nothing, fatal error → single attempt and provider disabled, bounded rate-limit retries, Gemini switch never reads the Cerebras key |
-| `tests/unit/test_effectiveness.py` | Neutered manipulation falls below the floor, baseline has an effect, score formula, one event per wash episode, cross-account spoof legs, config mapping |
+| `tests/unit/test_effectiveness.py` | Neutered manipulation falls below the floor for all four personas (fake-depth share for spoofing/layering), baseline has an effect, objective v2 formula (coverage/missed/delay, effect cap, complete escape = 1.0), one event per wash episode, cross-account spoof legs, config mapping, `enabled: true` turns a persona on, layering appears with the repo's baseline config |
 | `tests/integration/test_simulation_reproducibility.py` | New strict test: every log identical for the same seed, ids included |
 
 ---
@@ -410,6 +489,10 @@ New shared module: `src/core/persona_params.py` — one mapping from `persona_co
 | `#` in tactic card sources | YAML treated text as a comment | Quoted |
 | Stylized-facts script counted `"cancel"` events | Cancel ratios always 0% | Counts `"cancelled"` |
 | Results chart read old metric columns | Auto-chart failed after each run | Reads `round_summary.parquet` |
+| `enabled: true` in `persona_config.yaml` ignored (only `false` was applied) | Layering never ran in the first validation run (0 episodes, no classifier) even though the config enabled it | Flag applied in both directions; test added |
+| Pipeline left `persona_config.yaml` holding the last run's mutations and round snapshots (comments stripped) | Repo config changed after every run; edits to it could silently fail | Pipeline restores the file at the end of a run |
+| Cerebras "requests per minute" limit hit with 2 s spacing | One strategist turn failed (fell back to the hand-written mutation) | 6 s spacing, 20 s rate-limit back-off |
+| Spoofing effectiveness measured by noisy per-cycle price impact | Ratios swung −0.25× to 5.3×; good mutations could score 0 | Fake-depth share as primary measure (§5.4) |
 
 ---
 
@@ -432,6 +515,7 @@ New shared module: `src/core/persona_params.py` — one mapping from `persona_co
 
 ### 13.2 Cost
 Total Cerebras spend during development and both comparison runs: **$0.028** of the $4.50 cap (19 calls). One full 5-round LLM run: **$0.023**.
+Running total after all later work (8-commodity run, objective v2 and new-tactic validation runs, case-note tests): **$0.17** of the $4.50 cap. A 4-round run with four personas costs ~$0.03.
 
 ---
 
@@ -440,7 +524,7 @@ Total Cerebras spend during development and both comparison runs: **$0.028** of 
 1. **Pump-and-dumps barely move prices (~5 bp) and lose money.** Hedgers absorb the buying and trend followers amplify too little. Effectiveness therefore measures buying *pressure*, not realised lift. Next: strengthen trend-follower response so ignition can produce realistic 0.5–1.5% moves (as in Nefedova) without breaking the stylized facts.
 2. **Statistical power.** Results are from one seed. Run several seeds per arm before drawing conclusions about the LLM.
 3. **Calibration.** Calibrated values were left as they were (per instruction); `agent_config.yaml` is still not read by the simulator (defaults live in `SimConfig`).
-4. **Layering** is unchanged and disabled; it still uses random ids.
+4. **Spoofing and layering price impact is small** in this market (~0.2–1 bp per cycle), so effectiveness measures the fake displayed depth they create rather than the realised move. "Banging the close" (Optiver 2008, DRW 2013) was not implemented: it needs a settlement window in the simulator.
 5. **Remaining SRS items not built:** Docker/compose, CI, `seed_llm_cache.py` offline demo cache, price-impact-avoided counterfactual metric.
 6. **Old runs** in `data/runs` predate `flags.parquet`; the Flagged Trades tab asks to re-run the pipeline for them.
 7. **Older run folders may contain Gemini API keys** in `llm_calls.jsonl/.yaml` (written before the log fix). Check before sharing any run folder.
@@ -454,13 +538,14 @@ Total Cerebras spend during development and both comparison runs: **$0.028** of 
 - `src/core/persona_params.py` — persona config ↔ SimConfig mapping
 - `src/adversarial/effectiveness.py` — manipulation effectiveness and objective
 - `src/agentic/mutation_library.py` — hand-written mutation variants
+- `src/agentic/case_evidence.py` — behavioural evidence and mechanism descriptions for case notes
 - `docs/tactic_cards.yaml` — evasion tactic cards
 - `dashboard/components/tab_chat.py` — Analyst Chat tab
 - `tests/unit/test_detector.py`, `test_personas.py`, `test_agentic.py`, `test_llm_client.py`, `test_effectiveness.py`
 - `docs/CHANGES_overhaul.md` — this document
 
 **Substantially rewritten**
-- Simulator: `src/core/order_book.py`, `src/core/simulation.py`, `src/core/agents/base.py`, all four legitimate agents, `spoofing.py`, `wash_trading.py`, `pump_and_dump.py`
+- Simulator: `src/core/order_book.py`, `src/core/simulation.py`, `src/core/agents/base.py`, all four legitimate agents, `spoofing.py`, `wash_trading.py`, `pump_and_dump.py`, `layering.py`
 - Detector: `src/detector/features.py`, `anomaly.py`, `classifiers.py`, `pipeline.py`
 - Loop: `src/adversarial/orchestrator.py`, `metrics.py`
 - LLM: `src/agentic/llm_client.py`, `adversarial_strategist.py`, `tools.py`, `analyst_assistant.py` (and `narrative_generator.py` updated)

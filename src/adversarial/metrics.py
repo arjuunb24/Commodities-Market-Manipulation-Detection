@@ -12,6 +12,16 @@ Two levels, both per persona (SRS FR-2.6 — never one lumped number):
                latency = window_end of the first such flag − episode start
                (FR-2.7); missed episodes have NaN latency and are reported as
                misses, never averaged in as zero.
+               Episode coverage = share of each episode's own labelled
+               (account, window) rows that were flagged, averaged over episodes.
+               Unlike row recall it does not change when a mutation simply adds
+               more accounts (more rows) to an episode.
+  Caught       the same three event-level numbers (caught_coverage,
+               caught_events_detected, caught_latency_ticks) counted on ANY alert
+               (final_flag: any persona classifier or the anomaly model). An account
+               flagged under another persona's label is still caught; the
+               strategist's evasion score uses these, so relabelling (e.g. split
+               spoofing flagged as layering) is not rewarded as evasion.
 """
 
 from __future__ import annotations
@@ -42,12 +52,13 @@ def event_detection(
     results: pd.DataFrame,
     events: pd.DataFrame,
     persona: str,
+    flag_col: str | None = None,
 ) -> tuple[int, int, list[float]]:
     """Returns (n_events, n_detected, latencies_of_detected_events)."""
     ev = events[events["persona"] == persona] if events is not None and not events.empty else pd.DataFrame()
     if ev.empty:
         return 0, 0, []
-    flag_col = f"flag_{persona}"
+    flag_col = flag_col or f"flag_{persona}"
     if flag_col not in results.columns:
         return len(ev), 0, []
     hits = results[results[flag_col].astype(bool)].reset_index()
@@ -59,6 +70,24 @@ def event_detection(
         if not h.empty:
             latencies.append(float(max(0, int(h["window_end"].min()) - int(e["start_tick"]))))
     return len(ev), len(latencies), latencies
+
+
+def episode_coverage(results: pd.DataFrame, y: pd.DataFrame, events: pd.DataFrame, persona: str,
+                     flag_col: str | None = None) -> float:
+    """Mean over episodes of the flagged share of that episode's labelled rows (NaN if none)."""
+    ev = events[events["persona"] == persona] if events is not None and not events.empty else pd.DataFrame()
+    flag_col = flag_col or f"flag_{persona}"
+    if ev.empty or flag_col not in results.columns or persona not in y.columns:
+        return float("nan")
+    frame = results[[flag_col, "window_end"]].join(y[[persona]].rename(columns={persona: "_label"})).reset_index()
+    frame = frame[frame["_label"] == 1]
+    shares = []
+    for _, e in ev.iterrows():
+        rows = frame[(frame["commodity"] == e["commodity"]) & frame["trader_id"].isin(set(e["trader_ids"]))
+                     & (frame["window_end"] >= e["start_tick"]) & (frame["window_start"] <= e["end_tick"])]
+        if len(rows):
+            shares.append(float(rows[flag_col].astype(bool).mean()))
+    return round(float(np.mean(shares)), 4) if shares else float("nan")
 
 
 def compute_round_metrics(
@@ -99,7 +128,15 @@ def compute_round_metrics(
             "events_total": n_ev,
             "events_detected": n_det,
             "detection_latency_ticks": round(float(np.mean(lats)), 1) if lats else float("nan"),
+            "episode_coverage": episode_coverage(res, lab, events, persona) if events is not None else float("nan"),
         }
+        if events is not None and "final_flag" in res.columns:
+            c_ev, c_det, c_lats = event_detection(res, events, persona, flag_col="final_flag")
+            entry.update({
+                "caught_coverage": episode_coverage(res, lab, events, persona, flag_col="final_flag"),
+                "caught_events_detected": c_det,
+                "caught_latency_ticks": round(float(np.mean(c_lats)), 1) if c_lats else float("nan"),
+            })
         if y_true.sum() == 0:
             logger.warning("No positive labels for persona '%s' in this test set.", persona)
             entry.update({"precision": float("nan"), "recall": float("nan"), "f1": float("nan")})
@@ -203,6 +240,7 @@ def build_summary_table(all_metrics: list[dict[str, Any]]) -> pd.DataFrame:
                     "events_total": m.get("events_total", 0),
                     "events_detected": m.get("events_detected", 0),
                     "detection_latency_ticks": m.get("detection_latency_ticks"),
+                    "episode_coverage": m.get("episode_coverage"),
                     "effectiveness_ratio": (entry.get("effectiveness_ratio") or {}).get(persona),
                     "mutation_score": (entry.get("mutation_score") or {}).get(persona),
                 })
