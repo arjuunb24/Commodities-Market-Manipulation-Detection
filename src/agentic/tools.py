@@ -54,6 +54,8 @@ PARAM_BOUNDS: dict[str, dict[str, tuple[type, float, float, str]]] = {
         "reprice_to_touch": (int, 0, 1, "1 = keep the resting spoof pinned behind the moving best price (Sarao)"),
         "flip_after_cancel": (float, 0.0, 1.0, "chance of trading aggressively in the genuine direction when the spoof is pulled (Oystacher)"),
         "busy_period_bias": (float, 0.0, 1.0, "skip quiet periods; act mainly when the market is busy (advisory #5)"),
+        "cover_rate": (float, 0.0, 0.5, "per-account chance per tick of a genuine cover order inside the window (Sarao/Coscia traded genuinely too)"),
+        "cover_size": (float, 0.0, 3.0, "cover order size x average level depth; the detector's ratios are volume-weighted, so small cover barely dilutes"),
     },
     "wash_trading": {
         "trade_frequency": (float, 0.05, 1.0, "total cross rate per tick (split across groups)"),
@@ -82,9 +84,34 @@ PARAM_BOUNDS: dict[str, dict[str, tuple[type, float, float, str]]] = {
         "cancel_jitter": (float, 0.0, 0.8, "cancel delay drawn from delay x U(1-j, 1+j)"),
         "frequency": (float, 0.05, 1.0, "chance per tick to start a new layering cycle"),
         "busy_period_bias": (float, 0.0, 1.0, "skip quiet periods; act mainly when the market is busy (advisory #5)"),
+        "cover_rate": (float, 0.0, 0.5, "per-account chance per tick of a genuine cover order inside the window (Sarao/Coscia traded genuinely too)"),
+        "cover_size": (float, 0.0, 3.0, "cover order size x average level depth; the detector's ratios are volume-weighted, so small cover barely dilutes"),
     },
 }
 MUTABLE_PERSONAS = tuple(PARAM_BOUNDS)
+
+# Direction in which a knob LOWERS the persona's primary effect metric
+# (effectiveness.PRIMARY_METRIC). Only knobs whose effect cost follows from how
+# the metric is measured are listed:
+#   fake_depth_share   spoof/layer volume inside the +-0.2% near-touch band
+#   wash_volume_share  self-crossed share of market volume
+#   ignition_pressure  peak 60-tick share of market volume bought aggressively
+# Used by the effect guard (at risk: undo these; surplus: spend them on evasion).
+EFFECT_COST: dict[str, dict[str, str]] = {
+    "spoofing": {"order_size_multiplier": "down", "price_aggressiveness": "up"},
+    "layering": {"layer_spacing": "up", "n_layers": "down", "layer_size_multiplier": "down", "size_taper": "up"},
+    "wash_trading": {"trade_frequency": "down", "camouflage_rate": "up"},
+    "pump_and_dump": {"ignition_aggression": "down", "accumulation_size": "down",
+                      "n_coordinated_accounts": "down", "burst_duration_ticks": "up"},
+}
+
+
+def _costs_effect(persona: str, knob: str, old, new) -> bool:
+    """True when old -> new moves `knob` in the direction that lowers the effect."""
+    d = EFFECT_COST.get(persona, {}).get(knob)
+    if d is None or old is None or new is None or old == new:
+        return False
+    return (new > old) if d == "up" else (new < old)
 
 
 def validate_mutation(persona: str, parameters: Any) -> tuple[dict[str, Any] | None, str | None]:
@@ -345,6 +372,7 @@ class ToolRegistry:
         Is the persona's last evaluated parameter set still manipulating?
           status  "failed"  effect ratio < EFFECTIVENESS_FLOOR (score is 0)
                   "at_risk" effect ratio < EFFECT_AT_RISK
+                  "surplus" effect ratio >= EFFECT_SURPLUS (unused effect budget)
                   "ok"      otherwise (or no ratio yet)
           anchor  failed: the best effective past round (highest score among rounds
                   whose effect ratio cleared the floor; round 0 counts as
@@ -353,7 +381,7 @@ class ToolRegistry:
                   Returned with its params and the knob changes from it to the
                   last parameters.
         """
-        from src.adversarial.effectiveness import EFFECT_AT_RISK, EFFECTIVENESS_FLOOR
+        from src.adversarial.effectiveness import EFFECT_AT_RISK, EFFECT_SURPLUS, EFFECTIVENESS_FLOOR
         rows = [r for r in self.get_track_record(persona, max_rounds=50) if r["params"]]
         if not rows:
             return {"status": "ok"}
@@ -364,7 +392,11 @@ class ToolRegistry:
             status = "failed"
         elif ratio is not None and ratio < EFFECT_AT_RISK:
             status = "at_risk"
-        out = {"status": status, "round": last["round"], "effect_ratio": ratio}
+        elif ratio is not None and ratio >= EFFECT_SURPLUS:
+            status = "surplus"
+        out = {"status": status, "round": last["round"], "effect_ratio": ratio, "params": last["params"]}
+        if status == "surplus":
+            return out
         if status == "failed":   # reset target: best score among sets that still manipulated
             effective = [r for r in rows if r["round"] == 0 or (r.get("effect_ratio") or 0) >= EFFECTIVENESS_FLOOR]
             pick = lambda c: max(c, key=lambda r: ((r.get("score") or 0.0), r["round"]))  # noqa: E731
@@ -381,6 +413,46 @@ class ToolRegistry:
                                          if anchor["params"].get(k) != v},
             })
         return out
+
+    def enforce_effect_guard(self, persona: str, status: dict) -> dict[str, list]:
+        """
+        Code-enforced at-risk rule, applied AFTER this round's mutation for a
+        persona whose effect was at risk (see effect_status):
+          1. any NEW change that lowers the effect (EFFECT_COST, versus the last
+             round's parameters) is undone;
+          2. if the proposal undid none of the effect-costing changes made since
+             the anchor round, all of them are reverted to the anchor values
+             (evasion-only knobs such as cancel timing are left as proposed).
+        Returns {knob: [value_before_guard, value_after]} (empty when nothing changed).
+        """
+        if status.get("status") != "at_risk":
+            return {}
+        cfg = self._load_persona_config()
+        cur = dict(cfg.get(persona) or {})
+        last, anchor = status.get("params") or {}, status.get("anchor_params") or {}
+        reverts: dict[str, list] = {}
+        for k, v in list(cur.items()):
+            if _costs_effect(persona, k, last.get(k), v):
+                reverts[k] = [v, last[k]]
+                cur[k] = last[k]
+        harmful = {k: (anchor[k], last[k]) for k in EFFECT_COST.get(persona, {})
+                   if k in anchor and k in last and _costs_effect(persona, k, anchor[k], last[k])}
+        undone = any(cur.get(k) != was for k, (_a, was) in harmful.items())
+        if harmful and not undone:
+            for k in harmful:
+                reverts[k] = [cur.get(k), anchor[k]]
+                cur[k] = anchor[k]
+        if reverts:
+            res = self.propose_mutation(persona, {k: v for k, (_old, v) in reverts.items()}, reasoning="effect guard")
+            if "error" in res:
+                logger.warning(f"[Tools] effect guard for {persona} failed: {res['error']}")
+                return {}
+            logger.info(f"[Tools] {persona}: effect at risk, guard reverted {reverts}")
+        return reverts
+
+    def effect_costing_knobs(self, persona: str) -> str:
+        """Prompt text: which knob directions lower this persona's effect."""
+        return ", ".join(f"{k} {d}" for k, d in EFFECT_COST.get(persona, {}).items())
 
     def recover_effect(self, persona: str) -> dict | None:
         """

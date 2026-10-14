@@ -3,6 +3,8 @@ round_0:
     busy_period_bias: 0.0
     cancel_jitter: 0.0
     cancellation_delay_ticks: 5
+    cover_rate: 0.0
+    cover_size: 0.0
     enabled: true
     frequency: 0.3
     layer_size_multiplier: 2.0
@@ -23,6 +25,8 @@ round_0:
     busy_period_bias: 0.0
     cancel_jitter: 0.0
     cancellation_delay_ticks: 5
+    cover_rate: 0.0
+    cover_size: 0.0
     enabled: true
     flip_after_cancel: 0.0
     frequency: 0.4

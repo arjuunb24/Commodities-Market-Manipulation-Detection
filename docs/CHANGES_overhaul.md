@@ -334,6 +334,141 @@ Fixes:
   - The per-round parameter history and the console parameter table now include layering.
 - **Tests (+3, 114 total):** any-alert evasion versus own label; failed-effect reset to the best effective round; at-risk warns without resetting.
 
+**Validation run `guard_v1`** (8 commodities, 5 rounds, LLM, $0.05). Frozen any-alert coverage r1→r4:
+
+| Persona | Coverage | Effect |
+|---|---|---|
+| Spoofing | 1.00 → 0.91 | 1.00× → 1.04× |
+| Wash trading | 0.90 → **0.76** | kept 0.86× |
+| Layering | 0.94–0.99 | 0.87× → 0.56× |
+| Pump-and-dump | best 0.19 (round 2) | rose to 1.84× |
+
+- Two relabel "escapes" were correctly scored about 0.03: split spoofing caught as layering (own-label 0.37), and 2-layer layering caught as spoofing (own-label 0.00).
+- Effects stayed well above the previous run's.
+- Layering re-applied wide spacing in round 3 and **ignored the at-risk note** in round 4, so the effect fell to 0.56×. No reset fired, because the floor was not crossed.
+- Pump-and-dump kept pushing the same three knobs while its effect ran far above 1×, which earns nothing.
+
+### 5.9 Enforced at-risk guard, effect surplus, measured layering limit
+- **Effect-cost table (`tools.EFFECT_COST`).** The direction in which each knob lowers the primary effect metric, from how the metric is measured:
+  - spoofing: size down, `price_aggressiveness` up
+  - layering: spacing up, layers down, size down, taper up
+  - wash trading: frequency down, camouflage up
+  - pump-and-dump: ignition aggression down, accumulation size down, accounts down, burst duration up
+- **Enforced at-risk rule (`ToolRegistry.enforce_effect_guard`), run after the proposal (LLM or hand):**
+  1. Any new effect-costing change relative to last round is undone.
+  2. If the proposal undid none of the effect-costing changes made since the anchor round, all of them are reverted to the anchor values. Evasion-only knobs (cancel timing, jitter, busy periods) and effect-raising changes are kept.
+  - **Why all of them, not just the largest:** on guard_v1, "largest by bound range" would pick `n_layers`, but the measurement below shows spacing is the culprit.
+  - Recorded as `effect_guard_reverts` in `strategist.json` and the reasoning log, and shown as a dashboard caption.
+  - On guard_v1 round 4, the guard would have restored spacing to 0.0002 and layers to 4, keeping 3× size and the new cancel timing.
+- **Effect surplus (`EFFECT_SURPLUS = 1.5`).** The context says "EFFECT SURPLUS: … spend it on evasion" and lists the effect-costing directions and never-changed knobs. Prompt rule 6. On guard_v1 this fires for pump-and-dump (1.84×).
+- **The at-risk note** now lists the effect-costing directions and asks the model to undo at least one listed change, warning that the code reverts them otherwise.
+- **Measured layering limit** (crude oil, 2 seeds; effect vs. baseline 4 × 0.0002):
+  - 4 × 0.0003 and 4 × 0.0004: 1.00×
+  - 4 × 0.0005 and 3 × 0.0005: 0.88×
+  - 3 × 0.001 and 2 × 0.001: **0.42×**
+  - 6 × 0.00025: 1.20×
+  
+  The layering tactic card now states a hard limit of `layer_spacing ≤ 0.0004` with these numbers, and notes that fewer than 3 layers get caught as spoofing.
+- **Tests (+3, 117 total):** guard_v1 scenario reverts spacing and layer count while keeping evasion knobs; a new effect-costing change is undone on its own; surplus status.
+
+**Validation run `guard_v2`** (same settings, $0.05). Frozen any-alert coverage r1→r4:
+
+| Persona | Coverage | Effect | Retrained F1 |
+|---|---|---|---|
+| Spoofing | 1.00 → **0.74** (3 accounts, 30-tick jittered cancels) | 0.94× | **0.80** (was 0.93) |
+| Wash trading | 0.86 → 0.78–0.80 | 0.73–0.89× | — |
+| Layering | 0.97–0.99 | 0.60–0.86× | — |
+| Pump-and-dump | best 0.36 | about 1.0× (surplus spent on gentler ignition) | — |
+
+- Layering's effect held until round 4, when dropping to 3 layers pushed it to 0.60×. The run ended before the guard could act.
+
+### 5.10 Why spoofing, layering and wash trading stay caught: frozen-detector probes and cover trading
+Question: are the LLM's mutations for the three non-pump personas too weak, or is there no room to evade?
+
+**Probe method.**
+- The detector was trained exactly as frozen before guard_v1's round 4 (rounds 0–3).
+- Each parameter bundle was simulated on 8 markets: crude oil, gold, natural gas and corn, with 2 seeds each, 10,000 ticks, and one episode per persona per market.
+- Measured per persona: any-alert coverage, own-label coverage, the share flagged by the anomaly model (IsolationForest) and by the supervised classifiers, and effect versus baseline.
+
+| Bundle | Spoofing any / own / IF / effect | Wash any / own / IF / effect | Layering any / own / IF / effect |
+|---|---|---|---|
+| Baseline | 1.00 / 0.96 / 1.00 / 1.00 | 0.99 / 0.99 / 0.81 / 1.00 | 1.00 / 0.93 / 1.00 / 1.00 |
+| LLM best (guard_v1 r4) | 0.92 / 0.73 / 0.92 / 1.06 | 0.75 / 0.74 / 0.12 / 0.87 | 0.99 / 0.88 / 0.99 / 0.62 |
+| Low frequency | 1.00 / 0.77 / 1.00 / 1.01 | 0.95 / 0.95 / 0.63 / **0.40** | 0.99 / 0.83 / 0.99 / 0.98 |
+| Heavy combination | 0.75 / **0.12** / 0.76 / 0.92 | 0.36 / 0.31 / 0.08 / **0.28** | 1.00 / 0.98 / 1.00 / 0.84 |
+| Reprice/flip, rings, small layers | 0.98 / 0.78 / 0.98 / 0.98 | **0.61** / 0.59 / 0.03 / 0.63 | 0.98 / 0.94 / 0.98 / 0.83 |
+
+**Findings.**
+- No setting of the existing knobs gets spoofing or layering past the frozen detector: the **IsolationForest flags 76–100 %** of their windows in every bundle, even when the supervised classifier is beaten (spoofing 0.12).
+- The reason is in the simulator. Inside the window, manipulator accounts did nothing but manipulate, so they are extreme on volume-weighted features. With heavy timing evasion, spoofer medians are:
+  - average order size 9× the market median (normal 99th percentile: 3.6×);
+  - `large_order_share` 0.90 (normal 99th percentile: 0.41);
+  - `fill_ratio` 0.18 (normal: about 0.86).
+  
+  Layering adds `layered_order_share`.
+- Wash trading has real room (0.61 at 0.63×), but stronger dilution falls below the effect floor.
+
+**Cover trading (new knobs `cover_rate` and `cover_size`, spoofing and layering only).**
+- **Mechanism:** inside the window each account also sends genuine orders (`ManipulatorAccount.cover_order`, audit tag `v`): 35 % marketable, otherwise passive at its own touch, leaning against its position so it stays flat. This mirrors Sarao and Coscia trading genuinely alongside their spoofs.
+- **Size:** `cover_size` sizes these orders as a multiple of average level depth (0 = small 5–40 lot orders). The depth reference is frozen at the account's first cover order: sizing off live depth fed back on the account's own resting cover and overflowed.
+- **Wiring:** `SimConfig.spoof_cover_*` and `layer_cover_*`, `PERSONA_PARAM_MAP`, `PARAM_BOUNDS` (rate 0–0.5, size 0–3), recorded in episode parameters, baseline 0.
+
+**Measured results.**
+- Small cover (0.4/tick, 5–40 lots) barely moves the volume-weighted ratios: cancel ratio 0.95 → 0.88.
+- Sizeable cover beats the supervised classifiers: spoofing own-label coverage 0.96 → 0.74 at 0.5 × 3 depth, and **0.01** when combined with the LLM's best set.
+- But it makes the account an unusually big trader, so the IsolationForest still flags 99–100 %.
+- **Wash trading excluded:** the ring accounts' cover orders filled against each other and inflated wash volume (2–4×). Wash trading already has `camouflage_rate`.
+
+**Conclusion.** For spoofing and layering, the ceiling is not the LLM. The legitimate population (20 noise, 8 momentum, 6 mean-reversion traders and 1 market maker) has no participants that place large orders or cancel heavily. Any account that does is an outlier. Real markets have many such legitimate participants: HFT market makers cancel over 90 % of orders, and institutional execution algorithms rest and pull large orders. That is why spoofing surveillance is hard in practice.
+- **Tests (+1, 118 total):** cover orders appear only inside the window, are off by default, have bounded size, and are recorded in episode parameters.
+
+### 5.11 Legitimate look-alike traders (hard negatives)
+- **From:** the legitimate population was 20 noise traders, 8 momentum traders, 6 mean-reversion traders and 1 market maker. None of them placed large orders or cancelled heavily, so any account doing either was an outlier, and the anomaly model caught spoofing and layering regardless of tactics.
+- **To:** two legitimate agent types, both on by default (`SimConfig.n_hft_liquidity_providers = 3`, `n_execution_algos = 3`), dispatched through the batch path (`decide_batch`) with read-only `bind_book(is_resting)` so they never send rejected cancels.
+  - **`HFTLiquidityProvider`** (`src/core/agents/hft_liquidity_provider.py`):
+    - Requotes with probability 0.8 per tick (cancel-and-replace).
+    - Ladders of 1–3 levels per side, at least 1 bp apart, never inside 1 level-step of the mid. On fine-tick gold, joining the touch pinned the spread at one tick and made prices drift in small staircase-like steps.
+    - Sizes 0.2–0.6× a slowly averaged level depth.
+    - Inventory cap scales with quote size; beyond half the cap it quotes one side only and occasionally flattens.
+  - **`ExecutionAlgo`** (`src/core/agents/execution_algo.py`):
+    - Parent orders of 5–20× level depth.
+    - One child order at or one tick behind the touch, heavy-tailed 1–8× depth, cancelled and reposted when the price moves away or after 3–15 ticks.
+    - Occasional marketable slices and small opposite-side hedges.
+- **Why:** real markets are full of these participants. HFT firms cancel over 90 % of orders, and institutional algorithms rest and pull large orders. That is what makes spoofing surveillance hard in practice.
+
+**Measured profiles** (crude oil, medians per account-window):
+
+| Account type | Avg size | Max size | Large share | Cancel ratio | Fill ratio | Layered share | Spoof signature |
+|---|---|---|---|---|---|---|---|
+| HFT | 3.3× | 5.7× | 0.39 | 0.93 | 0.07 | 0.43 | 0.47 |
+| Algo | 13× | 36× | 0.99 | 0.68 | 0.31 | 0 | 0.20 |
+| Layering | 10× | 24× | 0.98 | 0.98 | 0.02 | 0.98 | 0.92 |
+| Spoofing | 35× | 104× | 0.99 | 0.99 | 0.01 | 0 | 0.96 |
+
+**Calibration check** (60-tick return std vs. the target daily vol ÷ √390):
+- Gold: 7.3e-4 → **5.3e-4**, target 4.8e-4. The look-alikes removed excess microstructure noise.
+- Crude: 1.6e-3, unchanged.
+- Natural gas: 2.5e-3 → 2.8e-3, and corn 1.4e-3 → 1.5e-3 (single seed).
+- Autocorrelation essentially unchanged.
+- Simulation time +1–8 s per market.
+
+**Frozen-detector probe with look-alikes.** The detector was trained on the baseline plus guard_v2's round 1–3 mutations, re-simulated; the test markets used fresh seeds.
+
+| Bundle | Spoofing caught / effect | Layering caught / effect | Wash caught / effect |
+|---|---|---|---|
+| Baseline | 1.00 / 1.00× | 1.00 / 1.00× | 0.99 / 1.00× |
+| guard_v2 round-4 LLM params | **0.58** / 0.85× (0.92 before look-alikes) | 0.97 / 0.73× | 0.75 / 0.86× |
+| Round-4 params + cover 0.3 × 1.0 | **0.52** / 0.91× | **0.65** / 0.74× | — |
+| Algo-sized orders (spoof 4×, layers 1.2×) + cover | **0.31** / 0.64× | 0.68 / 0.63× | — |
+
+- Unmodified manipulation is still caught 100 %.
+- Evasion is now possible but costs effect: the closer a spoof gets to algo size, the less fake depth it makes.
+- The IsolationForest catches 13–45 % of spoofer windows, down from 76–100 %.
+- **New realistic false-positive pressure:** 13–15 % of look-alike account-windows are falsely flagged. Ordinary legitimate traders stay at about 0 %.
+- Wash trading is unaffected, because the look-alikes do not trade with themselves.
+- **Tactic cards:** an "Algo-sized orders" card was added for spoofing with these numbers, and the cover-trading cards were updated.
+- **Tests:** `test_pipeline_end_to_end_flags_schema` assumed the first flagged row's score is the predicted persona's probability. With look-alikes, the first flag can be anomaly-triggered, or the highest probability and the largest margin can be different personas. The test now checks the real invariant: on classifier-only flags, `final_score` equals the highest persona probability. 118 tests pass.
+
 ---
 
 ## 6. LLM / agentic layer

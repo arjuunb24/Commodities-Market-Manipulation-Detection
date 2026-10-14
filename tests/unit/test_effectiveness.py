@@ -172,3 +172,73 @@ def test_effect_at_risk_warns_without_reset(tmp_path):
     assert tools.effect_status("layering")["status"] == "at_risk"
     assert tools.recover_effect("layering") is None
     assert yaml.safe_load(cfg.read_text())["layering"]["n_layers"] == 3
+
+
+def test_effect_guard_reverts_ignored_effect_costing_changes(tmp_path):
+    """guard_v1 round 4: layering at risk (0.59x) after spacing 0.0002->0.001 and 4->2 layers;
+    the model only touched cancel timing, so the guard restores spacing and layer count."""
+    import yaml
+    from src.agentic.tools import ToolRegistry
+    run = tmp_path / "run"
+    r2 = {"layer_spacing": 0.0002, "n_layers": 4, "layer_size_multiplier": 2.0, "cancel_jitter": 0.7}
+    r3 = {"layer_spacing": 0.001, "n_layers": 2, "layer_size_multiplier": 3.0, "cancel_jitter": 0.8}
+    _write_round(run, 0, {**r2, "cancel_jitter": 0.0}, 1.0, None)
+    _write_round(run, 2, r2, 0.75, 0.05)
+    _write_round(run, 3, r3, 0.59, 0.04)
+    cfg = tmp_path / "persona_config.yaml"
+    cfg.write_text(yaml.dump({"layering": {**r3, "cancel_jitter": 0.6}}))   # the model's proposal
+    tools = ToolRegistry(run_dir=run, persona_config_path=cfg)
+
+    st = tools.effect_status("layering")
+    assert st["status"] == "at_risk" and st["anchor_round"] == 2
+    reverts = tools.enforce_effect_guard("layering", st)
+    assert reverts == {"layer_spacing": [0.001, 0.0002], "n_layers": [2, 4]}
+    written = yaml.safe_load(cfg.read_text())["layering"]
+    assert written["cancel_jitter"] == 0.6 and written["layer_size_multiplier"] == 3.0   # evasion/helpful knobs kept
+
+
+def test_effect_guard_undoes_new_effect_costing_change_only(tmp_path):
+    import yaml
+    from src.agentic.tools import ToolRegistry
+    run = tmp_path / "run"
+    r1 = {"layer_spacing": 0.0002, "n_layers": 4, "layer_size_multiplier": 2.0}
+    r2 = {"layer_spacing": 0.0005, "n_layers": 4, "layer_size_multiplier": 2.0}
+    _write_round(run, 0, r1, 1.0, None)
+    _write_round(run, 1, r2, 0.6, 0.1)
+    cfg = tmp_path / "persona_config.yaml"
+    # the model undid the spacing change but newly shrank the layers
+    cfg.write_text(yaml.dump({"layering": {**r2, "layer_spacing": 0.0003, "layer_size_multiplier": 1.0}}))
+    tools = ToolRegistry(run_dir=run, persona_config_path=cfg)
+    reverts = tools.enforce_effect_guard("layering", tools.effect_status("layering"))
+    assert reverts == {"layer_size_multiplier": [1.0, 2.0]}
+    assert yaml.safe_load(cfg.read_text())["layering"]["layer_spacing"] == 0.0003
+
+
+def test_effect_surplus_status(tmp_path):
+    from src.agentic.tools import ToolRegistry
+    run = tmp_path / "run"
+    _write_round(run, 0, {"stagger": 0.0}, 1.0, None)
+    _write_round(run, 1, {"stagger": 0.9}, 1.8, 0.2)
+    tools = ToolRegistry(run_dir=run, persona_config_path=tmp_path / "none.yaml")
+    st = tools.effect_status("layering")
+    assert st["status"] == "surplus"
+    assert tools.enforce_effect_guard("layering", st) == {}
+
+
+def test_cover_trading_inside_window_and_bounded():
+    def run(rate, size):
+        out = run_simulation(SimConfig(commodity="gold", n_ticks=1500, write_to_disk=False,
+                                       enable_wash_trading=False, enable_pump_and_dump=False,
+                                       spoof_start_tick=200, spoof_end_tick=700,
+                                       spoof_cover_rate=rate, spoof_cover_size=size), 5)
+        o = out.order_log
+        cover = o[(o["event_type"] == "placed") & o["order_id"].str.endswith("v")]
+        return out, cover
+    out, cover = run(0.0, 0.0)
+    assert cover.empty                                                   # off by default
+    out, cover = run(0.4, 2.0)
+    assert len(cover) > 50 and cover["tick"].between(200, 700).all()     # only inside the window
+    assert cover["quantity"].max() < 50 * cover["quantity"].median()     # no depth feedback runaway
+    ev = out.manipulation_events
+    params = ev[ev["persona"] == "spoofing"].iloc[0]["parameters"]
+    assert params["cover_rate"] == 0.4 and params["cover_size"] == 2.0

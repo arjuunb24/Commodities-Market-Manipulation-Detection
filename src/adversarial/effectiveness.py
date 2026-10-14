@@ -42,6 +42,7 @@ PRIMARY_METRIC = {
 }
 EFFECTIVENESS_FLOOR = 0.5   # a mutation must keep >= 50% of the round-0 effect
 EFFECT_AT_RISK = 0.65       # early warning: the next effect-reducing change likely crosses the floor
+EFFECT_SURPLUS = 1.5        # effect this far above round 0 is unused budget that could buy evasion
 PRESSURE_WINDOW = 60        # ticks
 
 

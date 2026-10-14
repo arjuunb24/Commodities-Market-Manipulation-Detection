@@ -63,7 +63,8 @@ def _print_rows(df) -> None:
 
 def write_strategist_record(run_dir: Path, round_num: int, personas: list[str],
                             source: dict[str, str], reasoning: dict[str, str],
-                            recovered: dict[str, int] | None = None) -> None:
+                            recovered: dict[str, int] | None = None,
+                            guard_reverts: dict[str, dict] | None = None) -> None:
     """
     round_N/strategist.json: who chose each persona's parameters for round N, the
     exact changes (old -> new, versus the parameters used in round N-1) and the
@@ -88,6 +89,9 @@ def write_strategist_record(run_dir: Path, round_num: int, personas: list[str],
         if (recovered or {}).get(p) is not None:
             # effect fell below the floor last round: parameters were reset to this round's set first
             record["personas"][p]["effect_recovery_from_round"] = recovered[p]
+        if (guard_reverts or {}).get(p):
+            # effect was at risk: these knobs were reverted by the guard after the proposal
+            record["personas"][p]["effect_guard_reverts"] = guard_reverts[p]
     out = run_dir / f"round_{round_num}"
     out.mkdir(parents=True, exist_ok=True)
     (out / "strategist.json").write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -259,11 +263,15 @@ def main():
                             st = strategist.tools.recover_effect(p)
                             if st:
                                 result["recovered"][p] = st.get("anchor_round")
+                            status = strategist.tools.effect_status(p)
                             fb = get_fallback_mutation(p, round_num)
                             res = strategist.tools.propose_mutation(p, fb["parameters"], fb["reasoning"])
                             if "error" not in res:
                                 result["source"][p] = "hand_authored"
                                 result["reasoning"][p] = fb["reasoning"]
+                            if not st and (rev := strategist.tools.enforce_effect_guard(p, status)):
+                                result.setdefault("guard_reverts", {})[p] = rev
+                                result["reasoning"][p] = (result["reasoning"].get(p, "") + f"\n[effect guard] reverted {rev}").strip()
                     else:
                         result = strategist.run_strategist_round(
                             round_num=round_num - 1,  # Strategist reads the PREVIOUS round's metrics
@@ -274,7 +282,8 @@ def main():
 
                     # --- Structured record of this round's mutation (read by the dashboard) ---
                     write_strategist_record(master_run_dir, round_num, personas_to_mutate, mutation_source,
-                                            result.get("reasoning", {}), result.get("recovered", {}))
+                                            result.get("reasoning", {}), result.get("recovered", {}),
+                                            result.get("guard_reverts", {}))
 
                     # --- Print and Log Reasoning ---
                     reasonings = result.get("reasoning", {})

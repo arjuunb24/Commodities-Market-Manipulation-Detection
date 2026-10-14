@@ -573,6 +573,9 @@ def _render_strategist_card(persona: str, d: dict) -> None:
     if d.get("effect_recovery_from_round") is not None:
         st.caption(f"⚠ Effect had fallen below half of round 0 — parameters were reset to round "
                    f"{d['effect_recovery_from_round']} before this mutation.")
+    if d.get("effect_guard_reverts"):
+        reverted = ", ".join(f"`{k}` {_fmt_val(a)} → {_fmt_val(b)}" for k, (a, b) in d["effect_guard_reverts"].items())
+        st.caption(f"⚠ Effect was at risk — the guard reverted {reverted} after the proposal.")
     if d.get("episodes_caught"):
         st.caption(f"Episodes caught by frozen detector: {d['episodes_caught']} · "
                    f"mean detection delay: {_fmt_num(d.get('frozen_delay'))} ticks")

@@ -345,6 +345,7 @@ def load_strategist_history(run_dir_str: str) -> list[dict]:
                                     if pre else None),
                 "frozen_delay": pre.get("caught_latency_ticks", pre.get("detection_latency_ticks")),
                 "effect_recovery_from_round": r.get("effect_recovery_from_round"),
+                "effect_guard_reverts": r.get("effect_guard_reverts"),
                 "retrained_recall": post.get("recall"),
                 "effect_ratio": (m.get("effectiveness_ratio") or {}).get(p),
                 "score": (m.get("mutation_score") or {}).get(p),

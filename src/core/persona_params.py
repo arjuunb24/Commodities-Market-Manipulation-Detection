@@ -27,6 +27,8 @@ PERSONA_PARAM_MAP: dict[str, dict[str, tuple[str, type]]] = {
         "reprice_to_touch": ("spoof_reprice", int),
         "flip_after_cancel": ("spoof_flip", float),
         "busy_period_bias": ("spoof_busy_bias", float),
+        "cover_rate": ("spoof_cover_rate", float),
+        "cover_size": ("spoof_cover_size", float),
     },
     "wash_trading": {
         "trade_frequency": ("wash_frequency", float),
@@ -57,6 +59,8 @@ PERSONA_PARAM_MAP: dict[str, dict[str, tuple[str, type]]] = {
         "cancel_jitter": ("layer_cancel_jitter", float),
         "frequency": ("layer_frequency", float),
         "busy_period_bias": ("layer_busy_bias", float),
+        "cover_rate": ("layer_cover_rate", float),
+        "cover_size": ("layer_cover_size", float),
     },
 }
 ENABLE_FLAGS = {

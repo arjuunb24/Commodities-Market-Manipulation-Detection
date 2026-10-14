@@ -9,6 +9,17 @@ small discretionary trader outside its manipulation window (background
 activity). Without this, an account that only exists while manipulating would
 let a detector key on "new account appears" rather than on the behaviour
 itself, and trader-level ground truth would be trivially separable.
+
+Cover trading (`cover_rate`): real manipulators kept trading genuinely while
+they manipulated (Sarao and Coscia ran ordinary flow next to their spoof
+orders), so the manipulative orders were a minority of the account's activity.
+With cover_rate > 0 every account keeps sending small genuine orders inside the
+window too, passive at its own touch or marketable, leaning against its
+position so it stays flat. `cover_size` sets their size as a multiple of the
+average visible level depth (0 = small retail-size orders). The detector's
+cancel/fill/large-order ratios are volume-weighted, so only cover volume
+comparable to the scheme's own volume dilutes them. Cost: inventory risk, and
+genuine resting depth that offsets the fake depth on the spoofed side.
 """
 
 from __future__ import annotations
@@ -38,6 +49,7 @@ class ManipulatorAccount(Agent):
         super().__init__(trader_id, rng)
         self.background_rate = background_rate
         self.net_position = 0
+        self._cover_depth_ref: float | None = None
 
     def update_inventory(self, side: Side, quantity: int) -> None:
         self.net_position += quantity if side == Side.BUY else -quantity
@@ -54,6 +66,26 @@ class ManipulatorAccount(Agent):
         price = ref * (1 + self.rng.uniform(-0.002, 0.002))
         qty = int(self.rng.integers(5, 40))
         return self.limit(side, price, qty, tick)
+
+    def cover_order(self, book_state: BookState, tick: int, size_mult: float = 0.0) -> Order | None:
+        """One genuine order inside the manipulation window (audit tag "v")."""
+        bid, ask = book_state.best_bid, book_state.best_ask
+        if bid is None or ask is None or bid <= 0 or ask <= bid:
+            return None
+        if size_mult > 0:
+            # Depth reference frozen at the first cover order: large resting cover
+            # orders deepen the book, and sizing off the live depth would feed back.
+            if self._cover_depth_ref is None:
+                levels = book_state.bid_depth + book_state.ask_depth
+                self._cover_depth_ref = sum(q for _, q in levels) / max(1, len(levels)) or 50.0
+            qty = max(5, int(self._cover_depth_ref * size_mult * self.rng.uniform(0.5, 1.5)))
+        else:
+            qty = int(self.rng.integers(5, 40))
+        p_buy = 0.5 - 0.4 * float(np.clip(self.net_position / (10.0 * qty + 150.0), -1, 1))
+        side = Side.BUY if self.rng.random() < p_buy else Side.SELL
+        if self.rng.random() < 0.35:   # take liquidity: trade at the opposite touch
+            return self.limit(side, ask if side == Side.BUY else bid, qty, tick, ttl=3, tag="v")
+        return self.limit(side, bid if side == Side.BUY else ask, qty, tick, tag="v")
 
 
 BAND = 0.002   # same ±0.2% near-touch band the book uses for its imbalance signal
@@ -95,22 +127,37 @@ class ManipulationController(ABC):
         # manipulation hides among elevated, naturally explainable activity.
         # 0 = ignore market activity; 1 = never act in quiet periods.
         self.busy_period_bias = float(busy_period_bias)
+        # Per-account chance per tick of a genuine cover order inside the window (see module doc).
+        self.cover_rate = 0.0
+        self.cover_size = 0.0   # cover order size x average level depth (0 = small orders)
 
     def in_window(self, tick: int) -> bool:
         return self.start_tick <= tick <= self.end_tick
 
     def decide_batch(self, state: BookState, tick: int) -> list[Order]:
         if self.in_window(tick):
+            cover = self._cover_orders(state, tick)
             if self.busy_period_bias > 0 and state.baseline_volume > 0 and not state.is_busy():
                 rng = getattr(self, "rng", None) or self.accounts[0].rng
                 if rng.random() < self.busy_period_bias:
-                    return []   # quiet market: wait for cover
-            return self.manipulate(state, tick)
+                    return cover   # quiet market: wait for cover
+            return self.manipulate(state, tick) + cover
         orders = []
         for acct in self.accounts:
             o = acct.decide(state, tick)
             if o is not None:
                 orders.append(o)
+        return orders
+
+    def _cover_orders(self, state: BookState, tick: int) -> list[Order]:
+        if self.cover_rate <= 0:
+            return []
+        orders = []
+        for acct in self.accounts:
+            if acct.rng.random() < self.cover_rate:
+                o = acct.cover_order(state, tick, self.cover_size)
+                if o is not None:
+                    orders.append(o)
         return orders
 
     @abstractmethod
@@ -138,5 +185,5 @@ class ManipulationController(ABC):
             "start_tick": self.start_tick,
             "end_tick": self.ground_truth_end(),
             "trader_ids": [a.trader_id for a in self.accounts],
-            "parameters": self.parameters_snapshot(),
+            "parameters": {**self.parameters_snapshot(), "cover_rate": self.cover_rate, "cover_size": self.cover_size},
         }

@@ -308,7 +308,7 @@ def _case_evidence(run_dir_str: str, round_num: int, market: str | None, persona
                    commodity: str, start: int, end: int) -> dict:
     from src.agentic.case_evidence import build_case_evidence
     trades = load_trade_log(run_dir_str, round_num, market)
-    if persona in ("spoofing", "anomaly"):
+    if persona in ("spoofing", "layering", "anomaly"):   # order-based schemes need the order log
         orders = load_order_log(run_dir_str, round_num, market)
     else:
         orders = pd.DataFrame(columns=["order_id", "trader_id", "side", "price", "quantity", "tick", "event_type", "commodity"])
@@ -535,9 +535,11 @@ def _render_case(idx: int, case: pd.Series, trades: pd.DataFrame, run_dir: Path,
 
         with st.expander("Show the account's raw orders and trades in this span"):
             orders = load_order_log(str(run_dir), selected_round, market)
-            o = orders[(orders["trader_id"] == case["trader_id"])
+            # trader ids repeat across commodities, so the commodity must be matched too
+            o = orders[(orders["commodity"] == case["commodity"]) & (orders["trader_id"] == case["trader_id"])
                        & orders["tick"].between(case["start_tick"], case["end_tick"])]
-            t = trades[((trades["buyer_trader_id"] == case["trader_id"]) | (trades["seller_trader_id"] == case["trader_id"]))
+            t = trades[(trades["commodity"] == case["commodity"])
+                       & ((trades["buyer_trader_id"] == case["trader_id"]) | (trades["seller_trader_id"] == case["trader_id"]))
                        & trades["tick"].between(case["start_tick"], case["end_tick"])]
             st.markdown(f"Orders ({len(o)})")
             st.dataframe(o.drop(columns=["timestamp"], errors="ignore").head(500), use_container_width=True, hide_index=True)

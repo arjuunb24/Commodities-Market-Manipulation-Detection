@@ -49,6 +49,16 @@ spoofing:
     knobs: {price_aggressiveness: up}
     weakens: [passive_distance_bp]
     cost: STRONG — depth beyond ~0.2% barely moves prices (effectiveness collapses)
+  - tactic: Hide spoofs inside genuine trading
+    source: "Sarao (NAV) and Coscia traded genuinely alongside the spoof orders; the spoofs were a minority of their flow"
+    knobs: {cover_rate: up, cover_size: up}
+    weakens: [avg_order_size_rel, large_order_share, fill_ratio, cancel_ratio, fast_cancel_ratio, aggressor_ratio]
+    cost: "inventory risk; genuine resting orders slightly offset the fake depth. Does not hide max_order_size_rel or spoof_signature. Ratios are volume-weighted: cover_size ~1 needed to dilute (measured with cover 0.3 x 1.0: spoofing caught 0.52, layering 0.65); cover_size near 3 makes the account an outlier again"
+  - tactic: Algo-sized orders
+    source: "Real execution algorithms rest and chase large child orders (1-8x level depth); spoofs near that size blend in"
+    knobs: {order_size_multiplier: down}
+    weakens: [max_order_size_rel, avg_order_size_rel, large_cancel_ratio vs. look-alike algos]
+    cost: "STRONG on effect: measured 4x size + cover 0.2 -> caught 0.31 but effect 0.64x; stay above ~4"
 
 wash_trading:
   - tactic: Trade in busy periods
@@ -124,7 +134,7 @@ layering:
     source: Tower round 2 — 2-6 layers, varied spacing
     knobs: {n_layers: down, layer_spacing: up}
     weakens: [layered_order_share (needs >= 3 levels), n_orders]
-    cost: below 3 levels it is just split spoofing; wide spacing moves depth away from the touch
+    cost: "HARD LIMIT layer_spacing <= 0.0004 (measured: 0.0004 keeps 1.0x, 0.0005 0.88x, 0.001 only 0.42x with 2 or 3 layers: the layers sit outside the near-touch band). Below 3 levels it is caught as spoofing"
   - tactic: Randomised, longer cancel timing
     source: "advisory #2; Tower round 2 (timing staggered across 5-15 ticks)"
     knobs: {cancel_jitter: up, cancellation_delay_ticks: up}
@@ -140,3 +150,8 @@ layering:
     knobs: {busy_period_bias: up}
     weakens: [activity_vs_history, peer_z features]
     cost: fewer cycles when the market is quiet
+  - tactic: Hide layers inside genuine trading
+    source: "Tower Research: layering ran next to ordinary futures trading on the same desk"
+    knobs: {cover_rate: up, cover_size: up}
+    weakens: [avg_order_size_rel, large_order_share, fill_ratio, cancel_ratio, layered_order_share]
+    cost: "inventory risk; genuine resting orders slightly offset the fake depth. Ratios are volume-weighted: cover_size ~1 needed to dilute (measured with cover 0.3 x 1.0: spoofing caught 0.52, layering 0.65); cover_size near 3 makes the account an outlier again"

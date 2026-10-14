@@ -152,8 +152,13 @@ def test_pipeline_end_to_end_flags_schema(sim_features, tmp_path):
     assert (flagged["top_shap_features"].apply(len) > 0).all(), "every flag carries SHAP evidence"
     trained = set(pipe.supervised_detector.models)
     assert all(set(d) == trained for d in back["persona_scores"]), "every row carries all persona probabilities"
-    row = back[back["final_flag"] & back["predicted_persona"].isin(trained)].iloc[0]
-    assert row["persona_scores"][row["predicted_persona"]] == pytest.approx(row["final_score"], abs=1e-3)
+    # Classifier-only flags: final_score is the highest persona probability (with the
+    # anomaly model also firing, it can be the larger anomaly score instead).
+    sup_only = back["final_flag"] & back["triggered_by"].apply(lambda t: "isolation_forest" not in t) \
+        & back["predicted_persona"].isin(trained)
+    row = back[sup_only].iloc[0]
+    assert max(row["persona_scores"].values()) == pytest.approx(row["final_score"], abs=1e-3)
+    assert row["predicted_persona"] in row["persona_scores"]
     assert (tmp_path / "shap_importance.json").exists()
     metrics = compute_round_metrics(res, y, CFG["personas"], events=events)
     for p, m in metrics.items():

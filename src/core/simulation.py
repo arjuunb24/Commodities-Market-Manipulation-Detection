@@ -46,6 +46,8 @@ from src.core.agents.manipulation.layering import LayeringAgent
 from src.core.agents.manipulation.pump_and_dump import PumpDumpCoalition
 from src.core.agents.manipulation.spoofing import SpoofingAgent
 from src.core.agents.manipulation.wash_trading import WashTradingPair
+from src.core.agents.execution_algo import ExecutionAlgo
+from src.core.agents.hft_liquidity_provider import HFTLiquidityProvider
 from src.core.agents.market_maker import MarketMaker
 from src.core.agents.mean_reversion_trader import MeanReversionTrader
 from src.core.agents.momentum_trader import MomentumTrader
@@ -105,6 +107,10 @@ class SimConfig:
     n_momentum_traders: int = 8
     n_mean_reversion_traders: int = 6
     n_market_makers: int = 1
+    # Legitimate look-alikes of manipulators (hard negatives): high-cancel quoting
+    # firms and institutional algos that rest and pull large orders.
+    n_hft_liquidity_providers: int = 3
+    n_execution_algos: int = 3
 
     # Agent parameters (relative to price unless stated)
     noise_lambda: float = 0.6
@@ -138,6 +144,8 @@ class SimConfig:
     spoof_reprice: int = 0
     spoof_flip: float = 0.0
     spoof_busy_bias: float = 0.0
+    spoof_cover_rate: float = 0.0
+    spoof_cover_size: float = 0.0
 
     # Wash trading parameters
     wash_frequency: float = 0.5
@@ -167,6 +175,8 @@ class SimConfig:
     layer_cancel_jitter: float = 0.0
     layer_frequency: float = 0.3
     layer_busy_bias: float = 0.0
+    layer_cover_rate: float = 0.0
+    layer_cover_size: float = 0.0
 
     # Output
     data_dir: Path = Path("data")
@@ -254,6 +264,15 @@ def _make_persona(
     jitter_rng: np.random.Generator | None,
 ) -> list[Any]:
     """Instantiate one manipulation episode. Returns a list of controllers."""
+    controllers = _build_persona(persona, ep_idx, start, end, config, sub_rngs, jitter_rng)
+    cover = {"spoofing": (config.spoof_cover_rate, config.spoof_cover_size),
+             "layering": (config.layer_cover_rate, config.layer_cover_size)}.get(persona, (0.0, 0.0))
+    for c in controllers:
+        c.cover_rate, c.cover_size = float(cover[0]), float(cover[1])
+    return controllers
+
+
+def _build_persona(persona, ep_idx, start, end, config, sub_rngs, jitter_rng) -> list[Any]:
 
     def jit(x: float) -> float:
         return float(x * jitter_rng.uniform(0.95, 1.05)) if jitter_rng is not None else float(x)
@@ -381,6 +400,11 @@ def _build_agents(
             spread_ticks=mm_half_spread,
             arrival_rate_lambda=config.market_maker_lambda,
         ))
+
+    for i in range(config.n_hft_liquidity_providers):
+        agents.append(HFTLiquidityProvider(f"hft_{i}", next(sub_rngs)))
+    for i in range(config.n_execution_algos):
+        agents.append(ExecutionAlgo(f"algo_{i}", next(sub_rngs)))
 
     flag_map = {
         "spoofing": config.enable_spoofing,
@@ -554,6 +578,9 @@ def run_simulation(
     actors: list[Any] = [a for a in agents if not isinstance(a, MarketMaker)] + persona_controllers
 
     book = OrderBook(initial_price=init_price, id_prefix=id_prefix)
+    for a in agents:
+        if hasattr(a, "bind_book"):
+            a.bind_book(book.is_resting)
     # Market-activity signal (advisory #5 "busy period" tactic): volume over the
     # last minute and a slow moving baseline of it.
     from collections import deque
@@ -602,7 +629,7 @@ def run_simulation(
         state = _snapshot(book, tick)
         for idx in order_rng.permutation(len(actors)):
             actor = actors[idx]
-            if isinstance(actor, ManipulationController):
+            if hasattr(actor, "decide_batch"):
                 orders = actor.decide_batch(state, tick)
             else:
                 o = actor.decide(state, tick)
