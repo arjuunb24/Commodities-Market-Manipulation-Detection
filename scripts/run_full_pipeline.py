@@ -64,7 +64,8 @@ def _print_rows(df) -> None:
 def write_strategist_record(run_dir: Path, round_num: int, personas: list[str],
                             source: dict[str, str], reasoning: dict[str, str],
                             recovered: dict[str, int] | None = None,
-                            guard_reverts: dict[str, dict] | None = None) -> None:
+                            guard_reverts: dict[str, dict] | None = None,
+                            probe: dict[str, dict] | None = None) -> None:
     """
     round_N/strategist.json: who chose each persona's parameters for round N, the
     exact changes (old -> new, versus the parameters used in round N-1) and the
@@ -92,6 +93,9 @@ def write_strategist_record(run_dir: Path, round_num: int, personas: list[str],
         if (guard_reverts or {}).get(p):
             # effect was at risk: these knobs were reverted by the guard after the proposal
             record["personas"][p]["effect_guard_reverts"] = guard_reverts[p]
+        if (probe or {}).get(p):
+            # every candidate scored against the frozen detector on probe markets; `chosen` was kept
+            record["personas"][p]["probe"] = probe[p]
     out = run_dir / f"round_{round_num}"
     out.mkdir(parents=True, exist_ok=True)
     (out / "strategist.json").write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -179,6 +183,8 @@ def main():
                              "hand = hand-authored library only (no API calls; baseline for comparisons)")
     parser.add_argument("--test-markets", type=int, default=2, help="Held-out test markets per round")
     parser.add_argument("--run-name", type=str, default="", help="Optional label appended to the run id")
+    parser.add_argument("--no-probe", action="store_true",
+                        help="Do not probe-test the strategist's alternative candidates (faster, single blind proposal)")
     args = parser.parse_args()
 
     # ----------------------------------------------------------------
@@ -273,6 +279,10 @@ def main():
                                 result.setdefault("guard_reverts", {})[p] = rev
                                 result["reasoning"][p] = (result["reasoning"].get(p, "") + f"\n[effect guard] reverted {rev}").strip()
                     else:
+                        # Candidates are scored against the detector trained at the end of the previous
+                        # round, i.e. exactly the detector that will be frozen for this round.
+                        strategist.probe_fn = None if args.no_probe else (
+                            lambda cfgs, _r=round_num: orchestrator.probe(cfgs, round_num=_r))
                         result = strategist.run_strategist_round(
                             round_num=round_num - 1,  # Strategist reads the PREVIOUS round's metrics
                             personas=personas_to_mutate,
@@ -283,7 +293,7 @@ def main():
                     # --- Structured record of this round's mutation (read by the dashboard) ---
                     write_strategist_record(master_run_dir, round_num, personas_to_mutate, mutation_source,
                                             result.get("reasoning", {}), result.get("recovered", {}),
-                                            result.get("guard_reverts", {}))
+                                            result.get("guard_reverts", {}), result.get("probe", {}))
 
                     # --- Print and Log Reasoning ---
                     reasonings = result.get("reasoning", {})

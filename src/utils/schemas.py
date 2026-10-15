@@ -327,6 +327,10 @@ class FlagsSchema(pa.DataFrameModel):
     persona_scores: Series[object] = pa.Field(
         description="Dict of {persona: classifier probability} for every trained persona model"
     )
+    alert_tier: Series[str] = pa.Field(
+        isin=["alert", "review", "none"],
+        description="alert = final flag; review = IsolationForest only, not corroborated (not counted as caught)",
+    )
 
     @pa.dataframe_check
     @classmethod

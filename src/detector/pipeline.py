@@ -82,7 +82,9 @@ class DetectorPipeline:
                 and f_path.stat().st_mtime >= src.stat().st_mtime:
             X = pd.read_parquet(f_path)
             y = pd.read_parquet(l_path)
-            if set(self.personas).issubset(y.columns):
+            from src.detector.features import SELF_Z_COLUMNS
+            current = all(f"self_z_{c}" in X.columns for c in SELF_Z_COLUMNS)   # cache from an older feature set?
+            if current and set(self.personas).issubset(y.columns):
                 return X, y[self.personas]
 
         logger.info("Computing features for %s", run_dir)
@@ -191,15 +193,30 @@ class DetectorPipeline:
             res["sup_flag"], np.array(self.personas, dtype=object)[best],
             np.where(res["iso_flag"], "anomaly", None),
         )
-        rule = self.config.get("ensemble", {}).get("combination_rule", "or")
+        e = self.config.get("ensemble", {})
+        rule = e.get("combination_rule", "or")
+        # An IsolationForest flag on its own is often a legitimate but unusual firm (HFT,
+        # execution algorithm). With "or_corroborated" it becomes an alert only if a
+        # classifier is at least `min_prob_ratio` of the way to its threshold, or the
+        # account deviates strongly from its own history; otherwise it is a review item.
+        corr = e.get("iso_corroboration", {})
+        ratio = np.column_stack([
+            res[f"prob_{p}"] / max(self.supervised_detector.thresholds.get(p, 1.0), 1e-6) for p in self.personas
+        ]).max(axis=1)
+        self_cols = [c for c in Xc.columns if c.startswith("self_z_")]
+        self_dev = Xc[self_cols].abs().max(axis=1).to_numpy() if self_cols else np.zeros(len(Xc))
+        corroborated = (ratio >= corr.get("min_prob_ratio", 0.5)) | (self_dev >= corr.get("min_self_z", 6.0))
         if rule == "weighted":
             e = self.config.get("ensemble", {})
             res["final_score"] = (e.get("iso_weight", 0.4) * res["iso_score"]
                                   + e.get("supervised_weight", 0.6) * res[prob_cols].max(axis=1)).clip(0, 1)
             res["final_flag"] = res["sup_flag"] | (res["final_score"] > 0.5)
         else:
-            res["final_score"] = np.maximum(res[prob_cols].max(axis=1), res["iso_score"] * res["iso_flag"]).clip(0, 1)
-            res["final_flag"] = res["sup_flag"] | res["iso_flag"]
+            iso_alert = res["iso_flag"] & (corroborated if rule == "or_corroborated" else True)
+            res["final_score"] = np.maximum(res[prob_cols].max(axis=1), res["iso_score"] * iso_alert).clip(0, 1)
+            res["final_flag"] = res["sup_flag"] | iso_alert
+        res["alert_tier"] = np.where(res["final_flag"], "alert", np.where(res["iso_flag"], "review", "none"))
+        res.loc[res["alert_tier"] == "review", "predicted_persona"] = None
         res["triggered_by"] = [
             ([f"{p}_classifier" for p in self.personas if row[f"flag_{p}"]]
              + (["isolation_forest"] if row["iso_flag"] else []))
@@ -236,6 +253,7 @@ class DetectorPipeline:
         out["final_score"] = results["final_score"].to_numpy().astype(float)
         out["iso_score"] = results["iso_score"].to_numpy().astype(float)
         out["predicted_persona"] = results["predicted_persona"].to_numpy()
+        out["alert_tier"] = results["alert_tier"].to_numpy() if "alert_tier" in results else             np.where(results["final_flag"], "alert", "none")
         out["triggered_by"] = list(results["triggered_by"])
         out["top_shap_features"] = list(top)
         trained = [p for p in self.personas if p in self.supervised_detector.models]

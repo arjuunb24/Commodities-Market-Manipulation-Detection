@@ -207,6 +207,12 @@ PROPOSE_MUTATION_SCHEMA = _fn(
             "type": "string",
             "description": "Step-by-step justification referencing the metrics, SHAP drift and case notes.",
         },
+        "alternatives": {
+            "type": "array", "maxItems": 2,
+            "items": {"type": "object", "description": "A parameter dict, same shape as `parameters`"},
+            "description": "Up to 2 alternative parameter dicts using DIFFERENT tactics. Every candidate is "
+                           "probe-tested against the frozen detector and the best-scoring one is kept.",
+        },
     },
     ["persona", "parameters", "reasoning"],
 )
@@ -256,6 +262,8 @@ class ToolRegistry:
     def __init__(self, run_dir=None, persona_config_path: Path | None = None):
         self.run_dir = Path(run_dir) if run_dir else None
         self.persona_config_path = Path(persona_config_path) if persona_config_path else PERSONA_CONFIG_PATH
+        # persona -> [primary, *alternatives] parameter changes proposed this round (for probing)
+        self.candidates: dict[str, list[dict]] = {}
 
     # ------------------------------------------------------------------ helpers
     def _round_dir(self, round_num: int) -> Path | None:
@@ -517,12 +525,22 @@ class ToolRegistry:
                 return yaml.safe_load(f) or {}
         return {}
 
-    def propose_mutation(self, persona: str, parameters: dict, reasoning: str = "") -> dict:
-        """Validate against PARAM_BOUNDS, then write under the top-level persona key."""
+    def propose_mutation(self, persona: str, parameters: dict, reasoning: str = "",
+                         alternatives: list | None = None) -> dict:
+        """Validate against PARAM_BOUNDS, then write under the top-level persona key.
+        Valid `alternatives` are kept in self.candidates for probe testing (invalid ones are dropped)."""
         import yaml
         clean, error = validate_mutation(persona, parameters)
         if error:
             return {"error": f"Validation failed: {error}"}
+        alts, dropped = [], []
+        for alt in (alternatives or [])[:2]:
+            # models sometimes nest an alternative as {"parameters": {...}, "reasoning": ...}
+            if isinstance(alt, dict) and isinstance(alt.get("parameters"), dict):
+                alt = alt["parameters"]
+            a, err = validate_mutation(persona, alt)
+            (alts.append(a) if a else dropped.append(err))
+        self.candidates[persona] = [clean, *alts]
         existing = self._load_persona_config()
         old_params = dict(existing.get(persona) or existing.get("round_0", {}).get(persona, {}))
         merged = dict(old_params)
@@ -536,7 +554,48 @@ class ToolRegistry:
             "old_params": old_params,
             "new_params": existing[persona],
             "reasoning": reasoning,
+            "alternatives_accepted": len(alts),
+            **({"alternatives_dropped": dropped} if dropped else {}),
         }
+
+    def caught_by(self, persona: str, round_num: int, top_n: int = 5) -> dict | None:
+        """
+        How the detector retrained at the end of `round_num` (the detector that will be
+        FROZEN for the next round) treated this persona's episodes: share of episode
+        windows flagged, the label mix of those flags and the features (sum of |SHAP| in
+        the stored top attributions) that drove them.
+        """
+        d = self._round_dir(round_num)
+        if d is None or not (d / "flags.parquet").exists():
+            return None
+        ev = [pd.read_parquet(m / "manipulation_events.parquet") for m in sorted(d.glob("test*"))
+              if (m / "manipulation_events.parquet").exists()]
+        if not ev:
+            return None
+        ev = pd.concat(ev, ignore_index=True)
+        ev = ev[ev["persona"] == persona]
+        if ev.empty:
+            return None
+        flags = read_flags(d / "flags.parquet")
+        hit = pd.Series(False, index=flags.index)
+        for _, e in ev.iterrows():
+            hit |= ((flags["commodity"] == e["commodity"]) & flags["trader_id"].isin(set(e["trader_ids"]))
+                    & (flags["window_end"] >= e["start_tick"]) & (flags["window_start"] <= e["end_tick"]))
+        rows = flags[hit]
+        caught = rows[rows["final_flag"].astype(bool)]
+        if rows.empty:
+            return None
+        mix = caught["predicted_persona"].fillna("none").map(
+            lambda v: "own label" if v == persona else ("anomaly" if v == "anomaly" else "other persona")).value_counts()
+        weight: dict[str, float] = {}
+        for d_ in caught["top_shap_features"]:
+            for k, v in (d_ or {}).items():
+                if v is not None:
+                    weight[k] = weight.get(k, 0.0) + abs(float(v))
+        total = sum(weight.values()) or 1.0
+        top = dict(sorted(((k, round(v / total, 3)) for k, v in weight.items()), key=lambda kv: -kv[1])[:top_n])
+        return {"windows": int(len(rows)), "caught_share": round(len(caught) / len(rows), 3),
+                "label_mix": {k: round(v / max(1, len(caught)), 2) for k, v in mix.items()}, "top_features": top}
 
     # ---------------------------------------------------------------- analyst
     def list_rounds(self) -> dict:

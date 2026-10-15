@@ -88,6 +88,10 @@ class SimConfig:
     fundamental_value_initial: float | None = None
     fundamental_value_drift: float = 0.0001
     fundamental_value_vol: float = 0.0094
+    # Multiply the fundamental volatility by the commodity's simulator correction
+    # factor (configs/sim_calibration.yaml) so that REALISED 5-minute volatility
+    # matches the sourced daily volatility. The sourced figure itself is untouched.
+    apply_vol_scale: bool = True
     jumps_per_day: float = 4.0           # macro / inventory news shocks
     jump_size_daily_vol: float = 0.25    # jump std as a fraction of daily vol
     tick_offset: int = 0
@@ -550,10 +554,10 @@ def run_simulation(
     fundamental = FundamentalValueProcess(
         initial_value=init_price,
         drift=config.fundamental_value_drift / tpd,
-        volatility=config.fundamental_value_vol / np.sqrt(tpd),
+        volatility=config.fundamental_value_vol * _vol_scale(config) / np.sqrt(tpd),
         rng=fundamental_rng,
         jump_prob=config.jumps_per_day / tpd,
-        jump_std=config.jump_size_daily_vol * config.fundamental_value_vol,
+        jump_std=config.jump_size_daily_vol * config.fundamental_value_vol * _vol_scale(config),
     )
 
     agents, controllers = _build_agents(config, master_rng)
@@ -742,6 +746,25 @@ def _collect(
         if seller is not None and hasattr(seller, "update_inventory"):
             seller.update_inventory(Side.SELL, trade.quantity)
     all_order_events.extend(e.to_dict() for e in events)
+
+
+_SIM_CALIBRATION_PATH = Path(__file__).resolve().parents[2] / "configs" / "sim_calibration.yaml"
+_VOL_SCALE_CACHE: dict | None = None
+
+
+def _vol_scale(config: "SimConfig") -> float:
+    """Simulator correction factor for the commodity's fundamental volatility (1.0 if none)."""
+    global _VOL_SCALE_CACHE
+    if not config.apply_vol_scale:
+        return 1.0
+    if _VOL_SCALE_CACHE is None:
+        try:
+            import yaml
+            _VOL_SCALE_CACHE = (yaml.safe_load(_SIM_CALIBRATION_PATH.read_text()) or {}).get("vol_scale", {}) \
+                if _SIM_CALIBRATION_PATH.exists() else {}
+        except Exception:   # a broken calibration file must never stop a simulation
+            _VOL_SCALE_CACHE = {}
+    return float(_VOL_SCALE_CACHE.get(config.commodity, 1.0))
 
 
 def multi_commodity_seed(seed: int, commodity: str) -> int:

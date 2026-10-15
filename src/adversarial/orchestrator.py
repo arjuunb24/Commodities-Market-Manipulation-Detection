@@ -43,6 +43,25 @@ logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
+PROBE_COMMODITIES = ("crude_oil_wti", "gold", "natural_gas", "corn")
+PROBE_SEEDS = (9101, 9102)
+PROBE_TICKS = 6000
+
+
+def _probe_market(args) -> str:
+    """Process-pool worker: simulate one probe market with the given persona config and write it."""
+    import logging as _lg, warnings as _w
+    _w.filterwarnings("ignore"); _lg.disable(_lg.WARNING)
+    from src.core.calibration import CalibrationEngine
+    from src.core.persona_params import apply_persona_config
+    from src.core.simulation import SimConfig, run_simulation
+    active, commodity, seed, ticks, out_dir = args
+    ou, _ = CalibrationEngine().get_fallback(commodity)
+    cfg = SimConfig(commodity=commodity, fundamental_value_drift=ou.drift, fundamental_value_vol=ou.volatility,
+                    n_ticks=ticks, data_dir=Path(out_dir), overwrite=True, write_to_disk=True)
+    apply_persona_config(cfg, active)
+    return str(run_simulation(cfg, seed).run_dir)
+
 
 class RoundOrchestrator:
     """
@@ -94,6 +113,53 @@ class RoundOrchestrator:
         cfg = yaml.safe_load(self.persona_config_path.read_text()) if self.persona_config_path.exists() else {}
         active = resolve_persona_config(cfg or {})
         return {p: effective_params(active, p) for p in self.personas}
+
+    def probe(self, configs: list[dict[str, dict]], round_num: int | None = None) -> list[dict[str, dict]]:
+        """
+        Score candidate persona parameter sets against the CURRENT detector (the one
+        that will be frozen for the next round) before committing to one.
+
+        Each config maps persona -> full parameter dict. Every config is simulated on the
+        same short markets (PROBE_COMMODITIES x PROBE_SEEDS, PROBE_TICKS ticks; common
+        random numbers, so candidates differ only by their parameters) and returns, per
+        persona, any-alert coverage, effect ratio vs. round 0 and the mutation score.
+        """
+        from concurrent.futures import ProcessPoolExecutor
+        import yaml
+        if not self.pipeline.is_trained:
+            raise RuntimeError("probe() needs a trained detector")
+        cfg = yaml.safe_load(self.persona_config_path.read_text()) if self.persona_config_path.exists() else {}
+        base_active = resolve_persona_config(cfg or {})
+        baseline = self._baseline_effectiveness()
+        tag = f"round_{round_num}" if round_num is not None else "adhoc"
+        root = self.master_run_dir / "probes" / tag
+        out: list[dict[str, dict]] = []
+        for k, overrides in enumerate(configs):
+            active = {p: dict(v) for p, v in base_active.items()}
+            for p, params in overrides.items():
+                active[p] = {**active.get(p, {}), **params}
+            jobs = [(active, c, s, PROBE_TICKS, str(root / f"cand{k}" / f"{c}_{s}")) for c in PROBE_COMMODITIES for s in PROBE_SEEDS]
+            with ProcessPoolExecutor(min(len(jobs), 8)) as ex:
+                dirs = list(ex.map(_probe_market, jobs))
+            Xs, Ys, Es, effs = [], [], [], []
+            for d in dirs:
+                X, y = self.pipeline.load_and_preprocess(Path(d))
+                Xs.append(X); Ys.append(y)
+                ev = pd.read_parquet(Path(d) / "manipulation_events.parquet"); Es.append(ev)
+                effs.append(episode_effectiveness(ev, pd.read_parquet(Path(d) / "trade_log.parquet"),
+                                                  pd.read_parquet(Path(d) / "order_log.parquet")))
+            X, y, ev = pd.concat(Xs), pd.concat(Ys), pd.concat(Es, ignore_index=True)
+            met = compute_round_metrics(self.pipeline.score(X), y, self.personas, events=ev)
+            eff = summarize(pd.concat(effs, ignore_index=True))
+            res = {}
+            for p in overrides:
+                m = met.get(p, {})
+                ratio = effectiveness_ratio(eff.get(p), baseline.get(p), p) if p in eff else None
+                res[p] = {"coverage": m.get("caught_coverage"), "effect_ratio": ratio, "score": mutation_score(m, ratio)}
+            logger.info(f"[Probe] candidate set {k}: " + ", ".join(f"{p}: cov {v['coverage']} eff {v['effect_ratio']} score {v['score']}" for p, v in res.items()))
+            out.append(res)
+        shutil.rmtree(root, ignore_errors=True)   # probe markets are disposable
+        return out
 
     def _baseline_effectiveness(self) -> dict:
         path = self.master_run_dir / "round_0" / "metrics.json"

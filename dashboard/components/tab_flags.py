@@ -111,6 +111,11 @@ for _base in ("cancel_ratio", "fast_cancel_ratio", "avg_order_size_rel", "max_or
     FEATURE_DESCRIPTIONS[f"peer_z_{_base}"] = (
         f"{FEATURE_DESCRIPTIONS[_base]} — compared with all other accounts in the same window (robust z-score)"
     )
+for _base in ("avg_order_size_rel", "max_order_size_rel", "large_order_share", "cancel_ratio",
+              "fast_cancel_ratio", "n_orders", "gross_volume_share", "layered_order_share"):
+    FEATURE_DESCRIPTIONS[f"self_z_{_base}"] = (
+        f"{FEATURE_DESCRIPTIONS.get(_base, _base)} — compared with this account's OWN earlier windows (robust z-score)"
+    )
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -420,6 +425,12 @@ def render_flags_tab(run_dir: Path | None, selected_round: int, market: str | No
               help=f"Accounts only the IsolationForest found unusual (no persona). {n_anom_hit} of them overlap a real episode; "
                    "the rest are mostly legitimate accounts with unusual but lawful behaviour (e.g. hedgers' large orders). "
                    "Shown only when 'anomaly' is selected in the Persona filter.")
+    if "alert_tier" in flags.columns:
+        n_review = int((flags["alert_tier"] == "review").sum())
+        if n_review:
+            st.caption(f"🗂️ {n_review:,} review-tier windows: the IsolationForest found them unusual but no classifier or "
+                       "own-history deviation corroborated it, so they are not raised as alerts (typically legitimate "
+                       "HFT firms and execution algorithms).")
     st.caption("Detector flags are model output on synthetic data — not findings about real traders. "
                "Metrics cover the test market selected in the sidebar.")
 

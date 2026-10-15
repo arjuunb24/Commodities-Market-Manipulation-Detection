@@ -65,6 +65,15 @@ PEER_Z_COLUMNS = [
     "cancel_ratio", "fast_cancel_ratio", "avg_order_size_rel", "max_order_size_rel",
     "gross_volume_share", "reciprocal_ratio", "aggressor_ratio", "large_order_share",
 ]
+# Robust z-score of an account against ITS OWN earlier (non-overlapping) windows.
+# A legitimate algorithm that always rests large orders looks normal against its
+# own history; an account that only now starts spoofing does not.
+SELF_Z_COLUMNS = [
+    "avg_order_size_rel", "max_order_size_rel", "large_order_share", "cancel_ratio",
+    "fast_cancel_ratio", "n_orders", "gross_volume_share", "layered_order_share",
+]
+SELF_Z_MIN_HISTORY = 5          # past active windows needed before a self z-score is reported
+SELF_Z_SCALE_FLOOR = {"n_orders": 2.0, "avg_order_size_rel": 0.5, "max_order_size_rel": 0.5}
 MARKET_CONTEXT_COLUMNS = [
     "mkt_return_bp", "mkt_volatility_bp", "mkt_range_bp", "mkt_volume_spike",
     "mkt_trade_imbalance", "mkt_order_imbalance", "mkt_cancel_ratio", "mkt_abnormal_return_z",
@@ -76,6 +85,34 @@ def _ticks(value: Any) -> int:
     if isinstance(value, (int, np.integer)):
         return int(value)
     return int(pd.to_timedelta(value).total_seconds())
+
+
+def _opposite_fill_flags(lc: pd.DataFrame, legs: pd.DataFrame, grace: int = 2) -> np.ndarray:
+    """
+    For each large cancelled order (trader_id, side, placed_tick, tick): 1.0 if the same
+    account was filled on the OPPOSITE side at a tick in [placed_tick, tick + grace].
+
+    Uses per-account sorted fill ticks and binary search, so memory grows with the number
+    of orders, not orders x fills (a cross join exploded to hundreds of millions of rows
+    for high-cancel HFT accounts).
+    """
+    out = np.zeros(len(lc))
+    if lc.empty or legs.empty:
+        return out
+    sells = {t: np.sort(g["tick"].to_numpy()) for t, g in legs[legs["sell"] > 0].groupby("trader_id")}
+    buys = {t: np.sort(g["tick"].to_numpy()) for t, g in legs[legs["buy"] > 0].groupby("trader_id")}
+    lo_all = lc["placed_tick"].to_numpy(dtype=float)
+    hi_all = lc["tick"].to_numpy(dtype=float) + grace
+    side = lc["side"].to_numpy()
+    for trader, idx in lc.groupby("trader_id").indices.items():
+        for s, book in (("buy", sells), ("sell", buys)):      # a buy order needs a sell fill and vice versa
+            arr = book.get(trader)
+            sel = idx[side[idx] == s]
+            if arr is None or not len(sel):
+                continue
+            n = np.searchsorted(arr, hi_all[sel], side="right") - np.searchsorted(arr, lo_all[sel], side="left")
+            out[sel] = (n > 0).astype(float)
+    return out
 
 
 def _safe_div(a, b, fill: float = 0.0):
@@ -292,11 +329,7 @@ class FeatureEngine:
         lc = lc.reset_index(drop=True).reset_index().rename(columns={"index": "cid"})
         lc["opp_fill"] = 0.0
         if not lc.empty and not trades.empty:
-            fills = legs_with_tick[["trader_id", "tick", "buy", "sell"]].rename(columns={"tick": "fill_tick"})
-            j = lc.merge(fills, on="trader_id", how="inner")
-            j = j[(j["fill_tick"] >= j["placed_tick"]) & (j["fill_tick"] <= j["tick"] + 2)]
-            j = j[((j["side"] == "buy") & (j["sell"] > 0)) | ((j["side"] == "sell") & (j["buy"] > 0))]
-            lc.loc[lc["cid"].isin(j["cid"].unique()), "opp_fill"] = 1.0
+            lc["opp_fill"] = _opposite_fill_flags(lc, legs_with_tick)
         lc_step = lc.groupby(["step", "trader_id"]).agg(
             n_large_cancel=("cid", "size"), n_large_cancel_opp=("opp_fill", "sum"),
         ).reset_index()
@@ -342,6 +375,7 @@ class FeatureEngine:
         feats["gross_volume_share"] = _safe_div(feats["exec_vol"], feats["mkt_volume"])
         feats["signed_flow_return"] = feats["exec_side_imbalance"] * feats["mkt_return_bp"]
         feats = self._add_peer_z(feats)
+        feats = self._add_self_z(feats)
 
         feats["window_start"] = (feats["win"] - W + 1) * S
         feats["window_end"] = (feats["win"] + 1) * S - 1
@@ -467,6 +501,33 @@ class FeatureEngine:
         same = np.where(direction > 0, n_up - 1, np.where(direction < 0, n_down - 1, 0))
         f["coordinated_peers"] = np.clip(same, 0, None).astype(float)
         return f.drop(columns=["net_qty"])
+
+    def _add_self_z(self, f: pd.DataFrame) -> pd.DataFrame:
+        """
+        Robust z-score of each account against its own history: median and IQR of its
+        values in earlier windows that do not overlap the current one (shifted by one
+        full window length). 0 until SELF_Z_MIN_HISTORY past active windows exist.
+        """
+        W = self.n_steps
+        grid_wins = np.arange(f["win"].min(), f["win"].max() + 1)
+        out = []
+        for col in SELF_Z_COLUMNS:
+            grid = f.pivot_table(index="win", columns="trader_id", values=col, aggfunc="first").reindex(grid_wins)
+            past = grid.shift(W)
+            exp = past.expanding(min_periods=SELF_Z_MIN_HISTORY)
+            med = exp.median()
+            iqr = exp.quantile(0.75) - exp.quantile(0.25)
+            floor = SELF_Z_SCALE_FLOOR.get(col, 0.05)
+            scale = np.maximum(iqr / 1.349, floor)
+            z = ((grid - med) / scale).clip(-20, 20)
+            s = z.stack(future_stack=True).rename(f"self_z_{col}")
+            out.append(s)
+        sz = pd.concat(out, axis=1)
+        sz.index.names = ["win", "trader_id"]
+        f = f.merge(sz.reset_index(), on=["win", "trader_id"], how="left")
+        cols = [f"self_z_{c}" for c in SELF_Z_COLUMNS]
+        f[cols] = f[cols].fillna(0.0)
+        return f
 
     def _add_peer_z(self, f: pd.DataFrame) -> pd.DataFrame:
         """Robust z-score of each account against all accounts active in the same window."""
