@@ -40,7 +40,7 @@ narrative_generator:
 
 # --- 4B: Adversarial strategist (once per round)
 adversarial_strategist:
-  max_tokens: {gemini: 4096, cerebras: 2500}
+  max_tokens: {gemini: 4096, cerebras: 4000}   # 2500 was cut off mid-reasoning twice in one round (finish_reason=length)
   reasoning_effort: {cerebras: "medium"}  # the one place deeper thinking pays off (~$0.002-0.004/round)
   max_tool_calls: 5              # model turns per round (4 personas; gpt-oss sometimes proposes one per turn)
   max_retries: 1

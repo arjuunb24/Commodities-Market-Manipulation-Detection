@@ -59,6 +59,7 @@ PERSONA_PARAM_MAP: dict[str, dict[str, tuple[str, type]]] = {
         "cancel_jitter": ("layer_cancel_jitter", float),
         "frequency": ("layer_frequency", float),
         "busy_period_bias": ("layer_busy_bias", float),
+        "placement_stagger": ("layer_placement_stagger", int),
         "cover_rate": ("layer_cover_rate", float),
         "cover_size": ("layer_cover_size", float),
     },

@@ -24,6 +24,11 @@ Evasion knobs (Tower round 1/2 evasions, CFTC advisory):
                    book ("decreasing volume deeper in the book to appear natural")
   cancel_jitter    randomised cancel timing (advisory #2)
   busy_period_bias act mainly when the market is busy (advisory #5)
+  placement_stagger ticks between successive layers: 0 places the whole ladder in
+                   one tick (the Tower pattern); k > 0 builds it one layer every k
+                   ticks, so no single tick shows a multi-level batch ("orders
+                   entered in rapid succession" rather than simultaneously). The
+                   ladder is complete for less of the cycle, so fake depth falls.
 
 Order ids carry audit tags ("l" layer leg, "g" genuine leg) used only for
 effectiveness accounting, never by the detector.
@@ -56,6 +61,7 @@ class LayeringAgent(ManipulationController):
         frequency: float = 0.3,
         busy_period_bias: float = 0.0,
         layer_side: str = "both",
+        placement_stagger: int = 0,
         start_tick: int = 0,
         end_tick: int = 10000,
         background_rate: float = 0.05,
@@ -72,8 +78,11 @@ class LayeringAgent(ManipulationController):
         self.cancel_jitter = float(np.clip(cancel_jitter, 0.0, 0.9))
         self.frequency = float(frequency)
         self.layer_side = layer_side
+        self.placement_stagger = max(0, int(placement_stagger))
         self._cycle_busy_until = -1
         self._depth_shares: list[float] = []
+        # staggered cycle in progress: (side, next layer index, next tick, cancel tick, base size, step)
+        self._building: tuple | None = None
 
     @property
     def account(self) -> ManipulatorAccount:
@@ -90,6 +99,7 @@ class LayeringAgent(ManipulationController):
             "frequency": self.frequency,
             "busy_period_bias": self.busy_period_bias,
             "layer_side": self.layer_side,
+            "placement_stagger": self.placement_stagger,
             "realised_fake_depth_share": round(float(np.mean(self._depth_shares)), 4) if self._depth_shares else 0.0,
         }
 
@@ -100,7 +110,31 @@ class LayeringAgent(ManipulationController):
             return Side.SELL
         return Side.BUY if self.rng.random() < 0.5 else Side.SELL
 
+    def _layer(self, state: BookState, side: Side, i: int, base_size: float, step: float, tick: int, ttl: int) -> Order:
+        tick_size = self.account.tick_size
+        if side == Side.BUY:
+            price = min(state.best_bid - step * (i + 1), state.best_ask - tick_size)
+        else:
+            price = max(state.best_ask + step * (i + 1), state.best_bid + tick_size)
+        taper = 1.0 - self.size_taper * (i / max(1, self.n_layers - 1))
+        qty = max(5, int(round(base_size * taper * self.rng.uniform(0.9, 1.1))))
+        return self.account.limit(side, price, qty, tick, exact_ttl=max(1, ttl), tag="l")
+
+    def _continue_build(self, state: BookState, tick: int) -> list[Order]:
+        side, i, due, cancel_at, base_size, step = self._building
+        if tick < due:
+            return []
+        if state.best_bid is None or state.best_ask is None:
+            return []
+        # Every layer expires at the cycle's cancel tick, so the group is still pulled together.
+        o = self._layer(state, side, i, base_size, step, tick, cancel_at - tick)
+        self._building = (side, i + 1, tick + self.placement_stagger, cancel_at, base_size, step) \
+            if i + 1 < self.n_layers and tick + self.placement_stagger < cancel_at else None
+        return [o]
+
     def manipulate(self, state: BookState, tick: int) -> list[Order]:
+        if self._building is not None:
+            return self._continue_build(state, tick)
         if tick < self._cycle_busy_until or state.best_bid is None or state.best_ask is None:
             return []
         if self.rng.random() > self.frequency:
@@ -121,14 +155,19 @@ class LayeringAgent(ManipulationController):
                              exact_ttl=delay + 2, tag="g")]
         # At least one tick between layers so every layer sits on its own price level.
         step = max(tick_size, state.mid_price * self.layer_spacing if state.mid_price else tick_size)
-        for i in range(self.n_layers):
-            if side == Side.BUY:
-                price = min(state.best_bid - step * (i + 1), state.best_ask - tick_size)
-            else:
-                price = max(state.best_ask + step * (i + 1), state.best_bid + tick_size)
-            taper = 1.0 - self.size_taper * (i / max(1, self.n_layers - 1))
-            qty = max(5, int(round(base_size * taper * self.rng.uniform(0.9, 1.1))))
-            orders.append(acct.limit(side, price, qty, tick, exact_ttl=delay, tag="l"))
-        self._depth_shares.append(fake_depth_share(state, side, [(o.price, o.quantity) for o in orders[1:]]))
+        if self.placement_stagger > 0:
+            # Build the ladder over time: the full ladder only exists from the last layer on,
+            # so a staggered ladder also needs a cancel delay long enough to finish it.
+            delay = max(delay, self.placement_stagger * (self.n_layers - 1) + 1)
+            orders[0] = acct.limit(genuine_side, genuine_price, orders[0].quantity, tick, exact_ttl=delay + 2, tag="g")
+            layers = [self._layer(state, side, i, base_size, step, tick, delay) for i in range(self.n_layers)]
+            # Fake depth counts only while it rests: layer i is up for (delay - i x stagger) of the cycle.
+            alive = np.mean([max(0, delay - i * self.placement_stagger) / delay for i in range(self.n_layers)])
+            self._depth_shares.append(alive * fake_depth_share(state, side, [(o.price, o.quantity) for o in layers]))
+            orders.append(layers[0])
+            self._building = (side, 1, tick + self.placement_stagger, tick + delay, base_size, step)
+        else:
+            orders += [self._layer(state, side, i, base_size, step, tick, delay) for i in range(self.n_layers)]
+            self._depth_shares.append(fake_depth_share(state, side, [(o.price, o.quantity) for o in orders[1:]]))
         self._cycle_busy_until = tick + delay
         return orders

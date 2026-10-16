@@ -10,6 +10,7 @@ round_0:
     layer_size_multiplier: 2.0
     layer_spacing: 0.0002
     n_layers: 4
+    placement_stagger: 0
     size_taper: 0.0
   pump_and_dump:
     accumulation_size: 150

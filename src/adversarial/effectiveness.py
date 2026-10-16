@@ -185,7 +185,10 @@ def evasion_components(pre_metrics: dict | None) -> dict | None:
     How well a mutation evaded the FROZEN detector, from its pre-retrain metrics:
       coverage  1 - episode coverage (share of each episode's windows NOT flagged;
                 falls back to 1 - row recall for older metrics)
-      missed    share of episodes never flagged at all
+      missed    share of episodes practically missed: never flagged, or (when the
+                metrics carry caught_weak_share) under 20% of their windows flagged.
+                Every episode was flagged at least once in every round of two runs,
+                so "never flagged" alone left this 0.3-weight term at zero
       delay     detection delay of caught episodes / DELAY_REFERENCE_TICKS (capped at 1;
                 1 when every episode was missed)
     "Flagged" means ANY alert (caught_* metrics) when available, so being flagged
@@ -203,6 +206,9 @@ def evasion_components(pre_metrics: dict | None) -> dict | None:
     total = pre_metrics.get("events_total") or 0
     detected = pre_metrics.get("caught_events_detected" if any_alert else "events_detected") or 0
     missed = (total - detected) / total if total else 0.0
+    weak = pre_metrics.get("caught_weak_share") if any_alert else None
+    if weak is not None and weak == weak:
+        missed = max(missed, float(weak))
     lat = pre_metrics.get("caught_latency_ticks" if any_alert else "detection_latency_ticks")
     if lat is None or lat != lat:
         delay = 1.0 if total and detected == 0 else 0.0

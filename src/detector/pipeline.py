@@ -204,8 +204,12 @@ class DetectorPipeline:
             res[f"prob_{p}"] / max(self.supervised_detector.thresholds.get(p, 1.0), 1e-6) for p in self.personas
         ]).max(axis=1)
         self_cols = [c for c in Xc.columns if c.startswith("self_z_")]
-        self_dev = Xc[self_cols].abs().max(axis=1).to_numpy() if self_cols else np.zeros(len(Xc))
-        corroborated = (ratio >= corr.get("min_prob_ratio", 0.5)) | (self_dev >= corr.get("min_self_z", 6.0))
+        # Self-history corroboration needs `min_self_z_cols` features deviating at once: one
+        # feature (usually order size) jumps whenever an execution algo starts a new parent
+        # order, and that single-feature route made nearly all of their false alerts.
+        n_dev = ((Xc[self_cols].abs() >= corr.get("min_self_z", 6.0)).sum(axis=1).to_numpy()
+                 if self_cols else np.zeros(len(Xc)))
+        corroborated = (ratio >= corr.get("min_prob_ratio", 0.5)) | (n_dev >= corr.get("min_self_z_cols", 1))
         if rule == "weighted":
             e = self.config.get("ensemble", {})
             res["final_score"] = (e.get("iso_weight", 0.4) * res["iso_score"]

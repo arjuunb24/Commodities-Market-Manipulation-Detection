@@ -130,6 +130,11 @@ layering:
     knobs: {size_taper: up}
     weakens: [max_order_size_rel, order_size_cv, large_order_share]
     cost: deeper layers add less fake depth
+  - tactic: Build the ladder in rapid succession
+    source: "CFTC layering orders — orders 'entered in rapid succession' at consecutive levels rather than as one simultaneous batch"
+    knobs: {placement_stagger: up}
+    weakens: [layered_order_share (counts same-tick batches on >= 3 levels), self_z_layered_order_share]
+    cost: "STRONG at short cancel delays: the full ladder rests for less of each cycle (layer i rests delay - i x stagger ticks). Measured with delay 5: stagger 1 keeps 0.71x, 2 keeps 0.59x, 3 keeps 0.56x of the fake depth. Pair it with a long cancellation_delay_ticks (at delay 20, stagger 1 keeps ~0.93x). The delay is stretched to at least stagger x (n_layers - 1) + 1"
   - tactic: Fewer, wider layers
     source: Tower round 2 — 2-6 layers, varied spacing
     knobs: {n_layers: down, layer_spacing: up}

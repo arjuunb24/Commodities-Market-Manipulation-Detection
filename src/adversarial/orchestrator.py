@@ -30,6 +30,7 @@ from src.adversarial.metrics import (
     write_round_metrics_parquet,
 )
 from src.adversarial.effectiveness import (
+    PRIMARY_METRIC,
     effectiveness_ratio,
     episode_effectiveness,
     mutation_score,
@@ -124,42 +125,100 @@ class RoundOrchestrator:
         random numbers, so candidates differ only by their parameters) and returns, per
         persona, any-alert coverage, effect ratio vs. round 0 and the mutation score.
         """
-        from concurrent.futures import ProcessPoolExecutor
         import yaml
         if not self.pipeline.is_trained:
             raise RuntimeError("probe() needs a trained detector")
         cfg = yaml.safe_load(self.persona_config_path.read_text()) if self.persona_config_path.exists() else {}
         base_active = resolve_persona_config(cfg or {})
-        baseline = self._baseline_effectiveness()
         tag = f"round_{round_num}" if round_num is not None else "adhoc"
         root = self.master_run_dir / "probes" / tag
+        # Effect ratios divide by the round-0 effect measured on the SAME probe markets:
+        # the full test markets differ in commodities and length, and e.g. wash volume
+        # share depends on how much everyone else trades (probe vs. full-market baseline
+        # overstated the wash effect by 0.25-0.75 in every round of two runs).
+        baseline = self._probe_baseline(base_active, root) or self._baseline_effectiveness()
+        # Anchor on the last REAL round: simulate its parameters on the same probe markets and
+        # scale its measured effect ratio by candidate / reference. Same seeds, so the probe
+        # markets' bias and most of their noise cancel (the 8-episode round-0 probe baseline
+        # alone was off by 0.2-0.36 for pump-and-dump and 0.09 for layering).
+        real = json.loads((self.master_run_dir / f"round_{round_num}" / "metrics.json").read_text()) \
+            if round_num is not None and (self.master_run_dir / f"round_{round_num}" / "metrics.json").exists() else {}
+        real_ratio, ref_params = real.get("effectiveness_ratio") or {}, real.get("params_used") or {}
+        ref_eff: dict = {}
+        if real_ratio and ref_params:
+            ref_active = {p: dict(v) for p, v in base_active.items()}
+            for p in set().union(*configs) if configs else ():
+                if p in ref_params:
+                    ref_active[p] = {**ref_active.get(p, {}), **ref_params[p]}
+            _, _, _, ref_eff = self._simulate_probe_set(ref_active, root / "reference", features=False)
         out: list[dict[str, dict]] = []
         for k, overrides in enumerate(configs):
             active = {p: dict(v) for p, v in base_active.items()}
             for p, params in overrides.items():
                 active[p] = {**active.get(p, {}), **params}
-            jobs = [(active, c, s, PROBE_TICKS, str(root / f"cand{k}" / f"{c}_{s}")) for c in PROBE_COMMODITIES for s in PROBE_SEEDS]
-            with ProcessPoolExecutor(min(len(jobs), 8)) as ex:
-                dirs = list(ex.map(_probe_market, jobs))
-            Xs, Ys, Es, effs = [], [], [], []
-            for d in dirs:
-                X, y = self.pipeline.load_and_preprocess(Path(d))
-                Xs.append(X); Ys.append(y)
-                ev = pd.read_parquet(Path(d) / "manipulation_events.parquet"); Es.append(ev)
-                effs.append(episode_effectiveness(ev, pd.read_parquet(Path(d) / "trade_log.parquet"),
-                                                  pd.read_parquet(Path(d) / "order_log.parquet")))
-            X, y, ev = pd.concat(Xs), pd.concat(Ys), pd.concat(Es, ignore_index=True)
+            X, y, ev, eff = self._simulate_probe_set(active, root / f"cand{k}")
             met = compute_round_metrics(self.pipeline.score(X), y, self.personas, events=ev)
-            eff = summarize(pd.concat(effs, ignore_index=True))
             res = {}
             for p in overrides:
                 m = met.get(p, {})
-                ratio = effectiveness_ratio(eff.get(p), baseline.get(p), p) if p in eff else None
-                res[p] = {"coverage": m.get("caught_coverage"), "effect_ratio": ratio, "score": mutation_score(m, ratio)}
+                rel = effectiveness_ratio(eff.get(p), ref_eff.get(p), p) if p in eff and p in ref_eff else None
+                anchored = round(real_ratio[p] * rel, 3) if rel is not None and real_ratio.get(p) is not None else None
+                direct = effectiveness_ratio(eff.get(p), baseline.get(p), p) if p in eff else None
+                # Two estimates with different errors: `anchored` inherits the noise of the last real
+                # round's 2 test markets (wash off by 0.17-0.24 in run 124309Z), `direct` the bias of
+                # the 8-episode round-0 probe baseline (pump-and-dump off by 0.2-0.36 in 092237Z).
+                # Their mean is used; both are kept for checking against the realised ratio later.
+                parts = [x for x in (anchored, direct) if x is not None]
+                ratio = round(sum(parts) / len(parts), 3) if parts else None
+                key = PRIMARY_METRIC[p]
+                res[p] = {"coverage": m.get("caught_coverage"), "effect_ratio": ratio, "score": mutation_score(m, ratio),
+                          "effect_detail": {"anchored": anchored, "direct": direct, "probe_primary": (eff.get(p) or {}).get(key),
+                                            "reference_primary": (ref_eff.get(p) or {}).get(key),
+                                            "baseline_primary": (baseline.get(p) or {}).get(key),
+                                            "real_ratio_last_round": real_ratio.get(p)}}
             logger.info(f"[Probe] candidate set {k}: " + ", ".join(f"{p}: cov {v['coverage']} eff {v['effect_ratio']} score {v['score']}" for p, v in res.items()))
             out.append(res)
         shutil.rmtree(root, ignore_errors=True)   # probe markets are disposable
         return out
+
+    def _simulate_probe_set(self, active: dict, root: Path, features: bool = True):
+        """Simulate the probe markets under `active`; returns (X, y, events, summarised effect)."""
+        from concurrent.futures import ProcessPoolExecutor
+        jobs = [(active, c, s, PROBE_TICKS, str(root / f"{c}_{s}")) for c in PROBE_COMMODITIES for s in PROBE_SEEDS]
+        with ProcessPoolExecutor(min(len(jobs), 8)) as ex:
+            dirs = list(ex.map(_probe_market, jobs))
+        Xs, Ys, Es, effs = [], [], [], []
+        for d in dirs:
+            if features:
+                X, y = self.pipeline.load_and_preprocess(Path(d))
+                Xs.append(X); Ys.append(y)
+            ev = pd.read_parquet(Path(d) / "manipulation_events.parquet"); Es.append(ev)
+            effs.append(episode_effectiveness(ev, pd.read_parquet(Path(d) / "trade_log.parquet"),
+                                              pd.read_parquet(Path(d) / "order_log.parquet")))
+        X = pd.concat(Xs) if Xs else None
+        y = pd.concat(Ys) if Ys else None
+        return X, y, pd.concat(Es, ignore_index=True), summarize(pd.concat(effs, ignore_index=True))
+
+    def _probe_baseline(self, base_active: dict, root: Path) -> dict:
+        """
+        Round-0 effect on the probe markets (simulated once with the round-0 parameters,
+        then cached in probe_baseline.json). Empty when round 0 has no params_used.
+        """
+        cache = self.master_run_dir / "probe_baseline.json"
+        if cache.exists():
+            return json.loads(cache.read_text())
+        r0 = self.master_run_dir / "round_0" / "metrics.json"
+        params0 = json.loads(r0.read_text()).get("params_used", {}) if r0.exists() else {}
+        if not params0:
+            return {}
+        active = {p: dict(v) for p, v in base_active.items()}
+        for p, params in params0.items():
+            active[p] = {**active.get(p, {}), **params}
+        _, _, _, eff = self._simulate_probe_set(active, root / "baseline", features=False)
+        cache.write_text(json.dumps(eff, indent=2))
+        logger.info(f"[Probe] round-0 effect on probe markets: " + ", ".join(
+            f"{p}: {d.get(d.get('primary_metric'))}" for p, d in eff.items()))
+        return eff
 
     def _baseline_effectiveness(self) -> dict:
         path = self.master_run_dir / "round_0" / "metrics.json"

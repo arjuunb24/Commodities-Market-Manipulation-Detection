@@ -47,17 +47,23 @@ supervised:
   cv_folds: 3                  # GroupKFold folds for out-of-fold threshold tuning
   cv_block_ticks: 600          # time-block size for CV groups (keeps overlapping windows together)
   threshold_bounds: [0.25, 0.9]  # tuned thresholds are kept inside this range (few-episode robustness)
+  threshold_plateau_tol: 0.005   # thresholds within this (smoothed) OOF F1 of the best form the plateau; its centre is used
+  threshold_keep_tol: 0.01       # on retrain, keep the previous threshold while its OOF F1 is within this of the best
+  threshold_max_keep: 2          # ... but for at most this many retrains in a row, then re-tune
 
 # --- Ensemble Scorer ---
 ensemble:
   # "or_corroborated": flag if a classifier fires, OR the IsolationForest fires AND is
   # corroborated (a classifier >= min_prob_ratio of its threshold, or the account's
-  # own-history deviation |self_z| >= min_self_z). Uncorroborated forest flags become
-  # "review" items. "or": any forest flag is an alert (previous behaviour).
+  # own-history deviation |self_z| >= min_self_z on at least min_self_z_cols features).
+  # Uncorroborated forest flags become "review" items. "or": any forest flag is an alert.
+  # Frozen-detector check (run 092237Z): 6.0 x 1 feature -> algo false alerts 6.3-7.4%;
+  # 10.0 x 2 -> 1.4-1.5% with frozen coverage unchanged (round 1 spoofing 0.826 -> 0.818).
   combination_rule: "or_corroborated"
   iso_corroboration:
     min_prob_ratio: 0.5
-    min_self_z: 6.0
+    min_self_z: 10.0
+    min_self_z_cols: 2
   iso_weight: 0.4              # used only if combination_rule = "weighted"
   supervised_weight: 0.6
   supervised_threshold: 0.5    # fallback when a threshold cannot be tuned

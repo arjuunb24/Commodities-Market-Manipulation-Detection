@@ -36,6 +36,7 @@ import json
 import logging
 from typing import Any
 
+from src.adversarial.effectiveness import EFFECT_AT_RISK
 from src.agentic.llm_client import LLMClient, llm_unavailable_reason
 from src.agentic.mutation_library import get_fallback_mutation
 from src.agentic.tools import PROPOSE_MUTATION_SCHEMA, ToolRegistry, bounds_prompt_text
@@ -43,13 +44,14 @@ from src.agentic.tools import PROPOSE_MUTATION_SCHEMA, ToolRegistry, bounds_prom
 logger = logging.getLogger(__name__)
 
 PROBE_MIN_GAIN = 0.02   # an alternative replaces the primary only if its probe score is higher by this much
+MAX_TRUNCATION_RETRIES = 2   # replies cut off by max_tokens that do not count against max_tool_calls
 
 STRATEGIST_SYSTEM_PROMPT = """You are the adversary in a SIMULATED market-surveillance research loop (synthetic traders only). Each round you re-tune manipulation personas to evade an ML detector that is retrained every round on everything it has seen.
 
 OBJECTIVE per persona: maximise score = evasion x min(1, effect ratio), where
   evasion = 0.5 x (1 - coverage) + 0.3 x missed + 0.2 x delay, all measured against the FROZEN detector (trained BEFORE it saw your mutation):
   - coverage: share of each episode's account-windows that raised ANY alert (lower is better; adding accounts does NOT dilute it)
-  - missed:   share of episodes that never raised any alert (the strongest evasion)
+  - missed:   share of episodes with under 20% of their windows raising any alert (the strongest evasion)
   Being flagged under ANOTHER persona's label is still caught (e.g. split spoofing caught as layering earns nothing).
   - delay:    how late caught episodes were detected (capped at 300 ticks)
   - effect ratio: the scheme's market effect vs. round 0 (spoof price impact, wash-volume share, pump buying pressure). Below 0.5 the score is 0 (that is not manipulating, not evading). Above 1.0 earns NOTHING extra: making a scheme bigger (e.g. more pump accounts) only makes it easier to catch, so aim for an effect of roughly 0.6-1.2.
@@ -217,6 +219,7 @@ class AdversarialStrategist:
         reasoning_log: dict[str, str] = {}
         source: dict[str, str] = {}
         turns = 0
+        truncations = 0
 
         unavailable = llm_unavailable_reason(self.config)
         if unavailable:
@@ -236,6 +239,17 @@ class AdversarialStrategist:
             tool_calls = choice.get("tool_calls") or []
             if not tool_calls:
                 content = choice.get("content") or ""
+                if response["choices"][0].get("finish_reason") == "length" and not _proposals_in_text(content):
+                    # Cut off before calling the tool (it can loop "now propose for X..." until the
+                    # limit). Do not feed that text back, and do not let it use up a persona's turn.
+                    truncations += 1
+                    if truncations <= MAX_TRUNCATION_RETRIES:
+                        turns -= 1
+                    logger.warning(f"[Strategist] reply hit the output limit without a tool call ({truncations}x).")
+                    messages.append({"role": "user", "content": (
+                        "Your last reply hit the output limit before calling the tool. Keep the reasoning short and "
+                        f"call `propose_mutation` now, one persona per call, for: {sorted(pending)}.")})
+                    continue
                 if content:
                     messages.append({"role": "assistant", "content": content})
                 # Models sometimes write the call as JSON text; accept it rather than waste turns.
@@ -341,13 +355,21 @@ class AdversarialStrategist:
         for p, fs in full.items():
             scored = [(k, (results[k].get(p) or {})) for k in range(len(fs))]
             sc = lambda r: r.get("score") if r.get("score") is not None else -1.0  # noqa: E731
-            best_k = max(scored, key=lambda kv: (sc(kv[1]), -kv[0]))[0]
-            # Probe markets are small: switch away from the primary only for a real gain, not noise.
-            if best_k and sc(scored[best_k][1]) - sc(scored[0][1]) < PROBE_MIN_GAIN:
-                best_k = 0
+            # The effect guard also looks ahead: a candidate the probe already puts at risk
+            # (< EFFECT_AT_RISK) is only used when every candidate is at risk, and then the
+            # one keeping the most effect wins.
+            safe = [kv for kv in scored if kv[1].get("effect_ratio") is None or kv[1]["effect_ratio"] >= EFFECT_AT_RISK]
+            if safe:
+                best_k = max(safe, key=lambda kv: (sc(kv[1]), -kv[0]))[0]
+                # Probe markets are small: switch away from a safe primary only for a real gain, not noise.
+                if best_k and safe[0][0] == 0 and sc(scored[best_k][1]) - sc(scored[0][1]) < PROBE_MIN_GAIN:
+                    best_k = 0
+            else:
+                best_k = max(scored, key=lambda kv: (kv[1].get("effect_ratio") or 0.0, -kv[0]))[0]
             out[p] = {"chosen": best_k, "candidates": [
                 {"changes": cands[p][k], **({"origin": "code exploration"} if explore_idx.get(p) == k else {}),
-                 **{m: r.get(m) for m in ("coverage", "effect_ratio", "score")}} for k, r in scored]}
+                 **{m: r.get(m) for m in ("coverage", "effect_ratio", "score")},
+                 **({"effect_detail": r["effect_detail"]} if "effect_detail" in r else {})} for k, r in scored]}
             if best_k > 0:
                 self.tools.propose_mutation(persona=p, parameters=fs[best_k], reasoning="probe winner")
             summary = "; ".join(f"#{k}{'*' if k == best_k else ''}{'(explore)' if explore_idx.get(p) == k else ''} "

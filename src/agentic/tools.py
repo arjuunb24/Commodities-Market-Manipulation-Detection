@@ -84,6 +84,7 @@ PARAM_BOUNDS: dict[str, dict[str, tuple[type, float, float, str]]] = {
         "cancel_jitter": (float, 0.0, 0.8, "cancel delay drawn from delay x U(1-j, 1+j)"),
         "frequency": (float, 0.05, 1.0, "chance per tick to start a new layering cycle"),
         "busy_period_bias": (float, 0.0, 1.0, "skip quiet periods; act mainly when the market is busy (advisory #5)"),
+        "placement_stagger": (int, 0, 5, "ticks between successive layers: 0 = whole ladder in one tick; k = one layer every k ticks (no same-tick multi-level batch, but the full ladder rests for less of the cycle)"),
         "cover_rate": (float, 0.0, 0.5, "per-account chance per tick of a genuine cover order inside the window (Sarao/Coscia traded genuinely too)"),
         "cover_size": (float, 0.0, 3.0, "cover order size x average level depth; the detector's ratios are volume-weighted, so small cover barely dilutes"),
     },
@@ -99,7 +100,8 @@ MUTABLE_PERSONAS = tuple(PARAM_BOUNDS)
 # Used by the effect guard (at risk: undo these; surplus: spend them on evasion).
 EFFECT_COST: dict[str, dict[str, str]] = {
     "spoofing": {"order_size_multiplier": "down", "price_aggressiveness": "up"},
-    "layering": {"layer_spacing": "up", "n_layers": "down", "layer_size_multiplier": "down", "size_taper": "up"},
+    "layering": {"layer_spacing": "up", "n_layers": "down", "layer_size_multiplier": "down", "size_taper": "up",
+                 "placement_stagger": "up"},
     "wash_trading": {"trade_frequency": "down", "camouflage_rate": "up"},
     "pump_and_dump": {"ignition_aggression": "down", "accumulation_size": "down",
                       "n_coordinated_accounts": "down", "burst_duration_ticks": "up"},

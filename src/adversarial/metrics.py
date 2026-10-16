@@ -22,6 +22,13 @@ Two levels, both per persona (SRS FR-2.6 — never one lumped number):
                flagged under another persona's label is still caught; the
                strategist's evasion score uses these, so relabelling (e.g. split
                spoofing flagged as layering) is not rewarded as evasion.
+               caught_weak_share = share of episodes with under WEAK_COVERAGE of
+               their windows caught: an episode flagged in one window of twenty is
+               practically missed, and "any window" detection was 16/16 every round.
+  Family       family_coverage (spoofing, layering): episode coverage counting
+               flags under the persona's own label OR its fake-depth sibling's, so
+               "spoofing caught as layering" is visible as a labelling issue rather
+               than read as a miss by the persona's own classifier.
 """
 
 from __future__ import annotations
@@ -72,13 +79,27 @@ def event_detection(
     return len(ev), len(latencies), latencies
 
 
+WEAK_COVERAGE = 0.2   # an episode with under 20% of its windows flagged counts as (practically) missed
+
+# Schemes the law treats as one offence and the detector cannot always tell apart: layering is
+# a form of spoofing (CEA 4c(a)(5)(C)), and spoofing split over consecutive levels is a ladder.
+PERSONA_FAMILY = {"spoofing": ("spoofing", "layering"), "layering": ("spoofing", "layering")}
+
+
 def episode_coverage(results: pd.DataFrame, y: pd.DataFrame, events: pd.DataFrame, persona: str,
                      flag_col: str | None = None) -> float:
     """Mean over episodes of the flagged share of that episode's labelled rows (NaN if none)."""
+    shares = episode_shares(results, y, events, persona, flag_col)
+    return round(float(np.mean(shares)), 4) if shares else float("nan")
+
+
+def episode_shares(results: pd.DataFrame, y: pd.DataFrame, events: pd.DataFrame, persona: str,
+                   flag_col: str | None = None) -> list[float]:
+    """Flagged share of each episode's labelled rows (episodes without labelled rows are skipped)."""
     ev = events[events["persona"] == persona] if events is not None and not events.empty else pd.DataFrame()
     flag_col = flag_col or f"flag_{persona}"
     if ev.empty or flag_col not in results.columns or persona not in y.columns:
-        return float("nan")
+        return []
     frame = results[[flag_col, "window_end"]].join(y[[persona]].rename(columns={persona: "_label"})).reset_index()
     frame = frame[frame["_label"] == 1]
     shares = []
@@ -87,7 +108,7 @@ def episode_coverage(results: pd.DataFrame, y: pd.DataFrame, events: pd.DataFram
                      & (frame["window_end"] >= e["start_tick"]) & (frame["window_start"] <= e["end_tick"])]
         if len(rows):
             shares.append(float(rows[flag_col].astype(bool).mean()))
-    return round(float(np.mean(shares)), 4) if shares else float("nan")
+    return shares
 
 
 def compute_round_metrics(
@@ -131,9 +152,17 @@ def compute_round_metrics(
             "episode_coverage": episode_coverage(res, lab, events, persona) if events is not None else float("nan"),
         }
         if events is not None and "final_flag" in res.columns:
+            family = [p for p in PERSONA_FAMILY.get(persona, ()) if f"flag_{p}" in res.columns]
+            if len(family) > 1:
+                # flagged under its own label OR its family sibling's (spoofing <-> layering)
+                fam = res.assign(_family_flag=res[[f"flag_{p}" for p in family]].any(axis=1))
+                entry["family_coverage"] = episode_coverage(fam, lab, events, persona, flag_col="_family_flag")
             c_ev, c_det, c_lats = event_detection(res, events, persona, flag_col="final_flag")
+            c_shares = episode_shares(res, lab, events, persona, flag_col="final_flag")
             entry.update({
-                "caught_coverage": episode_coverage(res, lab, events, persona, flag_col="final_flag"),
+                "caught_coverage": round(float(np.mean(c_shares)), 4) if c_shares else float("nan"),
+                # share of episodes barely caught (< WEAK_COVERAGE of their windows on any alert)
+                "caught_weak_share": round(float(np.mean([s < WEAK_COVERAGE for s in c_shares])), 4) if c_shares else float("nan"),
                 "caught_events_detected": c_det,
                 "caught_latency_ticks": round(float(np.mean(c_lats)), 1) if c_lats else float("nan"),
             })

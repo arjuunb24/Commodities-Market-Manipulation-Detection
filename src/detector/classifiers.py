@@ -64,6 +64,10 @@ class SupervisedDetector:
         self.cv_folds = int(sup.get("cv_folds", 3))
         self.block_ticks = int(sup.get("cv_block_ticks", 600))
         self.threshold_bounds = tuple(sup.get("threshold_bounds", [0.25, 0.9]))
+        self.threshold_plateau_tol = float(sup.get("threshold_plateau_tol", 0.005))
+        self.threshold_keep_tol = float(sup.get("threshold_keep_tol", 0.01))
+        self.threshold_max_keep = int(sup.get("threshold_max_keep", 2))
+        self._kept_rounds: dict[str, int] = {}   # consecutive retrains each persona's threshold was kept
         self.default_threshold = float(config.get("ensemble", {}).get("supervised_threshold", 0.5))
         self.models: dict[str, Any] = {}
         self.thresholds: dict[str, float] = {}
@@ -101,7 +105,30 @@ class SupervisedDetector:
             ws = np.arange(len(X))
         return ws // max(1, self.block_ticks)
 
-    def _tune_threshold(self, Xp: pd.DataFrame, y: np.ndarray, groups: np.ndarray, spw: float) -> float:
+    def _pick_threshold(self, grid: np.ndarray, scores: list[float], previous: float | None,
+                        kept: int = 0) -> float:
+        """
+        Stable choice from the OOF F1 curve. The raw argmax jumped around between
+        retrains (spoofing 0.43 -> 0.28 -> 0.48 -> 0.68 -> 0.35) because the curve is a
+        flat, noisy plateau. So: smooth over neighbouring grid points, take the centre
+        of the near-optimal plateau, and keep the previous round's threshold while it
+        is still within `threshold_keep_tol` F1 of the best - but for at most
+        `threshold_max_keep` retrains in a row (`kept` so far), so an early threshold
+        cannot stay frozen while the data moves on (spoofing sat at 0.75 for 5 rounds).
+        """
+        s = np.asarray(scores, dtype=float)
+        smooth = np.convolve(np.pad(s, 1, mode="edge"), np.ones(3) / 3, mode="valid")
+        top = smooth.max()
+        plateau = grid[smooth >= top - self.threshold_plateau_tol]
+        best = float(grid[np.abs(grid - np.median(plateau)).argmin()])
+        if previous is not None and kept < self.threshold_max_keep:
+            at_prev = float(np.interp(previous, grid, smooth))
+            if at_prev >= top - self.threshold_keep_tol:
+                return float(previous)
+        return best
+
+    def _tune_threshold(self, Xp: pd.DataFrame, y: np.ndarray, groups: np.ndarray, spw: float,
+                        previous: float | None = None, kept: int = 0) -> float:
         pos_groups = np.unique(groups[y == 1])
         n_splits = min(self.cv_folds, len(np.unique(groups)))
         if len(pos_groups) < 2 or n_splits < 2:
@@ -119,8 +146,9 @@ class SupervisedDetector:
         lo, hi = self.threshold_bounds
         grid = np.linspace(lo, hi, 27)
         scores = [f1_score(y[ok], (oof[ok] >= t).astype(int), zero_division=0) for t in grid]
-        best = float(grid[int(np.argmax(scores))])
-        logger.info("    tuned threshold %.2f (OOF F1=%.3f)", best, max(scores))
+        best = self._pick_threshold(grid, scores, previous, kept)
+        logger.info("    tuned threshold %.2f (OOF F1 %.3f there, max %.3f)", best,
+                    float(np.interp(best, grid, scores)), max(scores))
         return best
 
     def fit(self, X: pd.DataFrame, y: pd.DataFrame) -> None:
@@ -136,6 +164,7 @@ class SupervisedDetector:
         self.feature_columns = model_columns(X)
         Xm = X[self.feature_columns]
         groups = self._groups(X)
+        previous = dict(self.thresholds)   # retraining the same detector: keep thresholds steady
         self.models, self.thresholds, self._explainers = {}, {}, {}
         for persona in self.personas:
             if persona not in y.columns:
@@ -153,7 +182,9 @@ class SupervisedDetector:
                 continue
             spw = n_neg / n_pos
             logger.info("[%s] training on %d rows (%d positive, scale_pos_weight=%.1f)", persona, len(target), n_pos, spw)
-            self.thresholds[persona] = self._tune_threshold(Xm, target, groups, spw)
+            prev, kept = previous.get(persona), self._kept_rounds.get(persona, 0)
+            self.thresholds[persona] = self._tune_threshold(Xm, target, groups, spw, prev, kept)
+            self._kept_rounds[persona] = kept + 1 if prev is not None and self.thresholds[persona] == prev else 0
             model = self._make_model(spw, len(target))
             model.fit(Xm, target)
             self.models[persona] = model

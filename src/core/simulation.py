@@ -179,6 +179,7 @@ class SimConfig:
     layer_cancel_jitter: float = 0.0
     layer_frequency: float = 0.3
     layer_busy_bias: float = 0.0
+    layer_placement_stagger: int = 0
     layer_cover_rate: float = 0.0
     layer_cover_size: float = 0.0
 
@@ -342,6 +343,7 @@ def _build_persona(persona, ep_idx, start, end, config, sub_rngs, jitter_rng) ->
             cancel_jitter=float(config.layer_cancel_jitter),
             frequency=float(config.layer_frequency),
             busy_period_bias=float(config.layer_busy_bias),
+            placement_stagger=int(config.layer_placement_stagger),
             start_tick=start, end_tick=end, background_rate=bg,
         )]
     raise ValueError(f"Unknown persona {persona!r}")

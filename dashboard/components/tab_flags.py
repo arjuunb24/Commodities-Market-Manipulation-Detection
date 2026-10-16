@@ -431,6 +431,13 @@ def render_flags_tab(run_dir: Path | None, selected_round: int, market: str | No
             st.caption(f"🗂️ {n_review:,} review-tier windows: the IsolationForest found them unusual but no classifier or "
                        "own-history deviation corroborated it, so they are not raised as alerts (typically legitimate "
                        "HFT firms and execution algorithms).")
+    fake_depth = {"spoofing", "layering"}
+    n_sibling = int((cls["gt_persona"].isin(fake_depth) & cls["persona"].isin(fake_depth)
+                     & (cls["gt_persona"] != cls["persona"])).sum()) if not cls.empty else 0
+    if n_sibling:
+        st.caption(f"🔁 {n_sibling} case(s) were labelled spoofing while the episode was layering, or the reverse. Both are "
+                   "fake-depth schemes (layering is a form of spoofing under CEA §4c(a)(5)(C)), and split spoof orders "
+                   "on consecutive levels look like a layer ladder, so read the label as the fake-depth family.")
     st.caption("Detector flags are model output on synthetic data — not findings about real traders. "
                "Metrics cover the test market selected in the sidebar.")
 
