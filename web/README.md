@@ -39,6 +39,8 @@ Chart colours come from a palette checked with a colour-vision validator. Person
 
 ## Hosting from this PC
 
+Full guide (local, Wi-Fi and public hosting, troubleshooting): [docs/WEB_APP.md](../docs/WEB_APP.md).
+
 `scripts\webapp` runs the built app in the background and turns it on or off:
 
 ```

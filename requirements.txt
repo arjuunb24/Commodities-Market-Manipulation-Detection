@@ -30,6 +30,8 @@ tenacity>=8.2          # retry/backoff for LLM calls
 
 # --- dashboard ---
 streamlit>=1.35
+fastapi>=0.110         # web API behind the React app (api/)
+uvicorn>=0.29          # serves the API and the built React app
 plotly>=5.22
 altair>=5.3
 
