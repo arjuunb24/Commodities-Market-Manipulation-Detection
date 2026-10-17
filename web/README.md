@@ -36,3 +36,18 @@ API docs are at `/api/docs`. The AI features (case note and analyst) use the pro
 Vite, React 18, TypeScript, Tailwind CSS, Framer Motion (page, list and number transitions), ECharts (all charts), TanStack Query, React Router, Lucide icons and react-markdown.
 
 Chart colours come from a palette checked with a colour-vision validator. Personas also carry a marker shape, so their identity never depends on colour alone. Charts with a Data button switch to a table of their values.
+
+## Hosting from this PC
+
+`scripts\webapp` runs the built app in the background and turns it on or off:
+
+```
+scripts\webapp start                           # http://localhost:8000
+scripts\webapp start -Lan                      # also other devices on the same Wi-Fi
+scripts\webapp start -Public -Password <pw>    # an internet link via a Cloudflare quick tunnel
+scripts\webapp status
+scripts\webapp stop
+```
+
+`-Public` needs `cloudflared` (`winget install --id Cloudflare.cloudflared`) and a password,
+because the analyst chat spends your LLM budget. `-Build` rebuilds `web/dist` first. Logs are in `.webapp\`.

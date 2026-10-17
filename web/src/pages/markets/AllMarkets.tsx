@@ -2,7 +2,7 @@ import { motion } from "framer-motion";
 import { useMemo, useState } from "react";
 import type { EChartsOption } from "echarts";
 import { EChart } from "@/components/charts/EChart";
-import { axisCommon, base, grid, hexA, legend, tooltip, ttRow, ttTitle, valueAxis, MONO } from "@/components/charts/base";
+import { axisCommon, base, grid, hexA, legend, tooltip, ttRow, ttTitle, valueAxis, MONO, narrow } from "@/components/charts/base";
 import { ChartCard, Chip, PersonaMark, StatGrid, StatTile, fadeUp, stagger } from "@/components/ui";
 import type { Overview } from "@/lib/api";
 import { fmtCompact, fmtInt, fmtNum, fmtPrice, fmtSignedPct, tickClock } from "@/lib/format";
@@ -76,21 +76,21 @@ export function AllMarkets({ data, onPick }: { data: Overview; onPick: (c: strin
   );
 
   const multiples = useMemo(() => {
-    const cols = 4;
+    const cols = narrow() ? 2 : 4;
     const rows = Math.ceil(commodities.length / cols);
     const pticks = data.prices?.ticks ?? [];
     const g = commodities.map((_, i) => ({
-      left: `${(i % cols) * 25 + 1.5}%`,
-      width: "22%",
+      left: `${(i % cols) * (100 / cols) + 1.5}%`,
+      width: `${100 / cols - 3}%`,
       containLabel: true,
-      top: `${Math.floor(i / cols) * (100 / rows) + 9}%`,
-      height: `${100 / rows - 17}%`,
+      top: `${Math.floor(i / cols) * (100 / rows) + (cols === 2 ? 5 : 9)}%`,
+      height: `${100 / rows - (cols === 2 ? 9 : 17)}%`,
     }));
     return base({
       grid: g,
       title: commodities.map((c, i) => ({
         text: COMMODITY_META[c]?.label ?? c,
-        left: `${(i % cols) * 25 + 1.5}%`,
+        left: `${(i % cols) * (100 / cols) + 1.5}%`,
         top: `${Math.floor(i / cols) * (100 / rows) + 1}%`,
         textStyle: { color: INK.secondary, fontSize: 11.5, fontWeight: 500, fontFamily: '"IBM Plex Sans"' },
       })),
@@ -136,7 +136,7 @@ export function AllMarkets({ data, onPick }: { data: Overview; onPick: (c: strin
       xAxis: { type: "category", data: short, ...axisCommon, splitLine: { show: false }, axisLine: { show: false } },
       yAxis: { type: "category", data: short, ...axisCommon, splitLine: { show: false }, axisLine: { show: false }, inverse: true },
       visualMap: { min: -1, max: 1, calculable: false, orient: "vertical", right: 0, top: "middle", itemHeight: 140, itemWidth: 10, inRange: { color: DIVERGING }, textStyle: { color: INK.muted, fontFamily: MONO, fontSize: 10 }, text: ["+1", "-1"] },
-      series: [{ type: "heatmap", data: cells, itemStyle: { borderColor: INK.surface, borderWidth: 2, borderRadius: 3 }, label: { show: true, color: INK.primary, fontSize: 10, fontFamily: MONO, formatter: (p: { value: unknown }) => fmtNum(Math.abs((p.value as number[])[2]) < 0.005 ? 0 : (p.value as number[])[2], 2) }, emphasis: { itemStyle: { borderColor: INK.primary } } }],
+      series: [{ type: "heatmap", data: cells, itemStyle: { borderColor: INK.surface, borderWidth: 2, borderRadius: 3 }, label: { show: !narrow(), color: INK.primary, fontSize: 10, fontFamily: MONO, formatter: (p: { value: unknown }) => fmtNum(Math.abs((p.value as number[])[2]) < 0.005 ? 0 : (p.value as number[])[2], 2) }, emphasis: { itemStyle: { borderColor: INK.primary } } }],
     });
   }, [data]);
 
@@ -188,7 +188,7 @@ export function AllMarkets({ data, onPick }: { data: Overview; onPick: (c: strin
         <StatTile label="Ground-truth episodes" value={data.kpi.events} format={fmtInt} tone={data.kpi.events ? "warn" : "good"} sub="Injected by the simulator" />
       </StatGrid>
 
-      <motion.div variants={stagger(0.04)} initial="hidden" animate="show" className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <motion.div variants={stagger(0.04)} initial="hidden" animate="show" className="mt-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
         {sortCommodities(data.snapshot.map((s) => s.commodity)).map((c) => {
           const s = data.snapshot.find((x) => x.commodity === c)!;
           const meta = COMMODITY_META[c];
@@ -199,11 +199,11 @@ export function AllMarkets({ data, onPick }: { data: Overview; onPick: (c: strin
               variants={fadeUp}
               onClick={() => onPick(c)}
               whileHover={{ y: -2 }}
-              className="focus-ring panel group p-4 text-left transition-colors hover:border-ink-600"
+              className="focus-ring panel group min-w-0 p-3 text-left transition-colors hover:border-ink-600 sm:p-4"
             >
               <div className="flex items-start justify-between gap-2">
-                <div>
-                  <div className="flex items-center gap-2 text-[13px] font-semibold text-fg">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 truncate text-[13px] font-semibold text-fg">
                     <span className="h-2 w-2 rounded-full" style={{ background: meta?.color }} />
                     {meta?.label}
                   </div>
@@ -212,13 +212,16 @@ export function AllMarkets({ data, onPick }: { data: Overview; onPick: (c: strin
                   </div>
                 </div>
                 {s.events > 0 ? (
-                  <span className="rounded-md border border-warn/30 bg-warn/10 px-1.5 py-0.5 text-[10.5px] font-medium text-warn">{s.events} episodes</span>
+                  <span className="shrink-0 rounded-md border border-warn/30 bg-warn/10 px-1.5 py-0.5 text-[10.5px] font-medium text-warn" title={`${s.events} ground-truth episodes`}>
+                    {s.events}
+                    <span className="hidden sm:inline"> episodes</span>
+                  </span>
                 ) : (
-                  <span className="rounded-md border border-good/30 bg-good/10 px-1.5 py-0.5 text-[10.5px] font-medium text-good">Clean</span>
+                  <span className="shrink-0 rounded-md border border-good/30 bg-good/10 px-1.5 py-0.5 text-[10.5px] font-medium text-good">Clean</span>
                 )}
               </div>
-              <div className="mt-3 flex items-baseline justify-between">
-                <span className="text-[20px] font-semibold tracking-tight text-fg">{fmtPrice(s.last)}</span>
+              <div className="mt-3 flex flex-wrap items-baseline justify-between gap-x-2">
+                <span className="text-[17px] font-semibold tracking-tight text-fg sm:text-[20px]">{fmtPrice(s.last)}</span>
                 <span className={up ? "font-mono text-[12px] text-good" : "font-mono text-[12px] text-critical"}>
                   {up ? "▲" : "▼"} {fmtSignedPct(s.pct)}
                 </span>
@@ -264,7 +267,7 @@ export function AllMarkets({ data, onPick }: { data: Overview; onPick: (c: strin
 
       <div className="mt-4">
         <ChartCard title="Small multiples" subtitle="Each book on its own price scale. Shading marks manipulation spans, coloured by persona.">
-          <EChart option={multiples} height={420} />
+          <EChart option={multiples} height={narrow() ? 620 : 420} />
           <div className="mt-2 flex flex-wrap gap-3">
             {PERSONAS.map((p) => (
               <span key={p} className="flex items-center gap-1.5 text-[11.5px] text-fg-2">

@@ -2,6 +2,7 @@ import clsx from "clsx";
 import { motion } from "framer-motion";
 import { Activity, BrainCircuit, CandlestickChart, Gauge, LayoutDashboard, MessagesSquare, ScanSearch, Swords } from "lucide-react";
 import { NavLink, useLocation } from "react-router-dom";
+import { useId } from "react";
 import { useRoundSummary } from "@/lib/api";
 import { fmtNum } from "@/lib/format";
 import { useSelection } from "@/lib/selection";
@@ -21,6 +22,8 @@ export const NAV = [
 
 export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
   const { search, run, round, scopeMarket } = useSelection();
+  // Unique per instance: the desktop sidebar stays mounted while the phone drawer is open.
+  const lid = useId();
   const loc = useLocation();
   const summary = useRoundSummary(run, round, scopeMarket);
   const scope = useScopeLabel();
@@ -50,13 +53,13 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
                 >
                   {active && (
                     <motion.span
-                      layoutId="nav-active"
+                      layoutId={`nav-active-${lid}`}
                       className="absolute inset-0 rounded-lg border border-ink-600 bg-ink-800"
                       transition={{ type: "spring", stiffness: 480, damping: 38 }}
                     />
                   )}
                   {active && (
-                    <motion.span layoutId="nav-bar" className="absolute left-0 top-2 h-[calc(100%-16px)] w-[2px] rounded-full bg-accent" />
+                    <motion.span layoutId={`nav-bar-${lid}`} className="absolute left-0 top-2 h-[calc(100%-16px)] w-[2px] rounded-full bg-accent" />
                   )}
                   <n.icon size={16} className={clsx("relative z-10", active ? "text-accent" : "")} strokeWidth={1.9} />
                   <span className="relative z-10">{n.label}</span>

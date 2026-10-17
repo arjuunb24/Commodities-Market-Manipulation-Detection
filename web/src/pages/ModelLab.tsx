@@ -2,7 +2,7 @@ import clsx from "clsx";
 import { useMemo, useState } from "react";
 import type { EChartsOption } from "echarts";
 import { EChart } from "@/components/charts/EChart";
-import { axisCommon, base, grid, legend, tooltip, ttRow, ttTitle, valueAxis, MONO, hexA } from "@/components/charts/base";
+import { axisCommon, base, grid, legend, tooltip, ttRow, ttTitle, valueAxis, MONO, hexA, narrow } from "@/components/charts/base";
 import { Callout, ChartCard, Chip, DataTable, ErrorNote, PageHeader, PersonaMark, SectionTitle, Segmented, Skeleton, StatGrid, StatTile } from "@/components/ui";
 import { useParams as useParamHistory, usePerformance, type PerfRow } from "@/lib/api";
 import { fmtNum, fmtPct, fmtVal } from "@/lib/format";
@@ -106,7 +106,7 @@ export default function ModelLab() {
       xAxis: { type: "category", data: rounds.map((r) => `R${r}`), position: "top", ...axisCommon, splitLine: { show: false }, axisLine: { show: false } },
       yAxis: { type: "category", data: ps.map((p) => PERSONA_META[p].label), inverse: true, ...axisCommon, splitLine: { show: false }, axisLine: { show: false }, axisLabel: { color: INK.secondary, fontSize: 11.5 } },
       visualMap: { min: 0.5, max: 1, orient: "vertical", right: 0, top: "middle", itemHeight: 130, itemWidth: 10, inRange: { color: SEQ_BLUE.slice(1, 6) }, textStyle: { color: INK.muted, fontFamily: MONO, fontSize: 10 }, text: ["1.0", "0.5"] },
-      series: [{ type: "heatmap", data: cells, itemStyle: { borderColor: INK.surface, borderWidth: 3, borderRadius: 4 }, label: { show: true, color: INK.primary, fontFamily: MONO, fontSize: 11.5, formatter: (p: { value: unknown }) => fmtNum((p.value as number[])[2], 3) } }],
+      series: [{ type: "heatmap", data: cells, itemStyle: { borderColor: INK.surface, borderWidth: 3, borderRadius: 4 }, label: { show: true, color: INK.primary, fontFamily: MONO, fontSize: narrow() ? 9 : 11.5, formatter: (p: { value: unknown }) => fmtNum((p.value as number[])[2], narrow() ? 2 : 3) } }],
     });
   }, [post, rounds]);
 
@@ -173,7 +173,8 @@ export default function ModelLab() {
         return ttTitle(`${q2.seriesName} · round ${q2.value[2]}`) + ttRow(q2.color, "Precision", fmtNum(q2.value[0], 3)) + ttRow(q2.color, "Recall", fmtNum(q2.value[1], 3)) + ttRow(INK.muted, "Support", String(q2.value[3]));
       } },
       xAxis: valueAxis({ min: Math.min(lowP, 0.5), max: 1, name: "Precision", nameLocation: "middle", nameGap: 26 }),
-      yAxis: valueAxis({ min: Math.min(lowR, 0.5), max: 1, name: "Recall" }),
+      // On phones the one-row legend takes the axis-name slot; the tooltip still names both axes.
+      yAxis: valueAxis({ min: Math.min(lowR, 0.5), max: 1, name: narrow() ? "" : "Recall" }),
       series: [
         ...iso,
         ...ps.map((p) => {

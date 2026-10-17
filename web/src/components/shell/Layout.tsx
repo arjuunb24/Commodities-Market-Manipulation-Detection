@@ -37,25 +37,29 @@ export function Layout() {
       </div>
 
       <AnimatePresence>
+        {/* Direct, keyed children: AnimatePresence cannot track exits inside a fragment, and an
+            unfinished exit left the overlay covering the menu button after the first close. */}
         {drawer && (
-          <>
-            <motion.div
-              className="fixed inset-0 z-40 bg-black/60 backdrop-blur-sm lg:hidden"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              onClick={() => setDrawer(false)}
-            />
-            <motion.div
-              className="fixed inset-y-0 left-0 z-50 lg:hidden"
-              initial={{ x: -260 }}
-              animate={{ x: 0 }}
-              exit={{ x: -260 }}
-              transition={{ type: "spring", stiffness: 380, damping: 38 }}
-            >
-              <Sidebar key={paint} onNavigate={() => setDrawer(false)} />
-            </motion.div>
-          </>
+          <motion.div
+            key="drawer-scrim"
+            className="fixed inset-0 z-40 bg-black/60 backdrop-blur-sm lg:hidden"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0, pointerEvents: "none" }}
+            onClick={() => setDrawer(false)}
+          />
+        )}
+        {drawer && (
+          <motion.div
+            key="drawer-panel"
+            className="fixed inset-y-0 left-0 z-50 lg:hidden"
+            initial={{ x: -260 }}
+            animate={{ x: 0 }}
+            exit={{ x: -260, pointerEvents: "none" }}
+            transition={{ type: "spring", stiffness: 380, damping: 38 }}
+          >
+            <Sidebar key={paint} onNavigate={() => setDrawer(false)} />
+          </motion.div>
         )}
       </AnimatePresence>
 

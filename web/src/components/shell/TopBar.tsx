@@ -1,6 +1,7 @@
 import clsx from "clsx";
 import { motion } from "framer-motion";
 import { Menu, Sparkles } from "lucide-react";
+import { useId } from "react";
 import { useAiStatus } from "@/lib/api";
 import { marketLabel, useSelection } from "@/lib/selection";
 import { tickClock } from "@/lib/format";
@@ -10,6 +11,9 @@ import { ThemePicker } from "./ThemePicker";
 
 function RoundScrubber() {
   const { rounds, round, setRound } = useSelection();
+  // The bar mounts two scrubbers (wide and phone rows); a shared layoutId would let the
+  // hidden one take the highlight, leaving the visible selection blank after navigation.
+  const pill = `round-pill-${useId()}`;
   if (!rounds.length) return null;
   return (
     <div className="flex items-center gap-2">
@@ -28,7 +32,7 @@ function RoundScrubber() {
               title={i === 0 ? "Baseline round (no mutations)" : `Round ${r.round}: mutated personas`}
             >
               {active && (
-                <motion.span layoutId="round-pill" className="absolute inset-0 rounded-md bg-accent" transition={{ type: "spring", stiffness: 520, damping: 36 }} />
+                <motion.span layoutId={pill} className="absolute inset-0 rounded-md bg-accent" transition={{ type: "spring", stiffness: 520, damping: 36 }} />
               )}
               <span className="relative z-10 font-medium">R{r.round}</span>
             </button>

@@ -1,7 +1,8 @@
 import clsx from "clsx";
 import { AnimatePresence, motion } from "framer-motion";
 import { Check, Moon, Palette, Sun } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { THEMES, cycleTheme, setTheme, useTheme, type Theme } from "@/lib/themes";
 
 /** Miniature of the theme: its page, a panel, the accent and the first data hues. */
@@ -38,22 +39,31 @@ function Preview({ t }: { t: Theme }) {
 export function ThemePicker() {
   const theme = useTheme();
   const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
+  const btn = useRef<HTMLButtonElement>(null);
+  const [anchor, setAnchor] = useState({ top: 64, right: 16 });
+  const [sheet, setSheet] = useState(() => typeof window !== "undefined" && window.innerWidth < 640);
+
+  // The panel lives in a portal (the top bar's backdrop blur would otherwise trap fixed
+  // positioning), anchored under the button on wide screens and as a bottom sheet on phones.
+  useLayoutEffect(() => {
+    if (!open) return;
+    const place = () => {
+      const r = btn.current?.getBoundingClientRect();
+      if (r) setAnchor({ top: r.bottom + 8, right: Math.max(8, window.innerWidth - r.right) });
+      setSheet(window.innerWidth < 640);
+    };
+    place();
+    window.addEventListener("resize", place);
+    return () => window.removeEventListener("resize", place);
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setOpen(false);
     };
-    document.addEventListener("mousedown", onDown);
     document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("mousedown", onDown);
-      document.removeEventListener("keydown", onKey);
-    };
+    return () => document.removeEventListener("keydown", onKey);
   }, [open]);
 
   // Shift+T cycles themes from anywhere outside a text field.
@@ -71,9 +81,14 @@ export function ThemePicker() {
   }, []);
 
   return (
-    <div ref={ref} className="relative">
+    <div className="relative">
       <button
-        onClick={() => setOpen((o) => !o)}
+        ref={btn}
+        onClick={() => {
+          // Decide the layout before the panel mounts, so its entry animation matches it.
+          setSheet(window.innerWidth < 640);
+          setOpen((o) => !o);
+        }}
         className={clsx(
           "focus-ring flex h-8 items-center gap-2 rounded-lg border px-2.5 text-[12px] transition-colors",
           open ? "border-accent/40 bg-accent/10 text-fg" : "border-ink-600 text-fg-2 hover:border-ink-600 hover:bg-tint/[0.04] hover:text-fg",
@@ -91,17 +106,38 @@ export function ThemePicker() {
         </span>
       </button>
 
+      {createPortal(
       <AnimatePresence>
         {open && (
+          // A tap outside lands on this backdrop and only closes the panel: it never reaches
+          // the page (or a theme card) underneath.
           <motion.div
+            key="theme-backdrop"
+            className={clsx("fixed inset-0 z-[60]", sheet ? "bg-black/40" : "bg-transparent")}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0, pointerEvents: "none" }}
+            transition={{ duration: 0.15 }}
+            onClick={() => setOpen(false)}
+          />
+        )}
+        {open && (
+          <motion.div
+            key="theme-panel"
             role="dialog"
             aria-label="Choose a theme"
-            initial={{ opacity: 0, y: -6, scale: 0.98 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: -6, scale: 0.98 }}
-            transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
-            className="panel-raised absolute right-0 top-10 z-50 w-[min(92vw,540px)] origin-top-right p-3 shadow-panel"
+            initial={sheet ? { y: "100%", opacity: 1 } : { opacity: 0, y: -6, scale: 0.98 }}
+            animate={sheet ? { y: 0, opacity: 1 } : { opacity: 1, y: 0, scale: 1 }}
+            // Closing panels stop taking input at once, so a quick tap cannot pick a theme mid-fade.
+            exit={sheet ? { y: "100%", pointerEvents: "none" } : { opacity: 0, y: -6, scale: 0.98, pointerEvents: "none" }}
+            transition={sheet ? { type: "spring", stiffness: 420, damping: 40 } : { duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+            style={sheet ? undefined : { top: anchor.top, right: anchor.right }}
+            className={clsx(
+              "panel-raised fixed z-[61] p-3 shadow-panel",
+              sheet ? "inset-x-0 bottom-0 rounded-b-none pb-[max(12px,env(safe-area-inset-bottom))]" : "w-[min(92vw,540px)] origin-top-right",
+            )}
           >
+            {sheet && <div className="mx-auto mb-2.5 h-1 w-10 rounded-full bg-ink-600" />}
             <div className="mb-2.5 flex items-baseline justify-between px-1">
               <div>
                 <div className="text-[13px] font-semibold text-fg">Theme</div>
@@ -111,7 +147,7 @@ export function ThemePicker() {
                 <kbd className="rounded border border-ink-600 px-1">Shift</kbd> + <kbd className="rounded border border-ink-600 px-1">T</kbd> cycles
               </span>
             </div>
-            <div className="grid max-h-[62vh] grid-cols-1 gap-2 overflow-y-auto pr-0.5 sm:grid-cols-2">
+            <div className="grid max-h-[62vh] grid-cols-2 gap-2 overflow-y-auto pr-0.5">
               {THEMES.map((t, i) => {
                 const active = t.id === theme.id;
                 return (
@@ -151,7 +187,9 @@ export function ThemePicker() {
             </div>
           </motion.div>
         )}
-      </AnimatePresence>
+      </AnimatePresence>,
+      document.body,
+      )}
     </div>
   );
 }

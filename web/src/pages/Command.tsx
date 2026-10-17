@@ -203,7 +203,7 @@ export default function Command() {
         <div className="panel p-4 sm:p-5">
           <div className="mb-3 flex items-center justify-between">
             <h3 className="text-[14px] font-semibold text-fg">Round {round} at a glance <span className="font-normal text-fg-muted">· {scope}</span></h3>
-            <span className="eyebrow">Persona · F1 · frozen coverage</span>
+            <span className="eyebrow hidden sm:inline">Persona · F1 · frozen coverage</span>
           </div>
           <motion.ul variants={stagger(0.07)} initial="hidden" animate="show" className="space-y-2.5">
             {PERSONAS.filter((p) => post[p]).map((p) => {
@@ -222,7 +222,7 @@ export default function Command() {
                       <StatusBadge kind={src === "agentic" ? "neutral" : "warning"}>{src === "agentic" ? "LLM mutation" : src.replace(/_/g, " ")}</StatusBadge>
                     )}
                   </div>
-                  <div className="mt-2 grid grid-cols-4 gap-2 font-mono text-[11.5px]">
+                  <div className="mt-2 grid grid-cols-2 gap-2 font-mono text-[11.5px] sm:grid-cols-4">
                     <div>
                       <div className="text-fg-muted">F1</div>
                       <div className="text-fg">{fmtNum(m.f1, 3)}</div>
@@ -248,7 +248,7 @@ export default function Command() {
       </div>
 
       <SectionTitle>Workspace</SectionTitle>
-      <motion.div variants={stagger(0.05)} initial="hidden" animate="show" className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+      <motion.div variants={stagger(0.05)} initial="hidden" animate="show" className="grid grid-cols-2 gap-3 xl:grid-cols-5">
         {NAV.slice(1).map((n) => (
           <motion.div key={n.to} variants={fadeUp}>
             <Link

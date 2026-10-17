@@ -1,7 +1,7 @@
 import clsx from "clsx";
 import { AnimatePresence, motion } from "framer-motion";
 import { ChevronDown, Eye, FileSearch, Search, ShieldAlert, ShieldCheck, ShieldQuestion, Siren } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
   Callout,
@@ -61,12 +61,16 @@ export default function Surveillance() {
   const pageRows = view.slice(page * PAGE, page * PAGE + PAGE);
   const paramCase = params.get("case");
   const selectedId = (paramCase && data?.cases.some((c) => c.id === paramCase) ? paramCase : pageRows[0]?.id) ?? null;
-  const select = (id: string) =>
+  const detailRef = useRef<HTMLDivElement>(null);
+  const select = (id: string) => {
     setParams((p) => {
       const n = new URLSearchParams(p);
       n.set("case", id);
       return n;
     });
+    // On one-column layouts the detail sits below the whole list: bring it into view.
+    if (window.innerWidth < 1280) window.setTimeout(() => detailRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 60);
+  };
 
   useEffect(() => {
     if (page >= pages) setPage(0);
@@ -242,7 +246,7 @@ export default function Surveillance() {
                   </div>
                 )}
               </div>
-              <div className="xl:sticky xl:top-[72px]">
+              <div ref={detailRef} className="scroll-mt-[120px] xl:sticky xl:top-[72px]">
                 {selectedId ? <CaseDetail id={selectedId} /> : <EmptyState title="Select a case" />}
               </div>
             </div>

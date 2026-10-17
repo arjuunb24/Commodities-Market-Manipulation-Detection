@@ -83,12 +83,13 @@ export function ChartCard({
   const [showTable, setShowTable] = useState(false);
   return (
     <Reveal className={clsx("panel flex flex-col p-4 sm:p-5", className)}>
-      <div className="mb-3 flex items-start justify-between gap-3">
+      {/* With extra controls the header stacks on phones, so the description keeps the full width. */}
+      <div className={clsx("mb-3 flex gap-3", actions ? "flex-col sm:flex-row sm:items-start sm:justify-between" : "items-start justify-between")}>
         <div className="min-w-0 flex-1">
           <h3 className="text-[14px] font-semibold tracking-tight text-fg">{title}</h3>
           {subtitle && <p className="mt-0.5 max-w-3xl text-[12.5px] leading-relaxed text-fg-muted">{subtitle}</p>}
         </div>
-        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+        <div className={clsx("flex shrink-0 flex-wrap items-center gap-2", actions ? "justify-start sm:justify-end" : "justify-end")}>
           {actions}
           {table && (
             <button

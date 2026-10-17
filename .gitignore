@@ -61,3 +61,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.code-workspace
+
+# Local web-app hosting state and logs (scripts/webapp.ps1)
+.webapp/

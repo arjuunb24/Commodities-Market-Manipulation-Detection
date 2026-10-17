@@ -11,13 +11,16 @@ Prod:  (cd web && npm run build) then uvicorn api.main:app --port 8000
 
 from __future__ import annotations
 
+import base64
+import hmac
 import logging
+import os
 import sys
 import threading
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
@@ -37,6 +40,22 @@ app = FastAPI(title="Veridex API", version="1.0.0", docs_url="/api/docs", openap
 app.add_middleware(GZipMiddleware, minimum_size=2048)
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
                    allow_methods=["*"], allow_headers=["*"])
+
+# Optional access gate for when the app is shared beyond this PC (scripts/webapp.ps1 -Password):
+# HTTP Basic auth, any user name, password from VERIDEX_PASSWORD. Unset = open (local use).
+_PASSWORD = os.environ.get("VERIDEX_PASSWORD") or ""
+if _PASSWORD:
+    @app.middleware("http")
+    async def _require_password(request: Request, call_next):
+        header = request.headers.get("authorization", "")
+        if header.lower().startswith("basic "):
+            try:
+                supplied = base64.b64decode(header[6:]).decode("utf-8").split(":", 1)[1]
+            except Exception:
+                supplied = ""
+            if hmac.compare_digest(supplied.encode(), _PASSWORD.encode()):
+                return await call_next(request)
+        return Response("Password required", status_code=401, headers={"WWW-Authenticate": 'Basic realm="Veridex"'})
 
 
 def _market(run: str, rnd: int, m: str | None) -> str | None:

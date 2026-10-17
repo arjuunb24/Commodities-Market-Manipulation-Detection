@@ -9,6 +9,9 @@ type Opt = Record<string, any>;
 export const FONT = '"IBM Plex Sans", system-ui, sans-serif';
 export const MONO = '"IBM Plex Mono", ui-monospace, monospace';
 
+/** Phone-portrait widths: charts thin out labels and keep legends to one scrolling row. */
+export const narrow = () => typeof window !== "undefined" && window.innerWidth < 640;
+
 export const tooltip = (extra: Opt = {}): any => ({
   trigger: "axis",
   confine: true,
@@ -34,7 +37,7 @@ export const axisCommon: any = {
   },
   axisTick: { show: false },
   get axisLabel() {
-    return { color: INK.muted, fontFamily: MONO, fontSize: 10.5 };
+    return { color: INK.muted, fontFamily: MONO, fontSize: narrow() ? 9.5 : 10.5, hideOverlap: true };
   },
   get splitLine() {
     return { lineStyle: { color: INK.grid, width: 1 } };
@@ -56,6 +59,8 @@ export const legend = (extra: Opt = {}): any => ({
   textStyle: { color: INK.secondary, fontFamily: FONT, fontSize: 11.5 },
   inactiveColor: INK.inactive,
   ...extra,
+  // A wrapped legend would spill over the plot on a phone; one swipeable row keeps it clear.
+  ...(narrow() ? { type: "scroll", left: 0, right: 0, itemGap: 10, pageIconSize: 10, pageTextStyle: { color: INK.muted, fontSize: 10 } } : {}),
 });
 
 export const grid = (extra: Opt = {}): any => ({ left: 8, right: 12, top: 34, bottom: 8, containLabel: true, ...extra });
