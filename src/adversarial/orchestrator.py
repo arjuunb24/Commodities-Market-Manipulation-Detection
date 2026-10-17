@@ -220,6 +220,26 @@ class RoundOrchestrator:
             f"{p}: {d.get(d.get('primary_metric'))}" for p, d in eff.items()))
         return eff
 
+    def _by_market(self, per_market: list, results: pd.DataFrame, pre_results: pd.DataFrame | None, baseline: dict) -> dict:
+        """
+        The round's metrics split by test market (each is an independent simulation).
+        The pooled numbers above stay the official ones; these let a viewer compare markets.
+        Effect ratios use the same pooled round-0 baseline as the pooled ratios.
+        """
+        out = {}
+        for name, idx, y_m, ev_m, eff_m in per_market:
+            entry: dict[str, Any] = {"personas": compute_round_metrics(results.loc[idx], y_m, self.personas, events=ev_m)}
+            if pre_results is not None:
+                entry["pre_retrain"] = compute_round_metrics(pre_results.loc[idx], y_m, self.personas, events=ev_m)
+            e = summarize(eff_m) if not eff_m.empty else {}
+            ratio = {p: effectiveness_ratio(e.get(p), baseline.get(p), p) if p in e else None for p in self.personas}
+            entry["effectiveness"] = e
+            entry["effectiveness_ratio"] = ratio
+            entry["mutation_score"] = {p: mutation_score((entry.get("pre_retrain") or {}).get(p), ratio[p]) for p in self.personas}
+            entry["n_episodes"] = int(len(ev_m))
+            out[name] = entry
+        return out
+
     def _baseline_effectiveness(self) -> dict:
         path = self.master_run_dir / "round_0" / "metrics.json"
         return json.loads(path.read_text()).get("effectiveness", {}) if path.exists() else {}
@@ -257,6 +277,7 @@ class RoundOrchestrator:
                 f.result()
 
         X_parts, y_parts, ev_parts, eff_parts = [], [], [], []
+        per_market = []   # (market name, row index, labels, events, per-episode effect) for by-market metrics
         for d in test_dirs:
             X_m, y_m = self.pipeline.load_and_preprocess(d)
             ev_m = pd.read_parquet(d / "manipulation_events.parquet")
@@ -266,6 +287,8 @@ class RoundOrchestrator:
             ev_parts.append(ev_m)
             eff_parts.append(episode_effectiveness(
                 ev_m, pd.read_parquet(d / "trade_log.parquet"), pd.read_parquet(d / "order_log.parquet")))
+            if not X_m.empty:
+                per_market.append((d.name, X_m.index, y_m, ev_m, eff_parts[-1]))
         if not X_parts:
             logger.warning(f"Round {round_num}: empty test feature matrix. Skipping.")
             return {}
@@ -275,6 +298,7 @@ class RoundOrchestrator:
 
         # --- Pre-retrain (frozen detector from previous round) ---
         pre_metrics = None
+        pre_results = None
         if self.pipeline.is_trained:
             logger.info(f"Round {round_num} — PRE-retrain scoring with frozen detector...")
             pre_results = self.pipeline.score(X_test)
@@ -306,6 +330,7 @@ class RoundOrchestrator:
         for p in self.personas:
             ratios[p] = effectiveness_ratio(eff.get(p), baseline.get(p), p) if p in eff else None
             scores[p] = mutation_score((pre_metrics or {}).get(p), ratios[p])
+        by_market = self._by_market(per_market, results, pre_results, baseline)
 
         save_round_metrics(
             post_metrics, round_num, round_dir,
@@ -320,6 +345,7 @@ class RoundOrchestrator:
                 "effectiveness": eff,
                 "effectiveness_ratio": ratios,
                 "mutation_score": scores,
+                "by_market": by_market,
             },
         )
         entry = {"round": round_num, "personas": post_metrics, "effectiveness_ratio": ratios, "mutation_score": scores}

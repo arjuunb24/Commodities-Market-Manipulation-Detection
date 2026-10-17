@@ -48,7 +48,8 @@ adversarial_strategist:
 
 # --- 4C: Analyst assistant (per chat message)
 analyst_assistant:
-  max_tokens: {gemini: 2048, cerebras: 600}
+  max_tokens: {gemini: 4096, cerebras: 2400}   # 600 cut tables off mid-row
+  max_tool_turns: 6              # model turns per question; the last one answers without tools
   max_retries: 1
   timeout_seconds: 30
 

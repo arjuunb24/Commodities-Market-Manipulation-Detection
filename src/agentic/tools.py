@@ -25,6 +25,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from src.detector.pipeline import read_flags
@@ -220,31 +221,122 @@ PROPOSE_MUTATION_SCHEMA = _fn(
 )
 STRATEGIST_TOOLS = [GET_ROUND_METRICS_SCHEMA, GET_SHAP_DRIFT_SCHEMA, GET_ENFORCEMENT_NOTES_SCHEMA, PROPOSE_MUTATION_SCHEMA]
 
+_MARKET = {"type": "string", "description": "Test market: 'A' (dir 'test') or 'B' (dir 'test_1'); omit for all test markets of the round"}
+_PERSONA = {"type": "string", "description": "spoofing | layering | wash_trading | pump_and_dump | anomaly"}
+
+
+_COMMODITY_ALIASES = {"wti": "crude_oil_wti", "crude": "crude_oil_wti", "crude oil": "crude_oil_wti", "oil": "crude_oil_wti",
+                      "brent": "brent_crude", "gas": "natural_gas", "natgas": "natural_gas", "natural gas": "natural_gas"}
+
+
+def _commodity_key(name: str) -> str:
+    """Accept 'Wheat', 'natural gas', 'WTI', 'brent_crude' ... and return the data's commodity key."""
+    k = str(name).strip().lower()
+    return _COMMODITY_ALIASES.get(k, k.replace(" ", "_"))
+
+
+def _account_status_counts(rows: list[dict]) -> dict:
+    """
+    Account-level ground-truth counts. "Account" = one trader flagged for one persona in one commodity.
+      accounts_confirmed               at least one of its cases matches a real episode of that persona
+      accounts_only_false_alerts       every case had no ground-truth episode
+      accounts_with_any_false_alert    at least one case had no episode (overlaps the two above)
+    """
+    out = {"accounts_confirmed": 0, "accounts_other_persona_only": 0, "accounts_only_false_alerts": 0, "accounts_with_any_false_alert": 0}
+    for a in rows:
+        st = a["statuses"]
+        if st.get("confirmed"):
+            out["accounts_confirmed"] += 1
+        elif st.get("other_persona"):
+            out["accounts_other_persona_only"] += 1
+        else:
+            out["accounts_only_false_alerts"] += 1
+        if st.get("no_episode"):
+            out["accounts_with_any_false_alert"] += 1
+    return out
+
+
+def _read_alerted(path: Path) -> pd.DataFrame:
+    """
+    Alerted rows of flags.parquet with the SHAP / score structs cleaned. Filtering in Arrow
+    before conversion avoids turning every window's struct into a dict (~13 s -> <1 s per round).
+    """
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+    from src.detector.pipeline import clean_shap_dict
+    table = pq.read_table(path)
+    df = table.filter(pc.equal(table["final_flag"], True)).to_pandas()
+    df["top_shap_features"] = df["top_shap_features"].apply(clean_shap_dict)
+    if "persona_scores" in df.columns:
+        df["persona_scores"] = df["persona_scores"].apply(clean_shap_dict)
+    df["triggered_by"] = df["triggered_by"].apply(lambda x: list(x) if x is not None else [])
+    return df
+
+
+def _r(v, nd: int = 4):
+    return round(float(v), nd) if isinstance(v, (int, float)) and v == v else None
+
+
 ANALYST_TOOLS = [
     _fn("list_rounds", "List the completed rounds of the current run with their flag counts.", {}),
     _fn(
+        "summarize_cases",
+        "BEST FOR 'which accounts were flagged and why'. Merges a round's alerted windows into cases per account, "
+        "checks each against the simulator's ground truth (confirmed / other_persona / no_episode) and returns one row "
+        "per account: windows, tick span, max score, top SHAP features (mean value; + pushes toward the flag) and totals.",
+        {"round_num": {"type": "integer"}, "persona": _PERSONA, "market": _MARKET,
+         "commodity": {"type": "string", "description": "Only this commodity, e.g. wheat"},
+         "status": {"type": "string", "description": "confirmed | other_persona | no_episode"},
+         "top_n": {"type": "integer", "description": "Accounts to return (default 10, max 25)"}},
+        ["round_num"],
+    ),
+    _fn(
+        "compare_markets",
+        "BEST FOR comparing test markets (Market A vs B) or looking at one commodity's book in a round: per market and "
+        "commodity the open/close, change %, range, 1-minute volatility, volume, trades, aggressive-buy share, ground-truth "
+        "episodes by persona and the detector's alerts (accounts flagged, confirmed, false alerts).",
+        {"round_num": {"type": "integer"},
+         "commodity": {"type": "string", "description": "e.g. wheat, corn, gold, silver, copper, natural_gas, crude_oil_wti, brent_crude; omit for all"}},
+        ["round_num"],
+    ),
+    _fn(
+        "run_overview",
+        "BEST FOR comparisons across personas or rounds (hardest persona, trends, evasion vs recovery). One call returns "
+        "every round: retrained F1/recall/precision, frozen-detector coverage, effect vs round 0, mutation score and source.",
+        {"market": _MARKET},
+    ),
+    _fn(
+        "get_strategist_history",
+        "What the adversarial LLM strategist changed for each persona each round, its reasoning and the outcome.",
+        {"persona": _PERSONA},
+    ),
+    _fn(
         "query_flags",
-        "Detector flags (post-retrain) for a round, filterable by trader_id and persona. "
-        "Returns windows, scores, which layer fired and the top SHAP features.",
+        "Raw alerted WINDOWS (not accounts) for a round, filterable by trader_id / persona / market. Use for window-level "
+        "detail on one account; prefer summarize_cases for lists of accounts.",
         {
             "round_num": {"type": "integer", "description": "Round number; omit for all rounds"},
             "trader_id": {"type": "string"},
-            "persona": {"type": "string", "description": "spoofing | wash_trading | pump_and_dump | anomaly"},
-            "limit": {"type": "integer", "description": "Max rows to return (default 20)"},
+            "persona": _PERSONA,
+            "market": _MARKET,
+            "limit": {"type": "integer", "description": "Max rows to return (default 10, max 25)"},
         },
     ),
     _fn(
         "query_round_metrics",
-        "Precision/recall/F1/FPR, event detection and latency per persona for a round (pre and post retrain).",
+        "Full per-persona metrics for one round (pooled over test markets): precision/recall/F1/FPR, event detection, "
+        "latency, coverage, for the frozen (pre) and retrained (post) detector.",
         {"round_num": {"type": "integer"}},
         ["round_num"],
     ),
     _fn(
         "get_trader_history",
-        "Summary of one trader's orders and trades in a round's test market, optionally within a tick range.",
+        "One trader's orders and trades in a round (optionally one market and a tick range): volumes, cancels, "
+        "largest order, counterparties.",
         {
             "trader_id": {"type": "string"},
             "round_num": {"type": "integer"},
+            "market": _MARKET,
             "start_tick": {"type": "integer"},
             "end_tick": {"type": "integer"},
         },
@@ -609,18 +701,52 @@ class ToolRegistry:
             return {"error": "No completed rounds in this run."}
         return {"rounds": rounds}
 
+    def _market_dirs(self, d: Path, market: str | None = None) -> list[Path]:
+        """A round's test markets ('test', 'test_1', ...); `market` may be the dir name or 'A'/'B'/'Market A'."""
+        dirs = [x for x in [d / "test"] + sorted(d.glob("test_*")) if x.is_dir()]
+        if market is None or market == "":
+            return dirs
+        m = str(market).strip()
+        if m.lower().startswith("market "):
+            m = m.split()[-1]
+        if len(m) == 1 and m.isalpha():
+            idx = ord(m.upper()) - ord("A")
+            return dirs[idx: idx + 1]
+        return [x for x in dirs if x.name == m]
+
+    def _tick_range(self, market_dir: Path) -> tuple[int, int] | None:
+        p = market_dir / "trade_log.parquet"
+        if not p.exists():
+            return None
+        t = pd.read_parquet(p, columns=["tick"])["tick"]
+        return (int(t.min()), int(t.max())) if len(t) else None
+
+    def _flagged(self, round_num: int, market: str | None = None) -> pd.DataFrame | None:
+        """Alerted windows of a round, optionally only those inside one test market's ticks."""
+        d = self._round_dir(round_num)
+        if d is None or not (d / "flags.parquet").exists():
+            return None
+        df = _read_alerted(d / "flags.parquet")
+        if market:
+            dirs = self._market_dirs(d, market)
+            if not dirs:
+                return df.iloc[0:0]
+            rng = self._tick_range(dirs[0])
+            if rng:
+                df = df[(df["window_start"] >= rng[0]) & (df["window_start"] <= rng[1])]
+        return df
+
     def query_flags(self, round_num: int | None = None, trader_id: str | None = None,
-                    persona: str | None = None, limit: int = 10) -> dict:
+                    persona: str | None = None, limit: int = 10, market: str | None = None) -> dict:
         rounds = [round_num] if round_num is not None else self._available_rounds()
         frames = []
         for r in rounds:
-            d = self._round_dir(r)
-            if d is None or not (d / "flags.parquet").exists():
+            df = self._flagged(r, market)
+            if df is None:
                 if round_num is not None:
                     return self._not_found(f"Flags for round {round_num}")
                 continue
-            df = read_flags(d / "flags.parquet")
-            df = df[df["final_flag"]]
+            df = df.copy()
             df.insert(0, "round_num", r)
             frames.append(df)
         if not frames:
@@ -649,10 +775,235 @@ class ToolRegistry:
     def query_round_metrics(self, round_num: int) -> dict:
         return self.get_round_metrics_full(round_num)
 
-    def get_trader_history(self, trader_id: str, round_num: int,
-                           start_tick: int | None = None, end_tick: int | None = None) -> dict:
+    def summarize_cases(self, round_num: int, persona: str | None = None, market: str | None = None,
+                        status: str | None = None, top_n: int = 10, commodity: str | None = None,
+                        _max_rows: int = 25) -> dict:
+        """
+        Account-level view of a round's alerts: consecutive flagged windows of one account and
+        persona are merged into a case, matched to the simulator's ground truth, then grouped
+        per account. This is the right granularity for "which accounts and why".
+        """
+        df = self._flagged(round_num, market)
+        if df is None:
+            return self._not_found(f"Flags for round {round_num}")
+        if persona:
+            df = df[df["predicted_persona"] == persona]
+        if commodity:
+            df = df[df["commodity"] == _commodity_key(commodity)]
         d = self._round_dir(round_num)
-        tests = [x for x in ([d / "test"] + sorted(d.glob("test_*")) if d else []) if (x / "order_log.parquet").exists()]
+        ev = [pd.read_parquet(x / "manipulation_events.parquet") for x in self._market_dirs(d, market)
+              if (x / "manipulation_events.parquet").exists()]
+        ev = pd.concat(ev, ignore_index=True) if ev else pd.DataFrame(columns=["event_id", "persona", "commodity", "trader_ids", "start_tick", "end_tick"])
+        if commodity:
+            ev = ev[ev["commodity"] == _commodity_key(commodity)]
+
+        cases = []
+        for (comm, trader, pers), g in df.sort_values("window_start").groupby(["commodity", "trader_id", "predicted_persona"], sort=False):
+            cur = None
+            for r in g.itertuples(index=False):
+                if cur and r.window_start <= cur["end_tick"] + 1:
+                    cur["end_tick"] = max(cur["end_tick"], int(r.window_end)); cur["windows"] += 1
+                    cur["max_score"] = max(cur["max_score"], float(r.final_score)); cur["shap"].append(r.top_shap_features or {})
+                    continue
+                if cur:
+                    cases.append(cur)
+                cur = {"commodity": comm, "trader_id": trader, "persona": pers, "start_tick": int(r.window_start),
+                       "end_tick": int(r.window_end), "windows": 1, "max_score": float(r.final_score), "shap": [r.top_shap_features or {}]}
+            if cur:
+                cases.append(cur)
+
+        matched = set()
+        for c in cases:
+            c["status"], c["ground_truth"] = "no_episode", None
+            for e in ev.itertuples(index=False):
+                if e.commodity == c["commodity"] and c["trader_id"] in set(e.trader_ids) and not (c["end_tick"] < e.start_tick or c["start_tick"] > e.end_tick):
+                    c["ground_truth"] = e.persona
+                    c["status"] = "confirmed" if e.persona == c["persona"] else "other_persona"
+                    if e.persona == c["persona"]:
+                        matched.add(e.event_id)
+                    break
+        # Accounts are built from ALL their cases; a status filter then keeps accounts that have at
+        # least one case with that status (filtering cases first made every account look single-status).
+        accounts: dict[tuple, dict] = {}
+        for c in cases:
+            a = accounts.setdefault((c["trader_id"], c["commodity"], c["persona"]), {
+                "trader_id": c["trader_id"], "commodity": c["commodity"], "persona": c["persona"], "cases": 0, "windows": 0,
+                "first_tick": c["start_tick"], "last_tick": c["end_tick"], "max_score": 0.0, "statuses": {}, "_w": {}})
+            a["cases"] += 1; a["windows"] += c["windows"]; a["max_score"] = max(a["max_score"], c["max_score"])
+            a["first_tick"] = min(a["first_tick"], c["start_tick"]); a["last_tick"] = max(a["last_tick"], c["end_tick"])
+            a["statuses"][c["status"]] = a["statuses"].get(c["status"], 0) + 1
+            if c["ground_truth"] and c["ground_truth"] != c["persona"]:
+                a["ground_truth_persona"] = c["ground_truth"]
+            for s in c["shap"]:
+                for k, v in s.items():
+                    if v is not None:
+                        a["_w"].setdefault(k, []).append(float(v))
+        rows = []
+        for a in accounts.values():
+            w = a.pop("_w")
+            top = sorted(w.items(), key=lambda kv: -sum(abs(x) for x in kv[1]))[:3]
+            a["top_features"] = {k: round(sum(v) / len(v), 3) for k, v in top}   # mean SHAP; + pushes toward the flag
+            a["max_score"] = round(a["max_score"], 3)
+            rows.append(a)
+        rows.sort(key=lambda a: (-a["max_score"], -a["windows"]))
+        acct_status = _account_status_counts(rows)
+        if status:
+            rows = [a for a in rows if a["statuses"].get(status)]
+            rows.sort(key=lambda a: (len(a["statuses"]) > 1, -a["max_score"]))   # accounts with ONLY that status first
+        n_eps = int((ev["persona"] == persona).sum()) if persona else int(len(ev))
+        return {
+            "round_num": round_num, "market": market or "all test markets", "persona": persona or "all",
+            **({"status_filter": f"accounts with at least one '{status}' case (their 'statuses' show all their cases)",
+                "accounts_matching_filter": len(rows)} if status else {}),
+            "totals": {"accounts": len(accounts), "accounts_by_status": acct_status,
+                       "cases": len(cases), "flagged_windows": int(sum(c["windows"] for c in cases)),
+                       "confirmed_cases": sum(c["status"] == "confirmed" for c in cases),
+                       "other_persona_cases": sum(c["status"] == "other_persona" for c in cases),
+                       "no_episode_cases": sum(c["status"] == "no_episode" for c in cases),
+                       "ground_truth_episodes": n_eps,
+                       "episodes_missed": n_eps - len({m for m in matched if not persona or m in set(ev[ev["persona"] == persona]["event_id"])})},
+            "accounts_returned": min(len(rows), max(1, min(int(top_n or 10), _max_rows))),
+            "accounts": rows[: max(1, min(int(top_n or 10), _max_rows))],
+            "status_meaning": {"confirmed": "ground truth has this account, persona and span",
+                               "other_persona": "a real episode, but of another persona",
+                               "no_episode": "no ground-truth manipulation (false alert)"},
+        }
+
+    def compare_markets(self, round_num: int, commodity: str | None = None) -> dict:
+        """
+        The round's test markets side by side (each is an independent simulation), per commodity:
+        price change, range, volatility, volume, trades, aggressive-buy share, ground-truth episodes
+        by persona, and the detector's alerts (accounts flagged, confirmed, false alerts).
+        """
+        d = self._round_dir(round_num)
+        if d is None:
+            return self._not_found(f"Round {round_num}")
+        dirs = self._market_dirs(d)
+        if not dirs:
+            return self._not_found(f"Round {round_num} test markets")
+        comm = _commodity_key(commodity) if commodity else None
+        out = {}
+        for i, md in enumerate(dirs):
+            label = chr(ord("A") + i)
+            if not (md / "trade_log.parquet").exists():
+                continue
+            t = pd.read_parquet(md / "trade_log.parquet", columns=["tick", "price", "quantity", "commodity", "aggressor_side"])
+            if comm:
+                t = t[t["commodity"] == comm]
+                if t.empty:
+                    return {"error": f"Commodity '{commodity}' not found.",
+                            "available_commodities": sorted(pd.read_parquet(md / "trade_log.parquet", columns=["commodity"])["commodity"].unique())}
+            ev = pd.read_parquet(md / "manipulation_events.parquet") if (md / "manipulation_events.parquet").exists() else pd.DataFrame()
+            per = {}
+            for c, g in t.groupby("commodity"):
+                g = g.sort_values("tick")
+                px = g.groupby("tick")["price"].last()
+                px = px.reindex(range(int(px.index.min()), int(px.index.max()) + 1)).ffill()
+                r = np.log(px.iloc[::60]).diff().dropna() * 1e4
+                e = ev[ev["commodity"] == c] if not ev.empty else ev
+                first, last = float(g["price"].iloc[0]), float(g["price"].iloc[-1])
+                per[c] = {
+                    "open": _r(first), "close": _r(last), "change_pct": _r((last / first - 1) * 100, 3),
+                    "range_bp": _r((g["price"].max() - g["price"].min()) / first * 1e4, 1),
+                    "volatility_1min_bp": _r(float(r.std()), 2) if len(r) > 2 else None,
+                    "volume": int(g["quantity"].sum()), "trades": int(len(g)),
+                    "aggressive_buy_share": _r(float(g.loc[g["aggressor_side"] == "buy", "quantity"].sum() / max(1, g["quantity"].sum())), 3),
+                    "episodes": {k: int(v) for k, v in e["persona"].value_counts().items()} if not e.empty else {},
+                }
+            # every account (internal call, not capped like the model-facing list)
+            cases = self.summarize_cases(round_num, market=label, commodity=comm, top_n=10**6, _max_rows=10**6)
+            by_comm: dict[str, list] = {}
+            for a in cases.get("accounts", []):
+                by_comm.setdefault(a["commodity"], []).append(a)
+            for c in per:
+                rows_c = by_comm.get(c, [])
+                by_persona: dict[str, int] = {}
+                for a in rows_c:
+                    by_persona[a["persona"]] = by_persona.get(a["persona"], 0) + 1
+                per[c]["alerts"] = {"accounts_flagged": len(rows_c), **_account_status_counts(rows_c), "by_persona": by_persona}
+            out[f"Market {label}"] = {"dir": md.name, "commodities": per}
+        return {"round_num": round_num, "commodity": comm or "all", "markets": out,
+                "notes": "Markets are independent simulations of the same commodities; alerts come from the retrained detector "
+                         "(alerts count every flagged account)."}
+
+    def run_overview(self, market: str | None = None) -> dict:
+        """
+        Every round in one table: retrained F1/recall, frozen-detector coverage, effect vs round 0,
+        mutation score and the mutation source per persona. With `market`, the retrained and effect
+        figures come from that market when the run stored or derived them (by_market).
+        """
+        rounds = []
+        for r in self._available_rounds():
+            m = self._metrics_json(r) or {}
+            scoped = None
+            if market:
+                d = self._round_dir(r)
+                names = [x.name for x in self._market_dirs(d, market)] if d else []
+                name = names[0] if names else None
+                scoped = (m.get("by_market") or {}).get(name) if name else None
+                if scoped is None and d is not None and name and (d / "by_market.json").exists():
+                    scoped = json.loads((d / "by_market.json").read_text()).get(name)
+            src = scoped or m
+            per = {}
+            for p in ("spoofing", "wash_trading", "pump_and_dump", "layering"):
+                post = (src.get("personas") or {}).get(p) or {}
+                pre = (src.get("pre_retrain") or (m.get("pre_retrain") if scoped else None) or {}).get(p) or {}
+                per[p] = {"f1": _r(post.get("f1")), "recall": _r(post.get("recall")), "precision": _r(post.get("precision")),
+                          "frozen_any_alert_coverage": _r(pre.get("caught_coverage", pre.get("episode_coverage"))),
+                          "effect_ratio": _r((src.get("effectiveness_ratio") or {}).get(p)),
+                          "mutation_score": _r((src.get("mutation_score") or (m.get("mutation_score") if scoped else None) or {}).get(p)),
+                          "mutation_source": (m.get("mutation_source") or {}).get(p)}
+            rounds.append({"round_num": r, "scope": (market if scoped else "pooled"), "personas": per})
+        if not rounds:
+            return {"error": "No completed rounds in this run."}
+        # Precomputed per-persona conclusions: the model misreads rankings out of the nested round table.
+        summary = {}
+        for p in ("spoofing", "wash_trading", "pump_and_dump", "layering"):
+            cov = [(r["round_num"], r["personas"][p]["frozen_any_alert_coverage"]) for r in rounds
+                   if r["personas"][p]["frozen_any_alert_coverage"] is not None]
+            f1 = [r["personas"][p]["f1"] for r in rounds if r["personas"][p]["f1"] is not None]
+            worst = min(cov, key=lambda x: x[1]) if cov else (None, None)
+            summary[p] = {"mean_frozen_coverage": _r(sum(c for _, c in cov) / len(cov)) if cov else None,
+                          "lowest_frozen_coverage": worst[1], "lowest_frozen_coverage_round": worst[0],
+                          "mean_retrained_f1": _r(sum(f1) / len(f1)) if f1 else None,
+                          "latest_retrained_f1": f1[-1] if f1 else None}
+        ranked = sorted((p for p in summary if summary[p]["mean_frozen_coverage"] is not None),
+                        key=lambda p: summary[p]["mean_frozen_coverage"])
+        return {"hardest_before_retraining_first": ranked,
+                "persona_summary": summary,
+                "rounds": rounds, "notes": "hardest_before_retraining_first ranks personas by mean frozen-detector coverage "
+                "(lowest first = hardest to catch before retraining). "
+                "frozen_any_alert_coverage = share of episode windows the detector frozen from the previous "
+                "round caught (lower = better evasion); effect_ratio = manipulation effect vs round 0; frozen figures are pooled when "
+                "the run did not store them per market."}
+
+    def get_strategist_history(self, persona: str | None = None) -> dict:
+        """What the strategist changed each round, its short reasoning and how the mutation did."""
+        out = []
+        for r in self._available_rounds():
+            if r == 0:
+                continue
+            m = self._metrics_json(r) or {}
+            d = self._round_dir(r)
+            rec = json.loads((d / "strategist.json").read_text()).get("personas", {}) if d and (d / "strategist.json").exists() else {}
+            for p, v in rec.items():
+                if persona and p != persona:
+                    continue
+                pre = (m.get("pre_retrain") or {}).get(p) or {}
+                out.append({"round_num": r, "persona": p, "source": v.get("source"),
+                            "changes": {k: {"from": a, "to": b} for k, (a, b) in (v.get("changes") or {}).items()},
+                            "reasoning": " ".join(str(v.get("reasoning") or "").split())[:400],
+                            "frozen_any_alert_coverage": _r(pre.get("caught_coverage")),
+                            "effect_ratio": _r((m.get("effectiveness_ratio") or {}).get(p)),
+                            "mutation_score": _r((m.get("mutation_score") or {}).get(p))})
+        if not out:
+            return {"error": "No strategist rounds in this run (mutations start at round 1)."}
+        return {"mutations": out}
+
+    def get_trader_history(self, trader_id: str, round_num: int,
+                           start_tick: int | None = None, end_tick: int | None = None, market: str | None = None) -> dict:
+        d = self._round_dir(round_num)
+        tests = [x for x in (self._market_dirs(d, market) if d else []) if (x / "order_log.parquet").exists()]
         if not tests:
             return self._not_found(f"Round {round_num} market logs")
         orders = pd.concat([pd.read_parquet(x / "order_log.parquet") for x in tests], ignore_index=True)

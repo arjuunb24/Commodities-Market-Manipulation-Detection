@@ -353,3 +353,54 @@ def test_kept_threshold_is_released_after_max_keep_rounds():
     assert det._pick_threshold(grid, scores, prev, kept=0) == prev
     assert det._pick_threshold(grid, scores, prev, kept=1) == prev
     assert det._pick_threshold(grid, scores, prev, kept=2) == grid[15]   # released to the plateau centre
+
+
+def test_round_metrics_are_also_split_by_test_market(tmp_path):
+    from src.adversarial.orchestrator import RoundOrchestrator
+    orch = RoundOrchestrator(tmp_path / "run", yaml.safe_load(open("configs/detector_config.yaml")), persona_config_path=tmp_path / "none.yaml")
+    orch.personas = ["spoofing"]
+
+    def market(start):
+        idx = pd.MultiIndex.from_tuples([("gold", start + w, "spoofer_0") for w in (0, 30)], names=["commodity", "window_start", "trader_id"])
+        ev = pd.DataFrame([{"event_id": f"e{start}", "persona": "spoofing", "commodity": "gold", "trader_ids": ["spoofer_0"],
+                            "start_tick": start, "end_tick": start + 200}])
+        eff = pd.DataFrame([{"event_id": f"e{start}", "persona": "spoofing", "fake_depth_share": 0.3 if start else 0.6}])
+        return idx, pd.DataFrame({"spoofing": 1}, index=idx), ev, eff
+
+    a, b = market(0), market(5000)
+    idx = a[0].append(b[0])
+    results = pd.DataFrame({"window_end": [179, 209, 5179, 5209], "flag_spoofing": [True, True, False, True],
+                            "final_flag": [True, True, False, True]}, index=idx)
+    pre = results.assign(flag_spoofing=False, final_flag=[True, False, False, False])
+    out = orch._by_market([("test", *a), ("test_1", *b)], results, pre, {"spoofing": {"fake_depth_share": 0.6}})
+    assert out["test"]["personas"]["spoofing"]["recall"] == 1.0 and out["test_1"]["personas"]["spoofing"]["recall"] == 0.5
+    assert out["test"]["pre_retrain"]["spoofing"]["caught_coverage"] == 0.5 and out["test_1"]["pre_retrain"]["spoofing"]["caught_coverage"] == 0.0
+    assert out["test"]["effectiveness_ratio"]["spoofing"] == 1.0 and out["test_1"]["effectiveness_ratio"]["spoofing"] == 0.5
+    assert out["test_1"]["mutation_score"]["spoofing"] is not None
+
+
+def test_analyst_applies_the_viewed_market_unless_the_question_overrides_it(tmp_path, monkeypatch):
+    import json
+    import src.agentic.analyst_assistant as aa
+    run = tmp_path / "run"; (run / "round_0").mkdir(parents=True)
+    (run / "round_0" / "metrics.json").write_text(json.dumps({"personas": {}}))
+    monkeypatch.setattr(aa, "llm_unavailable_reason", lambda cfg: None)
+    monkeypatch.setattr(aa, "LLMClient", lambda cfg, run_dir=None: None)
+    seen = []
+
+    class _Client:
+        def __init__(self): self.n = 0
+        def complete(self, system, messages, tools=None):
+            self.n += 1
+            if self.n % 2 == 1:   # first turn: call summarize_cases without a market
+                return {"choices": [{"finish_reason": "tool_calls", "message": {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "1", "type": "function", "function": {"name": "summarize_cases", "arguments": json.dumps({"round_num": 0})}}]}}]}
+            return {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "done"}}]}
+
+    a = aa.AnalystAssistant({"max_tool_turns": 3}, run_dir=run)
+    a.client = _Client()
+    monkeypatch.setattr(a.tools, "summarize_cases", lambda **kw: seen.append(kw) or {"totals": {}})
+    a.ask("Which accounts were flagged?", context={"round": 0, "market": "A", "scope": "market"})
+    a.ask("And across both markets?", context={"round": 0, "market": "A", "scope": "market"})
+    a.ask("Which accounts were flagged?", context={"round": 0, "market": "A", "scope": "pooled"})
+    assert [kw.get("market") for kw in seen] == ["A", None, None]

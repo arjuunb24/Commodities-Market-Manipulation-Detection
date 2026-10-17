@@ -1,0 +1,173 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  --bg: #080b10;
+  --bg-2: #0b1016;
+  --panel: #0f151c;
+  --panel-2: #141b24;
+  --line: #1b2430;
+  --line-2: #26313f;
+  --text: #e7ecf2;
+  --text-2: #a7b1bf;
+  --muted: #6e7a8a;
+  --accent: #4fe3b5;
+  --accent-soft: rgba(79, 227, 181, 0.12);
+  --accent-ink: #04140f;
+  --good: #22b14c;
+  --warn: #fab219;
+  --serious: #ec835a;
+  --critical: #e04848;
+
+  /* Same tokens as RGB channels, so Tailwind opacity modifiers (bg-ink-850/80) work */
+  --c-bg: 8 11 16;
+  --c-bg-2: 11 16 22;
+  --c-panel: 15 21 28;
+  --c-panel-2: 20 27 36;
+  --c-line: 27 36 48;
+  --c-line-2: 38 49 63;
+  --c-text: 231 236 242;
+  --c-text-2: 167 177 191;
+  --c-muted: 110 122 138;
+  --c-accent: 79 227 181;
+  --c-accent-ink: 4 20 15;
+  --c-good: 34 177 76;
+  --c-warn: 250 178 25;
+  --c-serious: 236 131 90;
+  --c-critical: 224 72 72;
+  /* white on dark themes, black on light ones: hover washes and hairline highlights */
+  --c-tint: 255 255 255;
+  --glow-1: rgba(79, 227, 181, 0.07);
+  --glow-2: rgba(57, 135, 229, 0.08);
+  --grid-line: rgba(255, 255, 255, 0.018);
+  --shadow-drop: rgba(0, 0, 0, 0.65);
+}
+
+/* Theme switch: colours ease across instead of snapping (charts redraw on their own) */
+.theme-anim,
+.theme-anim *,
+.theme-anim *::before,
+.theme-anim *::after {
+  transition:
+    background-color 0.35s ease,
+    border-color 0.35s ease,
+    color 0.35s ease,
+    fill 0.35s ease,
+    stroke 0.35s ease,
+    box-shadow 0.35s ease !important;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: "ss01", "cv11";
+}
+
+/* Ambient backdrop: a faint price grid and two soft light pools behind the panels */
+.backdrop {
+  background:
+    radial-gradient(900px 500px at 12% -10%, var(--glow-1), transparent 60%),
+    radial-gradient(800px 500px at 95% 0%, var(--glow-2), transparent 60%),
+    linear-gradient(var(--bg), var(--bg));
+}
+.backdrop::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 56px 56px;
+  mask-image: radial-gradient(ellipse at 50% 0%, black 20%, transparent 75%);
+}
+
+.panel {
+  @apply rounded-xl border border-ink-700 bg-ink-850/80 shadow-panel backdrop-blur-[2px];
+}
+.panel-raised {
+  @apply rounded-xl border border-ink-600 bg-ink-800;
+}
+.eyebrow {
+  @apply text-[10.5px] font-semibold uppercase tracking-[0.14em] text-fg-muted;
+}
+.num {
+  font-variant-numeric: tabular-nums;
+}
+.hairline {
+  @apply border-ink-700;
+}
+.focus-ring {
+  @apply outline-none focus-visible:ring-2 focus-visible:ring-accent/60 focus-visible:ring-offset-2 focus-visible:ring-offset-ink-950;
+}
+
+.skeleton {
+  background: linear-gradient(90deg, rgb(var(--c-tint) / 0.03) 0px, rgb(var(--c-tint) / 0.07) 80px, rgb(var(--c-tint) / 0.03) 160px);
+  background-size: 800px 100%;
+  @apply animate-shimmer rounded-lg;
+}
+
+/* Scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-2) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--line-2);
+  border-radius: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Markdown answers in the analyst view */
+.prose-vx p {
+  @apply my-2 leading-relaxed text-fg-2;
+}
+.prose-vx strong {
+  @apply font-semibold text-fg;
+}
+.prose-vx ul {
+  @apply my-2 list-disc space-y-1 pl-5 text-fg-2;
+}
+.prose-vx ol {
+  @apply my-2 list-decimal space-y-1 pl-5 text-fg-2;
+}
+.prose-vx code {
+  @apply rounded bg-ink-700 px-1.5 py-0.5 font-mono text-[12px] text-fg;
+}
+.prose-vx table {
+  @apply my-3 w-full text-left text-[12.5px];
+}
+.prose-vx th {
+  @apply border-b border-ink-600 py-1.5 pr-3 font-semibold text-fg;
+}
+.prose-vx td {
+  @apply border-b border-ink-700 py-1.5 pr-3 text-fg-2;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
