@@ -20,17 +20,27 @@ docs/enforcement_case_notes.md) — and how this agent reproduces it:
   4. Cancel the large order after `cancellation_delay_ticks`; cancel the genuine
      order too if it has not filled. Repeat, sometimes in the other direction.
 
+Campaigns (`direction_persistence`): real spoofers did not pick a side at random
+for every few-second cycle: Sarao spoofed the offer side of the E-mini for long
+stretches (Coscia, by contrast, alternated, which this knob also covers with low
+persistence). Each new cycle keeps the previous cycle's
+direction with this probability, so the fake depth leans one way for minutes
+before the campaign turns. With a coin flip per cycle (persistence 0.5) the
+pushes cancel within seconds. Even sustained, the price effect stays small
+(a tick or two at a time), as in the enforcement cases: spoofing is proven from
+order messages, not from minute price charts.
+
 The behavioural footprint this leaves is trader-level, not market-level:
 large orders with short lifetimes that are almost always cancelled, on the side
 OPPOSITE to where the same account's executions happen.
 
 Evasion knobs (each documented in docs/enforcement_case_notes.md):
-  size_jitter     ±random spoof size (CFTC 2020 advisory #1, Coscia round 2)
-  cancel_jitter   random cancel delay instead of a fixed one (advisory #2)
+  size_jitter     ±random spoof size (Tower: randomly-sized orders via an order splitter)
+  cancel_jitter   random cancel delay instead of a fixed one (design assumption)
   n_split_orders  spoof split into several smaller orders on consecutive ticks
-                  behind the touch (Coscia "split into batches", Tower layering)
+                  behind the touch (Tower order splitter; Bases: many smaller orders)
   n_accounts      >1 → the genuine order and the spoof come from DIFFERENT
-                  accounts (JPMorgan cross-trader spoofing, advisory #3)
+                  accounts (several traders on one desk at JPMorgan; the split is a design assumption)
   reprice_to_touch  1 → while resting, the spoof is cancelled and re-placed so it
                   stays the same distance behind the moving best price
                   (Sarao 2015: orders automatically modified to avoid execution
@@ -38,7 +48,10 @@ Evasion knobs (each documented in docs/enforcement_case_notes.md):
   flip_after_cancel probability of "flipping" when the spoof is pulled: trading
                   aggressively in the genuine order's direction straight away
                   (Oystacher 2015)
-  busy_period_bias  act mainly when the market is busy (advisory #5)
+  busy_period_bias  act mainly when the market is busy (design assumption)
+  direction_persistence  chance each new cycle keeps the previous side; lower
+                  values alternate sides (harder to see on a price chart, but
+                  each push is undone by the next, so the spoof earns less)
 
 Order ids carry an audit tag ("s" spoof leg, "g" genuine leg) used only for
 effectiveness accounting, never by the detector.
@@ -69,6 +82,7 @@ class SpoofingAgent(ManipulationController):
         flip_after_cancel: Probability of an aggressive trade in the genuine direction when the spoof is pulled.
         busy_period_bias: Probability of skipping a tick when the market is quieter than usual.
         spoof_side: "buy", "sell" or "both" (direction chosen per cycle).
+        direction_persistence: With spoof_side "both": probability a new cycle keeps the previous side.
     """
 
     PERSONA = "spoofing"
@@ -78,7 +92,7 @@ class SpoofingAgent(ManipulationController):
         trader_id: str,
         rng: np.random.Generator,
         *,
-        order_size_multiplier: float = 8.0,
+        order_size_multiplier: float = 5.0,
         cancellation_delay_ticks: int = 5,
         frequency: float = 0.4,
         price_aggressiveness: float = 0.0005,
@@ -93,6 +107,7 @@ class SpoofingAgent(ManipulationController):
         end_tick: int = 10000,
         spoof_side: str = "both",
         background_rate: float = 0.05,
+        direction_persistence: float = 0.95,
     ) -> None:
         n_accounts = max(1, int(n_accounts))
         acct_rngs = rng.spawn(n_accounts)
@@ -111,6 +126,8 @@ class SpoofingAgent(ManipulationController):
         self.spoof_side = spoof_side
         self.reprice_to_touch = int(bool(reprice_to_touch))
         self.flip_after_cancel = float(np.clip(flip_after_cancel, 0.0, 1.0))
+        self.direction_persistence = float(np.clip(direction_persistence, 0.0, 1.0))
+        self._campaign_side: Side | None = None
         self._cycle_busy_until = -1
         # Resting spoof legs of the current cycle: [order_id, account, side, qty, price, cancel_at, level]
         self._legs: list[list] = []
@@ -135,6 +152,7 @@ class SpoofingAgent(ManipulationController):
             "flip_after_cancel": self.flip_after_cancel,
             "busy_period_bias": self.busy_period_bias,
             "spoof_side": self.spoof_side,
+            "direction_persistence": self.direction_persistence,
             "realised_fake_depth_share": round(float(np.mean(self._depth_shares)), 4) if self._depth_shares else 0.0,
         }
 
@@ -143,7 +161,10 @@ class SpoofingAgent(ManipulationController):
             return Side.BUY
         if self.spoof_side == "sell":
             return Side.SELL
-        return Side.BUY if self.rng.random() < 0.5 else Side.SELL
+        # Campaigns: keep spoofing the same side, occasionally turning to trade the move back.
+        if self._campaign_side is None or self.rng.random() >= self.direction_persistence:
+            self._campaign_side = (Side.BUY if self.rng.random() < 0.5 else Side.SELL) if self._campaign_side is None                 else (Side.SELL if self._campaign_side == Side.BUY else Side.BUY)
+        return self._campaign_side
 
     def _target_price(self, state: BookState, side: Side, level: int, tick_size: float) -> float:
         if side == Side.BUY:

@@ -2,161 +2,180 @@
 # docs/tactic_cards.yaml
 #
 # Compact evasion "tactic cards" for the Adversarial Strategist (Module 4B).
-# Each card maps a tactic documented in docs/enforcement_case_notes.md to the
-# simulator knobs that implement it, the detector features it is expected to
-# weaken, and what it costs the manipulator. Kept short on purpose: this is
-# sent to a paid LLM every round.
+# Each card maps a tactic to the simulator knobs that implement it, the detector
+# features it is expected to weaken, and what it costs the manipulator. Kept short
+# on purpose: this is sent to a paid LLM every round.
+#
+# `source` is either a documented case (see docs/enforcement_case_notes.md, every
+# claim there has a public source) or "design assumption" when no case documents
+# the tactic. Revised Oct 2026: an earlier version cited a "CFTC 2020 staff
+# advisory" and a "Nefedova" case that could not be found in CFTC records.
+#
+# Detector facts the cards reflect: ground-truth labels count only windows where an
+# account placed manipulative orders (decoys, camouflage and quiet accumulation are
+# not labelled, so they neither hide nor reveal those windows); wash rings are seen
+# by group features (mutual_cpty_share, ring_size, ring_volume_share).
 # =============================================================================
 
 spoofing:
-  - tactic: Size randomisation
-    source: "CFTC 2020 staff advisory #1; Coscia round 2"
-    knobs: {size_jitter: up, order_size_multiplier: down}
-    weakens: [max_order_size_rel, large_order_share, order_size_cv]
-    cost: smaller/irregular fake depth moves the book less
-  - tactic: Cancel-timing randomisation
-    source: 'advisory #2; Coscia "introduce random delays"'
+  - tactic: Randomised spoof sizes / order splitting
+    source: "documented: Tower Research 2019 (order splitter, several smaller randomly-sized orders); Bases (many smaller orders)"
+    knobs: {size_jitter: up, n_split_orders: 2-4}
+    weakens: [max_order_size_rel, large_order_share, order_size_cv, large_cancel_ratio]
+    cost: smaller/irregular pieces move the book less; more cancel events per cycle
+  - tactic: Cancel-timing randomisation, longer rest
+    source: "design assumption (documented cancels are fast and automatic: Coscia milliseconds, Walleye under 10 s)"
     knobs: {cancel_jitter: up, cancellation_delay_ticks: up}
     weakens: [fast_cancel_ratio, mean_cancel_lifetime]
     cost: longer-resting spoofs risk being filled
-  - tactic: Split into batches / layers
-    source: Coscia evasion; Tower Research layering
-    knobs: {n_split_orders: 2-4}
-    weakens: [max_order_size_rel, large_cancel_ratio, n_large_cancels]
-    cost: more cancel events per cycle
-  - tactic: Cross-account (cross-trader) spoofing
-    source: JPMorgan 2020 — one account holds the genuine order, another spoofs
+  - tactic: Cross-account spoofing
+    source: "partly documented: several traders on one desk (JPMorgan, Scotiabank); splitting genuine and spoof legs across accounts is a design assumption"
     knobs: {n_accounts: 2-3}
     weakens: [spoof_signature, cancel_exec_opposition]
     cost: needs coordination; each account still cancels heavily
   - tactic: Reprice to stay behind the touch
-    source: Sarao 2015 — orders auto-modified to stay a few ticks from the best price, avoiding execution
+    source: "documented: Sarao 2015, orders auto-modified to stay 3-4+ levels from the best price"
     knobs: {reprice_to_touch: 1}
     weakens: [spoof_signature (fewer fills), passive_distance_bp drift]
-    cost: every re-place is a cancel, so orders live ~1 tick — cancel_replace_ratio and fast_cancel_ratio RISE (trades detectability for fewer fills)
+    cost: every re-place is a cancel, so cancel_replace_ratio and fast_cancel_ratio RISE (trades detectability for fewer fills)
+  - tactic: One-sided campaigns vs alternating sides
+    source: "documented: Sarao spoofed one side (sell) for long stretches; alternating per cycle is a design assumption"
+    knobs: {direction_persistence: down}
+    weakens: [cancel_side_imbalance, exec_side_imbalance]
+    cost: "STRONG: alternating pushes cancel each other within seconds, so the spoof earns less (keep >= 0.7)"
   - tactic: Flip after cancel
-    source: Oystacher 2015 — cancel the spoof, then immediately trade aggressively the other way
+    source: "reported for Oystacher/3Red 2015 (not verified from the primary text)"
     knobs: {flip_after_cancel: up}
     weakens: [fill_ratio, cancel_ratio (more real executions)]
     cost: real aggressive trades (execution cost, visible aggressor flow)
+  - tactic: Fewer cycles
+    source: "design assumption"
+    knobs: {frequency: down}
+    weakens: [n_large_cancels, self_z_n_orders, activity_vs_history]
+    cost: proportionally less fake depth over the episode
   - tactic: Trade in busy periods
-    source: "CFTC 2020 staff advisory #5 — manipulate when high activity explains the noise"
+    source: "design assumption: high activity explains the noise"
     knobs: {busy_period_bias: up}
     weakens: [activity_vs_history, peer_z features, mkt-relative signals]
     cost: fewer cycles (less effect) when the market is quiet
   - tactic: Spoof further from the touch
-    source: generic
+    source: "design assumption (Sarao rested 3-4 levels back but repriced constantly)"
     knobs: {price_aggressiveness: up}
     weakens: [passive_distance_bp]
     cost: STRONG — depth beyond ~0.2% barely moves prices (effectiveness collapses)
   - tactic: Hide spoofs inside genuine trading
-    source: "Sarao (NAV) and Coscia traded genuinely alongside the spoof orders; the spoofs were a minority of their flow"
+    source: "partly documented: Sarao and Coscia also traded genuinely; sizes and rates here are design assumptions"
     knobs: {cover_rate: up, cover_size: up}
     weakens: [avg_order_size_rel, large_order_share, fill_ratio, cancel_ratio, fast_cancel_ratio, aggressor_ratio]
     cost: "inventory risk; genuine resting orders slightly offset the fake depth. Does not hide max_order_size_rel or spoof_signature. Ratios are volume-weighted: cover_size ~1 needed to dilute (measured with cover 0.3 x 1.0: spoofing caught 0.52, layering 0.65); cover_size near 3 makes the account an outlier again"
   - tactic: Algo-sized orders
-    source: "Real execution algorithms rest and chase large child orders (1-8x level depth); spoofs near that size blend in"
+    source: "design assumption: real execution algorithms rest large child orders (1-8x level depth); spoofs near that size blend in. Documented spoofs were 5x+ the genuine order (Walleye: 10 or fewer vs 50+)"
     knobs: {order_size_multiplier: down}
     weakens: [max_order_size_rel, avg_order_size_rel, large_cancel_ratio vs. look-alike algos]
     cost: "STRONG on effect: measured 4x size + cover 0.2 -> caught 0.31 but effect 0.64x; stay above ~4"
 
 wash_trading:
+  - tactic: Account rings instead of a fixed pair
+    source: "design assumption (documented washes are between two commonly owned accounts: Cargill, Aralia/Vintage, Shinhan)"
+    knobs: {ring_size: 3-6}
+    weakens: [top_cpty_share, reciprocal_ratio]
+    cost: "more accounts to control; ring members are still mutual major partners, so mutual_cpty_share, ring_size and ring_volume_share see the ring at any size"
+  - tactic: Account proliferation (several groups)
+    source: "partly documented: wash trades across several accounts of one owner (Shinhan); independent groups are a design assumption"
+    knobs: {n_groups: 2-5}
+    weakens: [gross_volume_share, max_order_size_rel, activity_vs_history]
+    cost: "none on total volume (the rate is split across groups); each group is still a visible ring"
   - tactic: Trade in busy periods
-    source: "CFTC 2020 staff advisory #5; Kraft: timing trades to coincide with genuine high volume"
+    source: "design assumption"
     knobs: {busy_period_bias: up}
     weakens: [gross_volume_share, activity_vs_history, mkt_volume_spike]
     cost: fewer crosses when the market is quiet (less wash volume)
-  - tactic: Account rings instead of a fixed pair
-    source: Coinbase 2021 — cyclical A->B->C->A washes
-    knobs: {ring_size: 3-6}
-    weakens: [top_cpty_share, reciprocal_ratio]
-    cost: more accounts to control
-  - tactic: Account proliferation
-    source: "advisory #3; Kraft round 2 (3-5 accounts)"
-    knobs: {n_groups: 2-5}
-    weakens: [gross_volume_share, max_order_size_rel, activity_vs_history]
-    cost: none on total volume (the rate is split across groups)
   - tactic: Irregular sizes
-    source: "advisory #1"
+    source: "design assumption (documented washes matched quantity exactly: Cargill)"
     knobs: {size_jitter: up}
     weakens: [trade_size_cv, max_order_size_rel]
     cost: none
   - tactic: Interleave genuine trades
-    source: "Kraft round 2; advisory #4"
+    source: "design assumption"
     knobs: {camouflage_rate: up}
     weakens: [top_cpty_share, net_flatness, reciprocal_ratio]
-    cost: real market exposure and less wash volume
+    cost: "real market exposure and less wash volume; camouflage windows are not labelled as washing, but the wash windows themselves still are"
   - tactic: Lower cross frequency
-    source: generic
+    source: "design assumption (Cargill: few, larger transfers; Shinhan: 127 trades)"
     knobs: {trade_frequency: down}
     weakens: [gross_volume_share, activity_vs_history]
     cost: STRONG — wash volume (the whole point) falls proportionally
 
 pump_and_dump:
   - tactic: Ignite during busy periods
-    source: "CFTC 2020 staff advisory #5"
+    source: "design assumption"
     knobs: {busy_period_bias: up}
     weakens: [mkt_abnormal_return_z, activity_vs_history]
     cost: schedule drifts while waiting for activity
   - tactic: Staggered accumulation
-    source: Nefedova — accounts buy at different times, "appearing like independent decisions"
+    source: "design assumption"
     knobs: {stagger: up, burst_duration_ticks: up}
     weakens: [coordinated_peers, activity_vs_history]
     cost: a slower, less synchronised pump lifts the price less
   - tactic: Account proliferation
-    source: "Nefedova round 2 (5-8 accounts); advisory #3"
+    source: "design assumption"
     knobs: {n_coordinated_accounts: up, accumulation_size: down}
     weakens: [gross_volume_share, exec_vol, avg_order_size_rel]
     cost: coordination; total size per account must stay meaningful
   - tactic: Gentler ignition
-    source: generic
+    source: "design assumption (documented price pushes concentrate aggressive trading near the close: Optiver, Moore, Amaranth)"
     knobs: {ignition_aggression: down}
     weakens: [aggressor_ratio, mkt_abnormal_return_z, signed_flow_return]
     cost: STRONG — the ignition is what moves the price
   - tactic: Interleave decoy trades
-    source: "advisory #4"
+    source: "design assumption"
     knobs: {decoy_rate: up}
     weakens: [exec_side_imbalance, long_net_ratio, reversal_score]
-    cost: buys back some of what is sold and vice versa
+    cost: "buys back some of what is sold and vice versa; decoy windows are not labelled as pumping, but ignition and dump windows still are"
   - tactic: Slow, phased exit
-    source: Nefedova — dump over 2-3x the accumulation window
+    source: "design assumption"
     knobs: {dump_delay_ticks: up}
-    weakens: [reversal_score, vol_price_divergence]
+    weakens: [reversal_score, long_net_ratio]
     cost: price may revert before the coalition has sold
 
 layering:
   - tactic: Taper layer sizes
-    source: "Tower Research 2019 — decreasing volume deeper in the book to appear natural"
+    source: "design assumption"
     knobs: {size_taper: up}
     weakens: [max_order_size_rel, order_size_cv, large_order_share]
     cost: deeper layers add less fake depth
   - tactic: Build the ladder in rapid succession
-    source: "CFTC layering orders — orders 'entered in rapid succession' at consecutive levels rather than as one simultaneous batch"
+    source: "design assumption"
     knobs: {placement_stagger: up}
     weakens: [layered_order_share (counts same-tick batches on >= 3 levels), self_z_layered_order_share]
     cost: "STRONG at short cancel delays: the full ladder rests for less of each cycle (layer i rests delay - i x stagger ticks). Measured with delay 5: stagger 1 keeps 0.71x, 2 keeps 0.59x, 3 keeps 0.56x of the fake depth. Pair it with a long cancellation_delay_ticks (at delay 20, stagger 1 keeps ~0.93x). The delay is stretched to at least stagger x (n_layers - 1) + 1"
   - tactic: Fewer, wider layers
-    source: Tower round 2 — 2-6 layers, varied spacing
+    source: "design assumption"
     knobs: {n_layers: down, layer_spacing: up}
     weakens: [layered_order_share (needs >= 3 levels), n_orders]
     cost: "HARD LIMIT layer_spacing <= 0.0004 (measured: 0.0004 keeps 1.0x, 0.0005 0.88x, 0.001 only 0.42x with 2 or 3 layers: the layers sit outside the near-touch band). Below 3 levels it is caught as spoofing"
   - tactic: Randomised, longer cancel timing
-    source: "advisory #2; Tower round 2 (timing staggered across 5-15 ticks)"
+    source: "design assumption (Sarao's layers rested for long stretches, repriced)"
     knobs: {cancel_jitter: up, cancellation_delay_ticks: up}
     weakens: [fast_cancel_ratio, mean_cancel_lifetime]
     cost: layers rest longer and may get filled
   - tactic: Smaller layers
-    source: advisory #1
+    source: "design assumption (documented: Bases used many smaller orders)"
     knobs: {layer_size_multiplier: down}
     weakens: [avg_order_size_rel, max_order_size_rel]
     cost: STRONG — thin layers barely change the visible depth (effect falls)
+  - tactic: Fewer cycles
+    source: "design assumption"
+    knobs: {frequency: down}
+    weakens: [n_large_cancels, self_z_n_orders, activity_vs_history]
+    cost: proportionally less fake depth over the episode
   - tactic: Trade in busy periods
-    source: "CFTC 2020 staff advisory #5"
+    source: "design assumption"
     knobs: {busy_period_bias: up}
     weakens: [activity_vs_history, peer_z features]
     cost: fewer cycles when the market is quiet
   - tactic: Hide layers inside genuine trading
-    source: "Tower Research: layering ran next to ordinary futures trading on the same desk"
+    source: "partly documented: Sarao traded genuinely alongside his layering algorithm; sizes and rates are design assumptions"
     knobs: {cover_rate: up, cover_size: up}
     weakens: [avg_order_size_rel, large_order_share, fill_ratio, cancel_ratio, layered_order_share]
     cost: "inventory risk; genuine resting orders slightly offset the fake depth. Ratios are volume-weighted: cover_size ~1 needed to dilute (measured with cover 0.3 x 1.0: spoofing caught 0.52, layering 0.65); cover_size near 3 makes the account an outlier again"

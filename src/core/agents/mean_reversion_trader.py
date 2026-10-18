@@ -16,6 +16,13 @@ This is the core stabilising force of the ABM — mean reversion is an
 EMERGENT property of agent incentives responding to the fundamental
 value signal, NOT an imposed OU formula on the price series.
 (ABM Project Plan Section 3.1 — "emergence not imposition" principle)
+
+Position limit (`max_position`, off by default): these six accounts stand for the
+whole commercial/hedging sector and are the market's anchor to fundamental value.
+Capping them at 1,500 contracts was tested and removed the anchor: once at the cap
+they stopped fading moves and prices ran away (5-minute volatility 500-1,100 bp in
+corn, natural gas, silver, wheat and Brent). Large aggregate positions are the
+realistic price of that anchor.
 """
 
 from __future__ import annotations
@@ -50,11 +57,14 @@ class MeanReversionTrader(Agent):
         reversion_threshold: float = 0.005,
         order_size_base: int = 40,
         arrival_rate_lambda: float = 0.25,
+        max_position: int | None = None,
     ) -> None:
         super().__init__(trader_id, rng)
         self.reversion_threshold = reversion_threshold
         self.order_size_base = order_size_base
         self.arrival_rate_lambda = arrival_rate_lambda
+        self.max_position = int(max_position) if max_position else None
+        self.net_position = 0
 
         self._fundamental_value: float | None = None
 
@@ -65,6 +75,9 @@ class MeanReversionTrader(Agent):
         """
         if value > 0:
             self._fundamental_value = value
+
+    def update_inventory(self, side: Side, quantity: int) -> None:
+        self.net_position += quantity if side == Side.BUY else -quantity
 
     def decide(self, book_state: BookState, tick: int) -> Order | None:
         # --- Activation ---
@@ -87,6 +100,11 @@ class MeanReversionTrader(Agent):
 
         # --- Fade the move at the touch: commercial hedgers work orders patiently
         # and take only the liquidity displayed at the best price (no book sweeps).
+        if self.max_position is not None and (
+                (deviation > 0 and self.net_position <= -self.max_position)
+                or (deviation < 0 and self.net_position >= self.max_position)):
+            return None   # at the position limit on that side
+
         if deviation > 0:
             side = Side.SELL
             price = book_state.best_bid or ref_price * (1 - 0.0002)

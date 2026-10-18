@@ -1,219 +1,189 @@
 """
 docs/enforcement_case_notes.md
 ===============================
-CFTC Enforcement Case Notes — Spoofing, Wash Trading, Pump-and-Dump
+Enforcement case notes: spoofing, layering, wash trading, pump-and-dump and price pushes.
 
-Summarized findings from CFTC enforcement actions, used to:
-1. Ground manipulation persona design (ABM Project Plan Section 3.3/3.4)
-2. Inform Module 3 mutation parameter design (Implementation Plan Section 5.2)
-3. Provide literature grounding for Module 4B adversarial strategist prompts
-4. Support the project literature review
+Used to ground the manipulation personas, the replayed real cases
+(configs/case_replays.yaml) and the adversarial strategist, which reads one section
+per persona through its `get_enforcement_notes` tool.
 
-All case summaries are derived from publicly available CFTC enforcement
-action documents at https://www.cftc.gov/LawRegulation/Enforcement/EnforcementActions.htm
-
-This file is intentionally written in plain English for use as Module 4B
-grounding context — it is read by the adversarial strategist's
-`get_enforcement_notes` tool.
+Rules for this file (revised Oct 2026):
+- "Documented" lines state only what the cited public source says (CFTC/DOJ releases
+  and orders, court opinions, reputable reporting). Each case lists its sources.
+- Anything added for the simulator (sizes, tick counts, evasion knobs) is marked
+  "Design note" or listed under "Tactics without a documented case".
+- An earlier version cited a "CFTC 2020 staff advisory on spoofing evasion" and a
+  "CFTC v. Nefedova et al. (2020)" silver case. Neither could be found in CFTC records,
+  so both were removed; tactics that relied on them are now design assumptions.
 """
 
 # Spoofing Cases
 
-## Coscia v. CFTC (2014) — First Major Spoofing Conviction
+Pattern documented across cases: a small genuine order on one side, larger orders on the other side
+placed with intent to cancel, pulled once the genuine order fills or after seconds; repeated many times.
+- Coscia/Panther (2011): algorithm placed a small order, then large opposite-side orders it cancelled automatically after a short interval (milliseconds); configured so they would not all fill.
+- Walleye (2022 order): small order of 10 or fewer contracts, then 50+ contracts on the opposite side, cancelled within 10 seconds.
+- Tower Research (2012-2014): large orders pulled after smaller genuine opposite orders filled; an order splitter entered several smaller, randomly-sized orders to obscure the scheme.
+- Sarao (2010-2015): one-sided campaigns (sell side) for long stretches; orders repriced to stay several levels behind the touch.
+- Bank desks (JPMorgan 2008-2016, Merrill 2008-2014, Deutsche Bank, Scotiabank): several traders on one precious-metals desk; Pacilio typically one large order, Bases many smaller orders.
+- Oystacher/3Red (2011-2014): false depth in five products on four exchanges.
 
-**Source:** CFTC v. Michael Coscia, Case No. 1:14-cr-00551 (N.D. Ill.)
-**Commodity:** Crude oil, natural gas, metals futures
-**Settlement:** $2.8 million fine + 3-year trading ban
+## Michael Coscia / Panther Energy Trading (2011)
+**Sources:** CFTC Release 6649-13 (22 Jul 2013); United States v. Coscia, 866 F.3d 782 (7th Cir. 2017), No. 16-3017.
+**Documented:** algorithmic trading on CME Globex across a broad range of futures, 8 Aug - 18 Oct 2011.
+A small order on one side, then large orders on the opposite side; the algorithm was configured so the
+large orders would not all be filled and cancelled them automatically after a short interval
+(milliseconds). First CFTC penalty under the Dodd-Frank spoofing prohibition: $1.4M penalty, $1.4M
+disgorgement, one-year trading ban (2013). Criminal conviction upheld by the 7th Circuit (2017).
 
-**Mechanism documented:**
-Coscia used an algorithmic strategy that placed large orders (10–50x normal
-order size) on one side of the book to create a false impression of supply or
-demand, then immediately cancelled them within 2–300 milliseconds after
-smaller, opposite-side orders executed. The cancel-to-place ratio was
-approximately 95%+ for the spoof orders.
+## Walleye Trading (2022 CFTC order)
+**Source:** CFTC order, 12 Dec 2022 (cftc.gov/media/7981).
+**Documented:** a trader repeatedly (1) placed a small order of ten or fewer contracts on one side,
+(2) while it was pending placed an order of fifty or more contracts on the opposite side that he
+intended to cancel, and (3) cancelled the larger order within ten seconds.
 
-**Key tactics for mutation design:**
-- Initial pattern: very large single spoof orders (obvious from cancel_rate signal)
-- Evasion attempt: split large orders into smaller batches across multiple ticks
-  (reduces per-order anomaly but increases frequency of cancellation events)
-- Quote: "The rapid cancellation was the signature — once detected,
-  the strategy would need to introduce random delays to obscure the pattern."
+## Tower Research Capital (2012-2014)
+**Sources:** CFTC Release 8074-19 and order (7 Nov 2019); DOJ guilty pleas of Gandhi and Mohan (2018).
+**Documented:** E-mini equity index futures. Traders placed large orders on one side and cancelled them
+once smaller genuine orders on the opposite side filled. They "often used an order splitter to enter
+several smaller, randomly-sized orders in an attempt to obscure their scheme". $67.4M total
+($32.6M restitution, $10.5M disgorgement, $24.4M penalty).
 
-**Detector signal this exploits:** Order Cancellation Rate, Bid-Ask Imbalance Spike
-**Mutation progression for Module 3:**
-1. Round 0: Single large order (8x depth), immediate cancel (5 ticks)
-2. Round 1: Multiple smaller orders (2x depth each), cancel at 15–25 ticks (random)
-3. Round 2: Randomized order sizes (uniform 1–4x), randomized cancel timing (10–40 ticks)
+## Navinder Sarao / Nav Sarao Futures (2010-2015)
+**Sources:** CFTC Release 7156-15 (21 Apr 2015); CFTC Release 7480-16 (2016); CNBC reporting on the complaint.
+**Documented:** a modified trading platform placed several large SELL orders one price level apart in the
+E-mini S&P 500 book and repriced them as the market moved to stay at least 3-4 levels above the best
+ask; most were cancelled without executing. Used on 400+ trading days. On 6 May 2010 the orders were
+about 20-29% of the sell-side book (up to ~40% on some days, per reporting). Guilty plea (spoofing,
+wire fraud); more than $38M in sanctions sought in the CFTC consent order.
+
+## JPMorgan precious metals desk (2008-2016)
+**Sources:** CFTC Release 8260-20 (29 Sep 2020); DOJ, Smith and Nowak convicted (Aug 2022).
+**Documented:** traders placed orders they intended to cancel before execution to move prices toward
+orders they intended to execute on the opposite side; gold, silver, platinum and palladium futures
+(NYMEX/COMEX) and Treasury futures; hundreds of thousands of spoof orders over about eight years;
+$920.2M in total. Several traders on the desk took part.
+
+## Merrill Lynch precious metals (Bases and Pacilio, 2008-2014)
+**Sources:** United States v. Bases and Pacilio, 18-cr-48 (N.D. Ill.), convicted Aug 2021; trial testimony reported by Bloomberg.
+**Documented:** large buy and sell orders cancelled quickly to push gold, silver and platinum prices.
+Testimony: Pacilio typically used a single large order; Bases favoured many smaller orders.
+
+## Deutsche Bank (Vorley and Chanu, 2008-2013)
+**Source:** DOJ, convicted Sept 2020.
+**Documented:** orders in COMEX gold and silver futures they did not intend to execute, to create a
+false impression of supply or demand and trade on the opposite side.
+
+## Bank of Nova Scotia (Corey Flaum and others)
+**Sources:** CFTC order (19 Aug 2020); DOJ plea of Flaum (2019).
+**Documented:** thousands of gold and silver futures orders placed with intent to cancel, by four traders
+on the precious-metals desk; earlier $800K CFTC penalty (2018) for 2013-2016 conduct.
+
+## Igor Oystacher / 3Red Trading (2011-2014)
+**Sources:** CFTC Release 7264-15 (19 Oct 2015) and complaint; consent order Dec 2016.
+**Documented:** spoofing on at least 51 days, Dec 2011 - Jan 2014, in E-mini S&P 500, copper, crude oil,
+natural gas and VIX futures on four exchanges, creating the appearance of false market depth.
+$2.5M penalty and a three-year independent monitor.
+**Not verified here:** the commonly reported "flip" (cancel, then trade aggressively the other way).
 
 ---
 
-## JPMorgan Chase & Co. (2020) — Precious Metals & Treasuries Spoofing
+# Layering Cases
 
-**Source:** CFTC Order, In the Matter of JPMorgan Chase & Co.
-**Commodity:** Gold, Silver, Platinum, Palladium, Treasury futures
-**Settlement:** $920 million (largest spoofing settlement in CFTC history)
-
-**Mechanism documented:**
-Traders on the JPM precious metals desk placed hundreds of thousands of spoof orders over an 8-year period. A key tactic was "cross-market" and "cross-trader" spoofing, where one trader would place a genuine order on one exchange, and another trader in the same desk would place a massive spoof order on a correlated asset or opposite side of the book to push the price toward the genuine order.
-
-**Key tactics for mutation design:**
-- Initial pattern: Multi-account coordination to spoof. One account places the passive genuine order, a second account places the aggressive spoof order. 
-- Evasion attempt: Cross-asset spoofing (e.g. spoofing Silver to execute a Gold order) to completely evade single-order-book surveillance.
-- Quote: "The spoof orders were typically entered with the intent to cancel them before execution, and were designed to inject false information about supply and demand."
-
-**Detector signal this exploits:** Cross-Account Cancellation Correlation, Inter-commodity Order Imbalance
-**Mutation progression for Module 3 (Advanced):**
-1. Round 0: Same-book multi-account spoofing (Account A buys, Account B spoofs asks).
-2. Round 1: Spoofer account uses smaller, scattered spoof orders to avoid single-account size variance triggers.
-
----
-
-## Tower Research Capital (2019) — Layering via Algorithms
-
-**Source:** CFTC Order No. 19-09, Settlement with Tower Research Capital LLC
-**Commodity:** E-mini S&P 500, Eurodollar, and commodity futures
-**Settlement:** $67.4 million
-
-**Mechanism documented:**
-Tower's algorithms placed multiple (3–8) limit orders at consecutive price levels
-on one side (layering), creating a false impression of depth. The layers were
-placed nearly simultaneously and cancelled as a group once the opposite-side
-order executed. Average time-to-cancellation was 50–200 ms.
-
-**Key tactics for mutation design:**
-- Initial pattern: symmetric layers at fixed price intervals (detectable as
-  regular spacing in the order book)
-- Evasion: asymmetric layer sizes (decreasing volume deeper in the book to
-  appear more "natural"), randomized spacing between layers
-- Quote: CFTC found the layering "created the false appearance of market depth
-  and liquidity, thereby deceiving other market participants."
-
-**Detector signal this exploits:** Bid-Ask Imbalance Spike, Order Cancellation Rate, Order Size Variance
-**Mutation progression for Module 3 (Layering persona):**
-1. Round 0: 4 layers, equal size, uniform 2-tick spacing, 3-tick cancel
-2. Round 1: 4 layers, decreasing sizes (100/75/50/25), varied spacing
-3. Round 2: 2-6 layers (random), random sizes, timing staggered across 5–15 ticks
+Layering = several non-bona-fide orders stacked on consecutive price levels of one side to fake depth.
+- Sarao (2010-2015): several large sell orders one level apart, repriced to stay 3-4+ levels above the best ask, resting for long stretches, mostly cancelled; ~20-29% of sell-side depth on 6 May 2010.
+- Merrill/Bases: many smaller orders rather than one large order (testimony).
+- Tower: an order splitter producing several smaller, randomly-sized orders.
+No case found that documents layer-size tapering, staggered placement or randomised layer spacing:
+those are design assumptions (see the last section).
 
 ---
 
 # Wash Trading Cases
 
-## Kraft Foods Group (2015) — Wheat Futures Wash Trading
+Pattern documented across cases: equal and opposite orders between accounts with common ownership,
+matched in product, quantity, price and timing, often within seconds.
+- Cargill de Mexico (2010-2014): equal and opposite orders between two accounts it owned (corn, soybean, wheat), to move hedges between accounts.
+- Shinhan Securities (2025): 127 wash trades across its accounts, offsetting orders placed within seconds.
+- Aralia/Vintage (2021): accounts with the same ultimate beneficial owner placed offsetting orders in the same product.
+- Coinbase (2015-2018): two internal trading programs matched each other; one employee washed Litecoin/Bitcoin for six weeks in 2016.
+- CME rule: orders for accounts with common beneficial ownership, entered to negate market risk or price competition, are wash trades.
 
-**Source:** CFTC v. Kraft Foods Group, Inc. and Mondelez Global LLC,
-Case No. 15-cv-2881 (N.D. Ill.)
-**Commodity:** Wheat futures (Chicago Board of Trade)
-**Settlement:** $16 million
+## Cargill de Mexico (2010-2014)
+**Sources:** CFTC Release 7241-15 (24 Sep 2015) and order.
+**Documented:** wash sales and non-competitive transactions in CBOT corn, soybean and wheat and KCBT hard
+red wheat futures, Mar 2010 - Aug 2014: employees entered equal and opposite orders for another
+account it also owned, matching product, quantity, price and timing, to transfer hedging positions.
+$500K penalty; undertaking to use self-match prevention.
 
-**Mechanism documented:**
-Kraft/Mondelez executed a coordinated strategy across corporate accounts where
-related entities placed matching buy and sell orders in December 2011 wheat
-futures contracts. The trades created artificial volume and price signals while
-maintaining flat net positions across the corporate group.
+## Shinhan Securities (2025)
+**Source:** CFTC administrative order (17 Sep 2025).
+**Documented:** a trader executed 127 wash trades across Shinhan accounts at a US futures commission
+merchant, placing offsetting orders within seconds, knowing they would fill against each other.
 
-**Key tactics for mutation design:**
-- Initial pattern: two obvious account pair, fixed trade frequency, prices
-  near mid-price (very detectable via net-position/gross-volume ratio)
-- Evasion: timing trades to coincide with periods of genuine high volume
-  (hides volume concentration signal), using 3–5 accounts instead of 2
-- Quote: "The coordination was evidenced by the temporal clustering of
-  buy-sell pairs across accounts with no legitimate hedging or speculative purpose."
+## Aralia / Vintage (2021)
+**Source:** CFTC order (27 Dec 2021).
+**Documented:** trading accounts of two entities with the same ultimate beneficial owner placed
+offsetting orders in the same futures product; also treated as non-competitive transactions.
 
-**Detector signal this exploits:** Volume Concentration (top-k), Net-Position/Gross-Volume Ratio
-**Mutation progression for Module 3:**
-1. Round 0: 1 pair of colluding accounts, every 10 ticks, ±0.1% from mid
-2. Round 1: 2 pairs, every 8–15 ticks (randomized), ±0.05–0.3% from mid
-3. Round 2: 4 pairs (spread thin), intervals varied to match organic trading rhythm,
-   interspersed with small genuine-looking directional trades to obscure flat inventory
+## Coinbase Inc. (2021 order)
+**Sources:** CFTC Release 8369-21 (19 Mar 2021); Coinbase 10-Q.
+**Documented:** Jan 2015 - Sept 2018, two trading programs ("Hedger" and "Replicator") generated orders
+that at times matched each other, and the platform did not disclose that Coinbase ran more than one
+program or traded through multiple accounts; over six weeks in Aug-Sept 2016 a former employee
+placed Litecoin/Bitcoin orders that matched each other as wash trades. $6.5M penalty.
+**Not documented:** rotating ("cyclical") washes through rings of accounts; that is a design assumption.
 
----
-
-## Coinbase Inc. (2021) — Algorithmic Wash Trading
-
-**Source:** CFTC Order No. 21-03, In the Matter of Coinbase Inc.
-**Commodity:** Digital asset commodities (Bitcoin, Litecoin, etc.)
-**Settlement:** $6.5 million
-
-**Mechanism documented:**
-Coinbase operated two automated trading programs, "Hedger" and "Replicator", which ended up frequently matching trades against each other. Although originally designed to manage exchange liquidity, the CFTC found they engaged in wash trading that artificially inflated trading volume and created a false appearance of liquidity and market depth on the platform.
-
-**Key tactics for mutation design:**
-- Initial pattern: Pure algorithmic self-matching (same exact IP, same exact internal entity).
-- Evasion attempt: While this specific case was a reckless configuration rather than malicious evasion, the tactic translates to manipulators routing wash trades through API limits across multiple VPS subnets.
-- Quote: "The wash trades created a misleading appearance of liquidity and trading interest."
-
-**Detector signal this exploits:** IP/Subnet Trade Matching, Gross Volume vs. External Liquidity
-**Mutation progression for Module 3:**
-1. Round 0: Two known algorithmic accounts perfectly matching limit orders.
-2. Round 1: 10+ randomized "dummy" accounts executing cyclical wash trades (A trades to B, B to C, C to A) to break simple A-B pair detection algorithms.
+## Kraft Foods / Mondelez (wheat, 2011)
+**Sources:** CFTC complaint, No. 15-cv-2881 (N.D. Ill., Apr 2015); consent order May 2022 ($16M, paid by Mondelez); Reuters.
+**Documented (allegations):** about $90M of December 2011 wheat futures bought without intent to take
+delivery, to move cash-wheat prices; position limits exceeded; non-competitive trading of both sides
+of exchange-for-physical wheat transactions between related accounts.
 
 ---
 
-# Pump-and-Dump Cases
+# Pump-and-Dump and Price-Push Cases
 
-## CFTC v. Nefedova et al. (2020) — Silver Futures Coordinated Manipulation
+Classic pump-and-dumps (accumulate, promote or ignite, sell into the rise) are documented mainly in
+thin markets (small caps, crypto tokens: e.g. Telegram-coordinated pumps, Kamps & Kleinberg 2018).
+In large commodity futures the documented price pushes are mostly concentrated trading around the
+settlement ("banging the close") to move a settlement price that other positions reference.
+- Optiver (2007): about 20-30% of its trades just before the close and the rest during it; NYMEX crude, heating oil, gasoline.
+- Moore Capital (2007-2008): banging the close to push platinum and palladium settlement prices up.
+- Amaranth (2006): heavy selling in the 2:00-2:30 pm closing range on expiry days to push natural gas settlement down, benefiting short swaps.
+No futures case found that documents a multi-account coordinated pump with staggered entries, decoy
+trades or a phased exit: the pump_and_dump persona's evasion knobs are design assumptions.
 
-**Source:** CFTC Litigation Release, In re: Nefedova, Pleshakov et al.
-**Commodity:** Silver futures (COMEX)
-**Pattern:** Coordinated accumulation + momentum exploitation + coordinated dump
+## Optiver (March 2007)
+**Sources:** CFTC Release 5521-08 (24 Jul 2008); CFTC Release 6239-12 (consent order, Apr 2012).
+**Documented:** 19 attempted manipulations over 11 days in NYMEX crude oil, heating oil and gasoline
+futures (at least five successful): a substantial position acquired leading up to the closing
+period, about 20-30% of the trades just before the close and the remainder during it. $13M penalty
+and $1M disgorgement.
 
-**Mechanism documented:**
-A group of traders coordinated via messaging to simultaneously buy silver
-futures over a short window (15–60 minutes), causing legitimate momentum
-traders to follow the apparent trend. Once price had risen 0.5–1.5%, the
-group systematically reversed their positions over a slightly longer window
-(30–90 minutes) to conceal the coordinated nature of the exit.
+## Moore Capital (Christopher Pia, 2007-2008)
+**Sources:** CFTC Release 5815-10 (29 Apr 2010); CFTC Release 6079-11 (Pia, 2011).
+**Documented:** a portfolio manager attempted to push NYMEX platinum and palladium settlement prices up by
+banging the close, about Nov 2007 - May 2008. $25M and a two-year restriction on closing-period
+trading for the firm; Pia $1M and a permanent ban from closing-period trading.
 
-**Key tactics for mutation design:**
-- Initial pattern: sharp, synchronous burst of buys across 3 accounts,
-  immediate reversal (obvious from volume concentration + timing)
-- Evasion round 1: staggered accumulation (accounts buy at different ticks
-  over a longer window, appearing like independent decisions)
-- Evasion round 2: phased dump (sells spread over 5–8 accounts over 2–3x
-  the accumulation window, matching organic post-rally profit-taking)
-- Quote: CFTC noted that "a key diagnostic was the correlation in timing
-  across accounts combined with the net inventory reversal pattern —
-  individually, each account's activity could appear legitimate."
-
-**Detector signal this exploits:** Volume Concentration, Price-Volume Divergence (at reversal)
-**Mutation progression for Module 3:**
-1. Round 0: 3 coordinated accounts, 200-tick burst, 100-tick dump delay
-2. Round 1: 5 accounts, 400-tick gradual accumulation, 200-tick dump, staggered
-3. Round 2: 8 accounts, 600-tick accumulation paced to mimic momentum trader
-   pattern, 400-tick dump spread across all 8 accounts at slightly different times
+## Amaranth Advisors (Brian Hunter, 2006)
+**Sources:** CFTC complaint (July 2007); consent order ($7.5M, 2009); Risk.net.
+**Documented:** attempted manipulation of NYMEX natural gas settlement prices on expiry days (Feb and Apr
+2006): futures shorts reversed to long holdings during the day, then large volumes sold in the
+closing range (2:00-2:30 pm, whose volume-weighted price sets the settlement) while holding large
+short swaps on ICE that settle on that price.
 
 ---
 
-# Cross-Cutting Evasion Patterns (CFTC Staff Advisory 2020)
+# Tactics Without a Documented Case (design assumptions)
 
-**Source:** CFTC Division of Enforcement, Staff Advisory on Spoofing
-Detection Evasion Patterns
-
-The following evasion techniques have been documented across multiple cases
-and directly inform the Module 3 mutation library:
-
-1. **Order size randomization**: Spoofers who learned their patterns were
-   being detected introduced uniform random variation (±30–50%) in spoof
-   order sizes. This degrades the Order Size Variance anomaly signal.
-
-2. **Cancellation timing randomization**: Replacing fixed cancel delays with
-   random draws from a distribution that resembles legitimate cancel timing.
-
-3. **Account proliferation**: Distributing activity across more accounts to
-   dilute per-account signals (directly reduces volume concentration metrics).
-
-4. **Interleaving with legitimate activity**: Inserting genuine (non-cancelled,
-   non-wash) trades between manipulative events to "reset" rolling window
-   features. This is the hardest evasion to detect because it requires the
-   manipulator to absorb real execution risk.
-
-5. **Timing to market events**: Executing manipulation during high-liquidity
-   windows (e.g., market open, report releases) where elevated cancellation
-   rates and volume concentration are more naturally explainable.
-
-**Reference for viva:** The CFTC's 2020 staff advisory explicitly states:
-"Market participants who modify their algorithmic strategies to evade
-detection by randomizing order sizes, timing, or account usage continue to
-engage in prohibited behaviour regardless of the degree of obfuscation."
-This directly supports the project's adversarial loop design as reflecting
-real-world surveillance dynamics.
+These knobs make the personas harder targets for the detector. They are plausible evasions but no
+case above documents them; the strategist should treat their realism as unproven.
+- Randomised cancel timing (spoofing, layering): documented cancels are fast and automatic (Coscia, Walleye).
+- Trading mainly in busy periods (all personas).
+- Rotating wash trades through rings of 3-6 accounts; camouflage directional trades among the washes.
+- Pump-and-dump: more coordinated accounts, staggered entries, gentler ignition, decoy trades, phased exit.
+- Layering: tapered layer sizes, staggered placement, wider spacing, fewer layers.
+- Cover trading alongside the scheme: Sarao and Coscia traded genuinely as well, but the sizes and
+  rates used here are assumptions.

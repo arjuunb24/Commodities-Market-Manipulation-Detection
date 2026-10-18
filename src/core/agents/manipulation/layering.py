@@ -4,10 +4,11 @@ src/core/agents/manipulation/layering.py
 Layering persona — several non-bona-fide orders stacked on consecutive price
 levels of one side, cancelled together once the opposite-side order fills.
 
-Grounded in CFTC Order No. 19-09, Tower Research Capital (2019, $67.4M), see
-docs/enforcement_case_notes.md: algorithms placed 3–8 orders at consecutive
-levels to create a false impression of depth, then cancelled the group after
-the genuine order on the other side executed.
+Closest documented case: Sarao (CFTC 2015), whose algorithm kept several large
+sell orders one price level apart to fake depth and cancelled almost all of them
+(see docs/enforcement_case_notes.md). The specific shape here (a same-tick ladder
+near the touch, cancelled together once the opposite-side genuine order fills)
+and the evasion knobs below are design assumptions.
 
 Difference from spoofing: spoofing shows ONE large order (or a few splits)
 just behind the touch; layering spreads MODERATE orders over several levels,
@@ -19,15 +20,14 @@ Mechanism per cycle:
      starting `layer_spacing` behind the best price, each `layer_spacing` apart.
   3. After `cancellation_delay_ticks` (optionally jittered) all layers are cancelled.
 
-Evasion knobs (Tower round 1/2 evasions, CFTC advisory):
+Evasion knobs (design assumptions unless noted; docs/enforcement_case_notes.md):
   size_taper       0 = equal layer sizes; higher = smaller layers deeper in the
-                   book ("decreasing volume deeper in the book to appear natural")
-  cancel_jitter    randomised cancel timing (advisory #2)
-  busy_period_bias act mainly when the market is busy (advisory #5)
+                   book (design assumption)
+  cancel_jitter    randomised cancel timing
+  busy_period_bias act mainly when the market is busy
   placement_stagger ticks between successive layers: 0 places the whole ladder in
-                   one tick (the Tower pattern); k > 0 builds it one layer every k
-                   ticks, so no single tick shows a multi-level batch ("orders
-                   entered in rapid succession" rather than simultaneously). The
+                   one tick; k > 0 builds it one layer every k ticks, so no single
+                   tick shows a multi-level batch (design assumption). The
                    ladder is complete for less of the cycle, so fake depth falls.
 
 Order ids carry audit tags ("l" layer leg, "g" genuine leg) used only for

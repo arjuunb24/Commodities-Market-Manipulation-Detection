@@ -166,6 +166,44 @@ def summarize(per_episode: pd.DataFrame) -> dict[str, dict[str, float]]:
     return out
 
 
+def account_pnl(events: pd.DataFrame, trades: pd.DataFrame) -> dict[str, dict[str, float]]:
+    """
+    Did the manipulators make money? Per episode, the whole session's P&L of its
+    accounts together (cash flow plus the position marked at the market's last
+    price), so a wash ring's trades with itself net out and only what it paid to
+    the rest of the market counts. Includes the accounts' background trading.
+
+    Reported per persona (median pnl_bp = P&L / gross notional traded, share of
+    episodes that made money, episodes). Logged only: NOT part of the strategist
+    objective, which still optimises evasion x retained effect.
+    """
+    rows = []
+    for comm, ev in events.groupby("commodity"):
+        t = trades[trades["commodity"] == comm]
+        if t.empty:
+            continue
+        last = float(t.sort_values("tick")["price"].iloc[-1])
+        notional = t["price"] * t["quantity"]
+        for _, e in ev.iterrows():
+            ids = set(e["trader_ids"]) if e["trader_ids"] is not None else set()
+            if not ids:
+                continue
+            buy, sell = t["buyer_trader_id"].isin(ids), t["seller_trader_id"].isin(ids)
+            internal = buy & sell
+            b, s_ = buy & ~internal, sell & ~internal
+            cash = float(notional[s_].sum() - notional[b].sum())
+            inventory = float(t.loc[b, "quantity"].sum() - t.loc[s_, "quantity"].sum())
+            gross = float(notional[b].sum() + notional[s_].sum())
+            pnl = cash + inventory * last
+            rows.append({"persona": e["persona"], "pnl_bp": pnl / gross * 1e4 if gross else 0.0, "profitable": pnl > 0})
+    out: dict[str, dict[str, float]] = {}
+    for persona, g in pd.DataFrame(rows).groupby("persona") if rows else []:
+        out[persona] = {"pnl_bp_median": round(float(g["pnl_bp"].median()), 2),
+                        "profitable_share": round(float(g["profitable"].mean()), 3),
+                        "episodes": int(len(g))}
+    return out
+
+
 def effectiveness_ratio(current: dict, baseline: dict, persona: str) -> float | None:
     """current primary / round-0 primary (None when undefined)."""
     key = PRIMARY_METRIC[persona]

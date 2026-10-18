@@ -31,6 +31,7 @@ from src.adversarial.metrics import (
 )
 from src.adversarial.effectiveness import (
     PRIMARY_METRIC,
+    account_pnl,
     effectiveness_ratio,
     episode_effectiveness,
     mutation_score,
@@ -41,6 +42,20 @@ from src.detector.pipeline import DetectorPipeline
 from src.utils import io as io_utils
 
 logger = logging.getLogger(__name__)
+
+
+def _merge_pnl(parts: list[dict]) -> dict:
+    """Episode-weighted combination of per-market account_pnl summaries."""
+    out: dict[str, dict] = {}
+    for part in parts:
+        for p, v in part.items():
+            o = out.setdefault(p, {"_bp": [], "_prof": [], "episodes": 0})
+            o["_bp"] += [v["pnl_bp_median"]] * v["episodes"]
+            o["_prof"] += [v["profitable_share"]] * v["episodes"]
+            o["episodes"] += v["episodes"]
+    return {p: {"pnl_bp_median": round(float(np.median(o["_bp"])), 2),
+                "profitable_share": round(float(np.mean(o["_prof"])), 3),
+                "episodes": o["episodes"]} for p, o in out.items()}
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -276,7 +291,7 @@ class RoundOrchestrator:
             for f in [executor.submit(self._run_simulation, *job) for job in jobs]:
                 f.result()
 
-        X_parts, y_parts, ev_parts, eff_parts = [], [], [], []
+        X_parts, y_parts, ev_parts, eff_parts, tr_parts = [], [], [], [], []
         per_market = []   # (market name, row index, labels, events, per-episode effect) for by-market metrics
         for d in test_dirs:
             X_m, y_m = self.pipeline.load_and_preprocess(d)
@@ -285,8 +300,10 @@ class RoundOrchestrator:
                 X_parts.append(X_m)
                 y_parts.append(y_m)
             ev_parts.append(ev_m)
+            tr_m = pd.read_parquet(d / "trade_log.parquet")
+            tr_parts.append(account_pnl(ev_m, tr_m))
             eff_parts.append(episode_effectiveness(
-                ev_m, pd.read_parquet(d / "trade_log.parquet"), pd.read_parquet(d / "order_log.parquet")))
+                ev_m, tr_m, pd.read_parquet(d / "order_log.parquet")))
             if not X_m.empty:
                 per_market.append((d.name, X_m.index, y_m, ev_m, eff_parts[-1]))
         if not X_parts:
@@ -295,6 +312,10 @@ class RoundOrchestrator:
         X_test, y_test = pd.concat(X_parts), pd.concat(y_parts)
         events_test = pd.concat(ev_parts, ignore_index=True)
         eff = summarize(pd.concat(eff_parts, ignore_index=True))
+        pnl = _merge_pnl(tr_parts)
+        for p, v in pnl.items():
+            logger.info(f"Round {round_num} — {p}: P&L median {v['pnl_bp_median']:+.1f} bp, "
+                        f"{v['profitable_share']:.0%} of {v['episodes']} episodes profitable (logged, not optimised)")
 
         # --- Pre-retrain (frozen detector from previous round) ---
         pre_metrics = None
@@ -306,16 +327,24 @@ class RoundOrchestrator:
 
         # --- Retrain on cumulative training data ---
         logger.info(f"Round {round_num} — retraining on rounds 0..{round_num}...")
-        X_tr, y_tr = [], []
+        X_tr, y_tr, w_tr = [], [], []
+        anchor = float(self.detector_config.get("continual", {}).get("anchor_round_weight", 1.0))
         for r in range(round_num + 1):
             X_r, y_r = self.pipeline.load_and_preprocess(self.master_run_dir / f"round_{r}" / "train")
             if not X_r.empty:
                 X_tr.append(X_r)
                 y_tr.append(y_r)
+                w_tr.append(np.full(len(X_r), anchor if r == 0 else 1.0))
         if not X_tr:
             logger.warning(f"Round {round_num}: empty training data. Skipping.")
             return {}
-        self.pipeline.train(pd.concat(X_tr), pd.concat(y_tr), save_dir=round_dir)
+        for X_a, y_a in self._replay_training_markets():
+            X_tr.append(X_a)
+            y_tr.append(y_a)
+            w_tr.append(np.ones(len(X_a)))
+        weights = np.concatenate(w_tr)
+        self.pipeline.train(pd.concat(X_tr), pd.concat(y_tr), save_dir=round_dir,
+                            sample_weight=None if np.all(weights == 1.0) else weights)
 
         # --- Post-retrain ---
         results = self.pipeline.score(X_test)
@@ -343,17 +372,96 @@ class RoundOrchestrator:
                 "params_used": params_used,
                 "mutation_source": mutation_source or {p: ("baseline" if round_num == 0 else "unknown") for p in self.personas},
                 "effectiveness": eff,
+                "manipulator_pnl": pnl,
                 "effectiveness_ratio": ratios,
                 "mutation_score": scores,
                 "by_market": by_market,
             },
         )
+        self._save_models(round_num, round_dir)
+        replay_check = self._replay_check(round_num)
+        if replay_check:
+            with open(round_dir / "replay_check.json", "w") as f:
+                json.dump(replay_check, f, indent=2)
         entry = {"round": round_num, "personas": post_metrics, "effectiveness_ratio": ratios, "mutation_score": scores}
         if pre_metrics is not None:
             entry["pre_retrain"] = pre_metrics
         self._all_metrics.append(entry)
         self._save_cumulative_metrics()
         return post_metrics
+
+    def _replay_markets(self, block: str) -> list[Path]:
+        """Replay markets (simulated once, cached) for detector_config[block] = {cases, seeds, ticks}."""
+        cfg = self.detector_config.get(block, {}) or {}
+        if not cfg.get("cases"):
+            return []
+        from src.replay.evaluate import load_cases, simulate_market
+        cases = load_cases()
+        dirs = []
+        for cid in cfg["cases"]:
+            if cid not in cases:
+                logger.warning("%s: unknown case %s (see configs/case_replays.yaml)", block, cid)
+                continue
+            for com in cases[cid].get("markets", []):
+                for seed in cfg.get("seeds", [1]):
+                    dirs.append(simulate_market(cid, cases[cid], com, int(seed), int(cfg.get("ticks", 6000))))
+        return dirs
+
+    def _replay_training_markets(self):
+        """Labelled replay markets added to every retrain (replay_augmentation); features cached per market."""
+        if not hasattr(self, "_aug_cache"):
+            self._aug_cache = []
+            for d in self._replay_markets("replay_augmentation"):
+                X_a, y_a = self.pipeline.load_and_preprocess(d)
+                if not X_a.empty:
+                    self._aug_cache.append((X_a, y_a))
+            if self._aug_cache:
+                logger.info("Replay augmentation: %d labelled real-case markets added to training", len(self._aug_cache))
+        return self._aug_cache
+
+    def _replay_check(self, round_num: int) -> dict:
+        """
+        Score held-out real-case replays with this round's retrained detector. Logged and
+        saved; a case that stops being recognised (no window with its own label, family
+        spoofing/layering) triggers a warning, so forgetting is visible while the loop runs.
+        """
+        try:
+            dirs = self._replay_markets("replay_check")
+            if not dirs:
+                return {}
+            from src.replay.evaluate import score_market
+            rows = pd.DataFrame([score_market(d, self.pipeline, round_num) for d in dirs])
+            out = {}
+            for case, g in rows.groupby("case"):
+                out[case] = {"markets": int(len(g)), "caught": round(float(g["caught"].mean()), 3),
+                             "recognised_family": round(float(g["recognised_family"].mean()), 3),
+                             "label_share": round(float(g["label_share"].mean()), 3),
+                             "max_prob": round(float(g["max_prob"].median()), 3)}
+            prev = getattr(self, "_last_replay_check", {})
+            for case, v in out.items():
+                before = prev.get(case, {}).get("recognised_family")
+                if before is not None and v["recognised_family"] < before - 0.25:
+                    logger.warning("Round %d: real-case replay %s recognised in %.0f%% of markets (was %.0f%%): "
+                                   "the retrained detector is forgetting this tactic.", round_num, case,
+                                   100 * v["recognised_family"], 100 * before)
+            self._last_replay_check = out
+            return out
+        except Exception as exc:  # pragma: no cover - diagnostic only, never stops the loop
+            logger.warning("Round %d: replay check failed: %s", round_num, exc)
+            return {}
+
+    def _save_models(self, round_num: int, round_dir: Path) -> None:
+        """
+        Persist this round's retrained detector and a bar-level model (anonymous 1-minute
+        bars, for real market data) to round_N/models/. Saving must never stop the loop.
+        """
+        try:
+            from src.live.bar_model import train_round_bar_model
+            from src.live.registry import save_round_models
+            bar_model = train_round_bar_model(self.master_run_dir, round_num, self.personas)
+            save_round_models(round_dir, pipeline=self.pipeline, bar_model=bar_model)
+        except Exception as exc:  # pragma: no cover - logged, not fatal
+            logger.warning("Round %d: saving models failed: %s", round_num, exc)
 
     def get_metrics_for_round(self, round_num: int, phase: str = "post") -> dict[str, dict[str, float]]:
         """Reads metrics for a specific round from disk (used by tools.py)."""

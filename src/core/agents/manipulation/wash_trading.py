@@ -8,8 +8,9 @@ CFTC Definition:
   appearance of purchases and sales but resulting in no net change in
   the trader's market position."
 
-How it works in practice (Kraft 2015 and the wash-trade cases in
-docs/enforcement_case_notes.md) — and how this persona reproduces it:
+How it works in practice (Cargill de Mexico, Shinhan, Aralia/Vintage: equal and
+opposite orders between commonly owned accounts, matched in product, quantity, price
+and timing; see docs/enforcement_case_notes.md) — and how this persona reproduces it:
 
   * Two accounts under common control trade with EACH OTHER. One rests a limit
     order and the other immediately takes it at the same price and size. In a
@@ -25,14 +26,15 @@ two directional traders, not a wash. That has been replaced by the cross above.
 
 Evasion knobs (docs/enforcement_case_notes.md):
   ring_size        accounts per colluding group; crosses rotate A→B→C→A so no
-                   single pair dominates (Coinbase cyclical washes)
+                   single pair dominates (design assumption; documented washes use two
+                   commonly owned accounts)
   n_groups         independent groups; the persona's total cross rate is SPLIT
                    across them (account proliferation dilutes per-account
-                   signals without adding volume — advisory #3, Kraft round 2)
+                   signals without adding volume — design assumption)
   size_jitter      0 = fixed scripted lot size; higher = varied sizes
   camouflage_rate  share of cycles in which an account instead takes a small
-                   genuine directional trade from the market (Kraft round 2,
-                   advisory #4) — costs real exposure and wash volume
+                   genuine directional trade from the market (design
+                   assumption) — costs real exposure and wash volume
 price_deviation_from_mid only moves the cross price inside the spread, so it
 has almost no market effect and is not offered to the strategist.
 """

@@ -15,6 +15,12 @@ Orders are marketable (priced through the opposite best quote) because trend
 followers demand immediacy, and each trader respects a position limit, so
 herding is bounded the way risk limits bound real CTAs.
 
+The trigger is volatility-scaled: a move counts as a trend when it exceeds
+`vol_k` x the typical move over the lookback (a slow average of recent moves),
+with `momentum_threshold` as a floor. A fixed 0.1-0.2% threshold meant gold's
+trend followers placed about 15 orders a session (gold rarely moves that much in
+20 seconds) while natural gas's traded constantly.
+
 This agent is intentionally exploitable by the PumpDump persona, which
 relies on momentum traders amplifying a coordinated price burst.
 """
@@ -58,6 +64,7 @@ class MomentumTrader(Agent):
         order_size_scale: float = 5.0,
         arrival_rate_lambda: float = 0.3,
         max_position: int = 400,
+        vol_k: float = 1.5,
     ) -> None:
         super().__init__(trader_id, rng)
         self.lookback_ticks = lookback_ticks
@@ -68,10 +75,15 @@ class MomentumTrader(Agent):
         self.max_position = max_position
         self.net_position = 0
         self._price_history: deque[float] = deque(maxlen=lookback_ticks)
+        self.vol_k = float(vol_k)
+        self._typical_move: float | None = None   # slow average of |lookback move|
 
     def update_price(self, price: float) -> None:
         """Feed the latest price into the rolling window (the simulation calls this once per tick)."""
         self._price_history.append(price)
+        if len(self._price_history) == self._price_history.maxlen and self._price_history[0] > 0:
+            move = abs(self._price_history[-1] - self._price_history[0]) / self._price_history[0]
+            self._typical_move = move if self._typical_move is None else 0.995 * self._typical_move + 0.005 * move
 
     def update_inventory(self, side: Side, quantity: int) -> None:
         self.net_position += quantity if side == Side.BUY else -quantity
@@ -87,7 +99,8 @@ class MomentumTrader(Agent):
         if oldest <= 0:
             return None
         momentum = (newest - oldest) / oldest
-        if abs(momentum) < self.momentum_threshold:
+        trigger = max(self.momentum_threshold, self.vol_k * (self._typical_move or 0.0))
+        if self._typical_move is None or abs(momentum) < trigger:
             return None
 
         ref_price = book_state.mid_price or book_state.last_trade_price or newest

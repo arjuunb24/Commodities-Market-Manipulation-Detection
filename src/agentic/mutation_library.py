@@ -20,28 +20,28 @@ logger = logging.getLogger(__name__)
 FALLBACK_MUTATIONS: dict[str, list[dict[str, Any]]] = {
     "spoofing": [
         {
-            "parameters": {"order_size_multiplier": 6.0, "size_jitter": 0.4, "cancel_jitter": 0.5,
+            "parameters": {"order_size_multiplier": 4.5, "size_jitter": 0.4, "cancel_jitter": 0.5,
                            "cancellation_delay_ticks": 8},
             "reasoning": (
-                "Round 1 (Coscia evasion; advisory #1-2): randomise spoof size (+-40%) and cancel timing "
+                "Round 1 (Tower: randomly-sized orders; randomised cancel timing is a design assumption): randomise spoof size (+-40%) and cancel timing "
                 "(+-50%, mean 8 ticks) to blur max_order_size_rel and fast_cancel_ratio, keeping the spoof "
                 "near the touch so it still moves the book."
             ),
         },
         {
-            "parameters": {"order_size_multiplier": 6.0, "size_jitter": 0.5, "cancel_jitter": 0.6,
+            "parameters": {"order_size_multiplier": 4.5, "size_jitter": 0.5, "cancel_jitter": 0.6,
                            "cancellation_delay_ticks": 10, "n_split_orders": 3},
             "reasoning": (
-                "Round 2 (Coscia 'split into batches', Tower layering): split each spoof into 3 orders on "
+                "Round 2 (Tower order splitter; Bases: many smaller orders): split each spoof into 3 orders on "
                 "consecutive ticks so no single order is extreme (max_order_size_rel, large_cancel_ratio)."
             ),
         },
         {
-            "parameters": {"order_size_multiplier": 6.0, "size_jitter": 0.5, "cancel_jitter": 0.6,
+            "parameters": {"order_size_multiplier": 4.5, "size_jitter": 0.5, "cancel_jitter": 0.6,
                            "cancellation_delay_ticks": 10, "n_split_orders": 3, "n_accounts": 2,
                            "reprice_to_touch": 1},
             "reasoning": (
-                "Round 3+ (JPMorgan cross-trader spoofing; Sarao repricing): the genuine order and the spoof come "
+                "Round 3+ (several traders on one desk at JPMorgan; Sarao repricing): the genuine order and the spoof come "
                 "from different accounts, breaking the per-account spoof_signature, and the spoof is kept pinned "
                 "behind the moving touch so it keeps its effect while avoiding fills."
             ),
@@ -51,21 +51,21 @@ FALLBACK_MUTATIONS: dict[str, list[dict[str, Any]]] = {
         {
             "parameters": {"size_jitter": 0.6, "ring_size": 3},
             "reasoning": (
-                "Round 1 (Coinbase cyclical washes; advisory #1): rotate crosses through a 3-account ring and vary "
+                "Round 1 (design assumption: rings of commonly owned accounts, cf. Shinhan, Aralia/Vintage): rotate crosses through a 3-account ring and vary "
                 "lot sizes, so no pair dominates (top_cpty_share) and sizes look organic (trade_size_cv)."
             ),
         },
         {
             "parameters": {"size_jitter": 0.6, "ring_size": 3, "n_groups": 2},
             "reasoning": (
-                "Round 2 (Kraft round 2; advisory #3): split the same cross rate over two independent groups — "
+                "Round 2 (design assumption; Shinhan used several accounts): split the same cross rate over two independent groups — "
                 "per-account volume share halves while total wash volume is unchanged."
             ),
         },
         {
             "parameters": {"size_jitter": 0.7, "ring_size": 4, "n_groups": 3, "camouflage_rate": 0.2},
             "reasoning": (
-                "Round 3+ (Kraft: 'interspersed with small genuine-looking directional trades'; advisory #4): "
+                "Round 3+ (design assumption: camouflage trades among the washes): "
                 "larger rings, three groups and 20% genuine market trades to break net_flatness/reciprocal_ratio."
             ),
         },
@@ -74,7 +74,7 @@ FALLBACK_MUTATIONS: dict[str, list[dict[str, Any]]] = {
         {
             "parameters": {"n_coordinated_accounts": 5, "stagger": 0.4, "burst_duration_ticks": 300},
             "reasoning": (
-                "Round 1 (Nefedova evasion 1): five accounts with staggered schedules over a longer burst so "
+                "Round 1 (design assumption): five accounts with staggered schedules over a longer burst so "
                 "their buying does not light up coordinated_peers in the same window."
             ),
         },
@@ -82,7 +82,7 @@ FALLBACK_MUTATIONS: dict[str, list[dict[str, Any]]] = {
             "parameters": {"n_coordinated_accounts": 6, "stagger": 0.6, "burst_duration_ticks": 400,
                            "dump_delay_ticks": 200, "decoy_rate": 0.15},
             "reasoning": (
-                "Round 2 (Nefedova evasion 2; advisory #4): phased, longer exit and occasional decoy trades to "
+                "Round 2 (design assumption): phased, longer exit and occasional decoy trades to "
                 "soften exec_side_imbalance and reversal_score."
             ),
         },
@@ -90,7 +90,7 @@ FALLBACK_MUTATIONS: dict[str, list[dict[str, Any]]] = {
             "parameters": {"n_coordinated_accounts": 8, "stagger": 0.7, "burst_duration_ticks": 600,
                            "dump_delay_ticks": 300, "decoy_rate": 0.2, "accumulation_size": 120},
             "reasoning": (
-                "Round 3+ (Nefedova round 2: 8 accounts, 600-tick accumulation, staggered exit): spread smaller "
+                "Round 3+ (design assumption: 8 accounts, 600-tick accumulation, staggered exit): spread smaller "
                 "per-account positions across 8 accounts."
             ),
         },
@@ -99,14 +99,14 @@ FALLBACK_MUTATIONS: dict[str, list[dict[str, Any]]] = {
         {
             "parameters": {"size_taper": 0.5, "layer_spacing": 0.0003},
             "reasoning": (
-                "Round 1 (Tower evasion: 'decreasing volume deeper in the book to appear more natural'): taper layer "
+                "Round 1 (design assumption): taper layer "
                 "sizes and widen the spacing slightly so the depth profile looks organic."
             ),
         },
         {
             "parameters": {"size_taper": 0.6, "n_layers": 3, "cancel_jitter": 0.5, "cancellation_delay_ticks": 8},
             "reasoning": (
-                "Round 2 (Tower round 2; advisory #2): fewer layers per cycle and randomised, longer cancel timing to "
+                "Round 2 (design assumption): fewer layers per cycle and randomised, longer cancel timing to "
                 "blunt fast_cancel_ratio and the same-tick multi-level batch signature."
             ),
         },
@@ -114,7 +114,7 @@ FALLBACK_MUTATIONS: dict[str, list[dict[str, Any]]] = {
             "parameters": {"size_taper": 0.6, "n_layers": 3, "cancel_jitter": 0.6, "cancellation_delay_ticks": 10,
                            "busy_period_bias": 0.6},
             "reasoning": (
-                "Round 3+ (advisory #5): concentrate layering in busy periods so the cancellation burst hides among "
+                "Round 3+ (design assumption): concentrate layering in busy periods so the cancellation burst hides among "
                 "elevated legitimate activity."
             ),
         },

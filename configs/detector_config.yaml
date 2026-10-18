@@ -59,11 +59,15 @@ ensemble:
   # Uncorroborated forest flags become "review" items. "or": any forest flag is an alert.
   # Frozen-detector check (run 092237Z): 6.0 x 1 feature -> algo false alerts 6.3-7.4%;
   # 10.0 x 2 -> 1.4-1.5% with frozen coverage unchanged (round 1 spoofing 0.826 -> 0.818).
+  # Re-tuned after the self-z scale floors and evidence weighting (run 131915Z_seed222): those cap
+  # ratio deviations below ~7-9, so 10 x 2 almost never fired and a Sarao-style layering replay went
+  # unalerted. 6 x 3 alerts it in every replay market AND cuts alerts on ordinary accounts
+  # (round 4: 213 -> 135, round 7: 131 -> 29): agreement across three features filters noise better.
   combination_rule: "or_corroborated"
   iso_corroboration:
     min_prob_ratio: 0.5
-    min_self_z: 10.0
-    min_self_z_cols: 2
+    min_self_z: 6.0
+    min_self_z_cols: 3
   iso_weight: 0.4              # used only if combination_rule = "weighted"
   supervised_weight: 0.6
   supervised_threshold: 0.5    # fallback when a threshold cannot be tuned
@@ -75,3 +79,39 @@ personas:
   - wash_trading
   - pump_and_dump
   - layering
+
+# --- Continual learning across adversarial rounds ---
+# Real-case replays (scripts/replay_cases.py) showed later rounds forgetting
+# what the baseline round taught: the round-0 detector recognised a Sarao-style
+# layering algorithm, rounds 2-5 did not. These options keep earlier patterns in view.
+continual:
+  # Tested on run 131915Z_seed222 (round 7): x3 and x6 did not restore the forgotten Sarao pattern
+  # (layering probability 0.09 -> 0.09 / 0.05) and x6 hurt Coscia and Bases. Left off.
+  anchor_round_weight: 1.0     # sample weight of round-0 training rows (1.0 = off)
+
+# Documented real cases (configs/case_replays.yaml) added to EVERY retrain as
+# extra labelled training markets (separate seeds from the test replays).
+# Cases listed here are no longer a held-out test; keep the others held out.
+# Cross-split test (run 131915Z_seed222): training on one group of cases lifted the right-label share
+# on the OTHER, never-seen group (Deutsche Bank 51% -> 100%, Pacilio 70% -> 100%, Oystacher 73% -> 100%,
+# Bases 31% -> 73%) with the run's own held-out metrics unchanged. Group A trains; group B stays held out.
+replay_augmentation:
+  cases: [coscia_panther, jpmorgan_precious_metals, merrill_bases_many_small, optiver_banging_the_close, shinhan_wash_trades]
+  seeds: [101, 102, 103]
+  ticks: 6000
+
+# After each retrain, score these held-out replay cases and record recognition in
+# round_N/replay_check.json; a warning is logged when a case stops being recognised.
+replay_check:
+  cases: [sarao_layering_algorithm, oystacher_3red, merrill_pacilio_single_large, deutsche_bank_vorley_chanu,
+          amaranth_closing_range, moore_banging_the_close, cargill_position_transfers, tower_research_spoofing]
+  seeds: [1, 2, 3]
+  ticks: 6000
+
+# --- Ground-truth labels ---
+# activity: a window is positive only where the account placed manipulative orders (audit tags,
+#           see ACTIVITY_TAGS in src/detector/pipeline.py); camouflage, decoys and quiet
+#           accumulation are not labelled, so classifiers learn the manipulation, not the cover.
+# span:     every window of the account overlapping its episode (the earlier definition).
+labels:
+  mode: activity

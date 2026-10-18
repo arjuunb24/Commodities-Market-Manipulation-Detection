@@ -64,3 +64,9 @@ Thumbs.db
 
 # Local web-app hosting state and logs (scripts/webapp.ps1)
 .webapp/
+
+# Real-market datasets and predictions (scripts/fetch_market_data.py, predict_live.py)
+data/live/
+
+# Real-case replay markets and reports (scripts/replay_cases.py)
+data/replays/

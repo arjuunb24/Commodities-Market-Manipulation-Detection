@@ -1,0 +1,389 @@
+# =============================================================================
+# configs/case_replays.yaml
+#
+# Documented real manipulation cases, written as scripts the simulator can
+# replay (src/core/agents/manipulation/replay.py). They are a HELD-OUT test:
+# the adversarial strategist never sees them and no detector trains on them.
+# Scripts are stylised from public descriptions, not reconstructed order logs:
+#   - sizes are in this simulator's units (multiples of average visible level
+#     depth, or a target share of the visible near-touch depth on one side);
+#   - time is in ticks (1 tick = 1 second, the simulator's finest step), so
+#     sub-second behaviour (Coscia's millisecond cancels) becomes 1 tick;
+#   - `verified` lists what the cited sources state; `approximated` lists what
+#     had to be assumed to make the pattern executable.
+#
+# Script fields
+#   label            persona used as ground truth (spoofing | layering)
+#   markets          simulated commodities to replay in (the real case's own
+#                    contract when it is one of ours, else a stand-in)
+#   duration_ticks   length of the replayed episode
+#   fake.side        buy | sell | both (both: direction per cycle, see persistence)
+#   fake.n_orders    non-bona-fide orders per cycle, one price level apart
+#   fake.levels_from_touch  first order this many ticks behind the same-side best price
+#   fake.size_x_level_depth   size of EACH order x average visible level depth, or
+#   fake.target_share         total fake orders as this share of visible near-touch depth
+#   fake.lifetime_ticks [lo, hi]  rest before cancelling
+#   fake.reprice     keep the orders at their distance as the touch moves
+#   fake.cancel_on_genuine_fill  pull them as soon as the genuine order fills
+#   fake.direction_persistence   chance the next cycle keeps the fake side (side: both)
+#   genuine.place    per_cycle | none   genuine order at the touch on the other side
+#   genuine.size_x_level_depth   its size x average level depth
+#   genuine.rate     extra chance per tick, while fake orders rest, of another genuine order
+#   flip_after_cancel  chance of trading aggressively the genuine way right after the pull
+#   gap_ticks [lo, hi] idle time between cycles
+#   n_accounts       >= 2: genuine and fake legs come from different accounts
+# =============================================================================
+
+sarao_layering_algorithm:
+  title: "Navinder Sarao, E-mini S&P 500 layering algorithm (2010-2015)"
+  label: layering
+  markets: [crude_oil_wti, gold]       # E-mini is not simulated; liquid stand-ins
+  duration_ticks: 1200
+  fake:
+    side: sell
+    n_orders: 5
+    levels_from_touch: 3
+    target_share: 0.25
+    lifetime_ticks: [240, 600]
+    reprice: true
+    cancel_on_genuine_fill: false
+  genuine:
+    place: none
+    size_x_level_depth: 0.4
+    rate: 0.03
+  flip_after_cancel: 0.0
+  gap_ticks: [5, 30]
+  n_accounts: 1
+  sources:
+    - "CFTC Release 7156-15 (21 Apr 2015): https://www.cftc.gov/PressRoom/PressReleases/7156-15"
+    - "CNBC, Sarao flash crash orders: https://www.cnbc.com/id/102607337"
+  verified:
+    - "modified trading platform placed several large SELL orders one price level apart"
+    - "orders repriced as the market moved to stay at least 3-4 levels above the best ask"
+    - "most orders cancelled without executing; used on 400+ trading days"
+    - "on 6 May 2010 the orders were about 20-29% of the sell-side order book"
+  approximated:
+    - "target_share 0.25 of the visible near-touch sell depth stands for the 20-29% figure"
+    - "orders rest 4-10 minutes per cycle (in reality the algorithm ran for hours)"
+    - "his genuine trading is modelled as occasional small buys at the touch"
+
+coscia_panther:
+  title: "Michael Coscia / Panther Energy Trading, CME and ICE futures (2011)"
+  label: spoofing
+  markets: [copper, gold, crude_oil_wti]
+  duration_ticks: 600
+  fake:
+    side: both
+    direction_persistence: 0.0          # each cycle reverses (buy small / sell large, then the reverse)
+    n_orders: 3
+    levels_from_touch: 0
+    size_x_level_depth: 3.0
+    lifetime_ticks: [1, 1]
+    reprice: false
+    cancel_on_genuine_fill: true
+  genuine:
+    place: per_cycle
+    size_x_level_depth: 0.3
+    rate: 0.0
+  flip_after_cancel: 0.0
+  gap_ticks: [1, 4]
+  n_accounts: 1
+  sources:
+    - "United States v. Coscia, 866 F.3d 782 (7th Cir. 2017); docket No. 16-3017"
+    - "Cleary Gottlieb summary: https://www.clearygottlieb.com/news-and-insights/publication-listing/seventh-circuit-upholds-first-ever-federal-spoofing-conviction-8-10-17"
+  verified:
+    - "a small order on one side, then large orders on the opposite side"
+    - "algorithm configured so the large orders would not all fill and were cancelled automatically after a short interval (milliseconds)"
+  approximated:
+    - "millisecond lifetimes become 1 tick (1 second), the simulator's finest step"
+    - "3 large orders near the touch at 3x level depth each; direction reverses every cycle"
+
+oystacher_3red:
+  title: "Igor Oystacher / 3Red Trading, copper, crude oil, natural gas and others (2011-2014)"
+  label: spoofing
+  markets: [copper, crude_oil_wti, natural_gas]
+  duration_ticks: 600
+  fake:
+    side: both
+    direction_persistence: 0.7
+    n_orders: 2
+    levels_from_touch: 0
+    size_x_level_depth: 4.0
+    lifetime_ticks: [2, 6]
+    reprice: false
+    cancel_on_genuine_fill: false
+  genuine:
+    place: none
+    size_x_level_depth: 0.5
+    rate: 0.0
+  flip_after_cancel: 0.8
+  gap_ticks: [2, 10]
+  n_accounts: 1
+  sources:
+    - "CFTC Release 7264-15 (19 Oct 2015): https://www.cftc.gov/PressRoom/PressReleases/7264-15"
+    - "CFTC complaint: https://cftc.gov/idc/groups/public/%40lrenforcementactions/documents/legalpleading/enfigorcomplnt101915.pdf"
+  verified:
+    - "spoofing on at least 51 trading days, Dec 2011 - Jan 2014, in five futures (E-mini, copper, crude oil, natural gas, VIX) on four exchanges"
+    - "created the appearance of false market depth"
+  approximated:
+    - "UNVERIFIED: the 'flip' (cancel the false depth, then trade aggressively the other way) is the commonly reported pattern, not confirmed from the primary text here"
+    - "2 large orders at the touch at 4x level depth for 2-6 seconds"
+
+jpmorgan_precious_metals:
+  title: "JPMorgan precious metals desk (Smith, Nowak and others), COMEX gold and silver (2008-2016)"
+  label: spoofing
+  markets: [gold, silver]
+  duration_ticks: 900
+  fake:
+    side: both
+    direction_persistence: 0.9
+    n_orders: 2
+    levels_from_touch: 1
+    size_x_level_depth: 5.0
+    lifetime_ticks: [3, 15]
+    reprice: false
+    cancel_on_genuine_fill: true
+  genuine:
+    place: per_cycle
+    size_x_level_depth: 1.0
+    rate: 0.0
+  flip_after_cancel: 0.0
+  gap_ticks: [3, 20]
+  n_accounts: 2
+  sources:
+    - "CFTC Release 8260-20 (29 Sep 2020): https://www.cftc.gov/PressRoom/PressReleases/8260-20"
+    - "DOJ, traders convicted (2022): https://www.justice.gov/archives/opa/pr/former-jp-morgan-traders-convicted-fraud-attempted-price-manipulation-and-spoofing-multi-year"
+  verified:
+    - "orders placed with intent to cancel before execution, to move prices toward orders they intended to execute on the opposite side"
+    - "gold, silver, platinum and palladium futures on NYMEX and COMEX, about May 2008 - Aug 2016; several traders on one desk"
+  approximated:
+    - "genuine orders of about one level of depth (bank-sized) at the touch"
+    - "fake orders pulled when the genuine order fills or after 3-15 seconds; mostly one direction per stretch"
+    - "two accounts (several traders on one desk); UNVERIFIED: iceberg genuine orders are not modelled"
+
+# --- Added cases ------------------------------------------------------------
+
+merrill_pacilio_single_large:
+  title: "John Pacilio, Merrill Lynch precious metals desk (2008-2014): one large order"
+  label: spoofing
+  markets: [gold, silver]
+  duration_ticks: 900
+  fake:
+    side: both
+    direction_persistence: 0.8
+    n_orders: 1
+    levels_from_touch: 1
+    size_x_level_depth: 8.0
+    lifetime_ticks: [2, 8]
+    reprice: false
+    cancel_on_genuine_fill: true
+  genuine:
+    place: per_cycle
+    size_x_level_depth: 0.5
+    rate: 0.0
+  flip_after_cancel: 0.0
+  gap_ticks: [3, 20]
+  n_accounts: 1
+  sources:
+    - "United States v. Bases and Pacilio, 18-cr-48 (N.D. Ill.); convicted Aug 2021"
+    - "Bloomberg Law: https://news.bloomberglaw.com/banking-law/ex-merrill-lynch-gold-traders-found-guilty-in-spoofing-trial"
+    - "BNN Bloomberg (trial testimony): https://www.bnnbloomberg.ca/ex-merrill-trader-says-he-learned-to-spoof-from-pacilio-bases-1.1632058"
+  verified:
+    - "large buy and sell orders cancelled quickly to push gold, silver and platinum prices, 2008-2014"
+    - "trial testimony: Pacilio typically used a single large order to push the market"
+  approximated:
+    - "one order of 8x level depth one level behind the touch, pulled when the genuine order fills or after 2-8 seconds"
+
+merrill_bases_many_small:
+  title: "Edward Bases, Merrill Lynch precious metals desk (2008-2014): many smaller orders"
+  label: spoofing
+  markets: [gold, silver]
+  duration_ticks: 900
+  fake:
+    side: both
+    direction_persistence: 0.8
+    n_orders: 6
+    levels_from_touch: 1
+    size_x_level_depth: 1.2
+    lifetime_ticks: [2, 8]
+    reprice: false
+    cancel_on_genuine_fill: true
+  genuine:
+    place: per_cycle
+    size_x_level_depth: 0.5
+    rate: 0.0
+  flip_after_cancel: 0.0
+  gap_ticks: [3, 20]
+  n_accounts: 1
+  sources:
+    - "United States v. Bases and Pacilio, 18-cr-48 (N.D. Ill.); convicted Aug 2021"
+    - "BNN Bloomberg (trial testimony): https://www.bnnbloomberg.ca/ex-merrill-trader-says-he-learned-to-spoof-from-pacilio-bases-1.1632058"
+  verified:
+    - "large orders cancelled quickly to push precious metals prices, 2008-2014"
+    - "trial testimony: Bases favoured using many smaller orders (Pacilio a single large one)"
+  approximated:
+    - "six orders of 1.2x level depth on consecutive levels from one level behind the touch; same timing as the Pacilio script"
+
+deutsche_bank_vorley_chanu:
+  title: "James Vorley and Cedric Chanu, Deutsche Bank precious metals (2008-2013)"
+  label: spoofing
+  markets: [gold, silver]
+  duration_ticks: 900
+  fake:
+    side: both
+    direction_persistence: 0.85
+    n_orders: 2
+    levels_from_touch: 1
+    size_x_level_depth: 4.0
+    lifetime_ticks: [3, 10]
+    reprice: false
+    cancel_on_genuine_fill: true
+  genuine:
+    place: per_cycle
+    size_x_level_depth: 0.4
+    rate: 0.1
+  flip_after_cancel: 0.0
+  gap_ticks: [3, 20]
+  n_accounts: 1
+  sources:
+    - "DOJ, traders convicted (Sept 2020): https://www.justice.gov/opa/pr/two-former-deutsche-bank-traders-convicted-engaging-deceptive-and-manipulative-trading"
+    - "BNN Bloomberg: https://www.bnnbloomberg.ca/ex-deutsche-bank-gold-traders-found-guilty-in-spoofing-trial-1.1499597"
+  verified:
+    - "orders they did not intend to execute, placed to create a false impression of supply or demand in COMEX gold and silver futures, to trade on the opposite side"
+    - "convicted of wire fraud affecting a financial institution (Vorley 3 counts, Chanu 7)"
+  approximated:
+    - "UNVERIFIED: genuine orders as iceberg orders; modelled as a small genuine order per cycle plus repeated small refills (rate 0.1)"
+    - "two fake orders of 4x level depth one level behind the touch, pulled on the genuine fill or after 3-10 seconds"
+
+optiver_banging_the_close:
+  title: "Optiver, NYMEX crude oil, heating oil and gasoline futures (March 2007): banging the close"
+  label: pump_and_dump
+  markets: [crude_oil_wti, natural_gas]   # heating oil and gasoline are not simulated
+  duration_ticks: 660
+  mode: program
+  phases:
+    - {name: before_close, kind: trade, ticks: 240, side: buy, how: marketable, size_x_level_depth: 0.6, rate: 0.1}
+    - {name: closing_window, kind: trade, ticks: 180, side: buy, how: marketable, size_x_level_depth: 0.6, rate: 0.4}
+    - {name: offset, kind: trade, ticks: 240, side: sell, how: passive, size_x_level_depth: 0.6, rate: 0.4}
+  n_accounts: 1
+  sources:
+    - "CFTC Release 5521-08 (24 Jul 2008): https://www.cftc.gov/PressRoom/PressReleases/5521-08"
+    - "CFTC Release 6239-12 (consent order, Apr 2012): https://www.cftc.gov/PressRoom/PressReleases/6239-12"
+  verified:
+    - "19 attempted manipulations over 11 days in March 2007 in NYMEX crude oil, heating oil and gasoline futures; at least five successful"
+    - "banging the close: a substantial position acquired leading up to the closing period, about 20-30% of the trades just before the close and the remainder during it"
+    - "settled in 2012: 13 million dollar civil penalty and 1 million dollar disgorgement"
+  approximated:
+    - "the simulator has no settlement; the close is a 3-minute window inside the session"
+    - "trading direction (buying) and the passive offset afterwards are assumptions; the sources state the timing split, not the side"
+    - "closest of the four personas is pump_and_dump (price pushed by concentrated aggressive trading); banging the close is not one of them"
+
+shinhan_wash_trades:
+  title: "Shinhan Securities (2025) and Aralia/Vintage (2021): wash trades between accounts of one owner"
+  label: wash_trading
+  markets: [gold, crude_oil_wti]
+  duration_ticks: 600
+  mode: program
+  phases:
+    - {name: offsetting_orders, kind: cross, ticks: 600, size_x_level_depth: 0.5, rate: 1.0, cross_delay_ticks: [0, 3]}
+  n_accounts: 2
+  sources:
+    - "CFTC order, Shinhan Securities (17 Sep 2025): https://www.cftc.gov/media/12701/enfShinhanSecuritiesCoLtdAdministrativeOrder091725/download"
+    - "CFTC order, Aralia/Vintage (27 Dec 2021): https://cftc.gov/media/6871/enfaraliaorder122721/download"
+  verified:
+    - "Shinhan: a trader executed 127 wash trades across Shinhan accounts, placing offsetting orders within seconds, knowing they would fill against each other"
+    - "Aralia/Vintage: accounts with the same ultimate beneficial owner placed offsetting orders in the same futures product"
+  approximated:
+    - "trades compressed into a 10-minute episode (the real trades were spread over a longer period)"
+    - "each wash: one account rests an order inside the spread, the other takes it 0-3 seconds later whenever the spread is wider than one tick; roles alternate"
+
+amaranth_closing_range:
+  title: "Amaranth Advisors (Brian Hunter), NYMEX natural gas futures (2006): selling into the closing range"
+  label: pump_and_dump
+  markets: [natural_gas, crude_oil_wti]
+  duration_ticks: 1500
+  mode: program
+  phases:
+    - {name: build_long_during_day, kind: trade, ticks: 900, side: buy, how: passive, size_x_level_depth: 0.5, rate: 0.08}
+    - {name: closing_range_selling, kind: trade, ticks: 600, side: sell, how: marketable, size_x_level_depth: 0.8, rate: 0.35}
+  n_accounts: 1
+  sources:
+    - "CFTC complaint (July 2007) and consent order (2009, 7.5 million dollars); Risk.net: https://www.risk.net/regulation/1502734/amaranth-civil-lawsuit-battle"
+    - "SteelEye summary: https://www.steel-eye.com/news/amaranth-advisors-cftc-fine-manipulation"
+  verified:
+    - "attempted manipulation of NYMEX natural gas futures settlement prices on expiry days (24 Feb and 26 Apr 2006)"
+    - "futures shorts reversed to long holdings during the trading day, then large volumes sold in the closing range (2:00-2:30 pm), whose volume-weighted price sets the settlement"
+    - "the motive: large short natural gas swaps on ICE that settle on the NYMEX settlement price"
+  approximated:
+    - "the 30-minute closing range is compressed to 10 minutes; the simulator has no settlement or swap leg"
+    - "daytime buying is passive at the bid, closing selling is marketable; sizes in level-depth units"
+    - "closest of the four personas is pump_and_dump (price pushed by concentrated aggressive trading); here the push is downward"
+
+moore_banging_the_close:
+  title: "Moore Capital (Christopher Pia), NYMEX platinum and palladium futures (2007-2008): banging the close upward"
+  label: pump_and_dump
+  markets: [silver, gold]                 # platinum and palladium are not simulated; precious-metal stand-ins
+  duration_ticks: 600
+  mode: program
+  phases:
+    - {name: closing_period_buying, kind: trade, ticks: 300, side: buy, how: marketable, size_x_level_depth: 0.5, rate: 0.4}
+    - {name: offset_after_close, kind: trade, ticks: 300, side: sell, how: passive, size_x_level_depth: 0.5, rate: 0.35}
+  n_accounts: 1
+  sources:
+    - "CFTC Release 5815-10 (29 Apr 2010): https://www.cftc.gov/PressRoom/PressReleases/5815-10"
+    - "CFTC Release 6079-11 (Pia, 2011): https://www.cftc.gov/PressRoom/PressReleases/6079-11"
+  verified:
+    - "a portfolio manager attempted to manipulate platinum and palladium settlement prices on NYMEX by banging the close, about Nov 2007 - May 2008"
+    - "25 million dollars and a two-year restriction on closing-period trading for the firm; Pia 1 million dollars and a permanent ban from closing-period trading"
+  approximated:
+    - "buying direction follows the 'push settlement prices up' finding; sizes and a 5-minute closing window are assumptions"
+    - "the passive offset after the close is an assumption (the sources do not say how positions were unwound)"
+
+cargill_position_transfers:
+  title: "Cargill de Mexico, CBOT corn, soybean and wheat futures (2010-2014): wash sales between its own accounts"
+  label: wash_trading
+  markets: [corn, wheat]
+  duration_ticks: 600
+  mode: program
+  phases:
+    - {name: equal_and_opposite_orders, kind: cross, ticks: 600, size_x_level_depth: 2.0, rate: 0.2, cross_delay_ticks: [0, 0]}
+  n_accounts: 2
+  sources:
+    - "CFTC Release 7241-15 (24 Sep 2015): https://www.cftc.gov/PressRoom/PressReleases/7241-15"
+    - "CFTC order: https://cftc.gov/idc/groups/public/%40lrenforcementactions/documents/legalpleading/enfcargillorder92415.pdf"
+  verified:
+    - "wash sales and non-competitive transactions in CBOT corn, soybean and wheat and KCBT hard red wheat futures, March 2010 - August 2014; 500,000 dollar penalty"
+    - "equal and opposite orders for two accounts it owned, matching product, quantity, price and timing, to move hedge positions between accounts"
+  approximated:
+    - "fewer, larger crosses than the Shinhan script (position transfers, 2x level depth), entered in the same second; compressed into 10 minutes"
+    - "like every cross here, only when the spread is wider than one tick (otherwise the orders would fill against others)"
+
+tower_research_spoofing:
+  title: "Tower Research Capital (Gandhi, Mohan, Mao), CME E-mini futures (2012-2014)"
+  label: spoofing
+  markets: [crude_oil_wti, copper]       # E-mini index futures are not simulated; liquid stand-ins
+  duration_ticks: 900
+  fake:
+    side: both
+    direction_persistence: 0.8
+    n_orders: 1
+    levels_from_touch: 1
+    size_x_level_depth: 6.0
+    lifetime_ticks: [5, 30]
+    reprice: false
+    cancel_on_genuine_fill: true
+  genuine:
+    place: per_cycle
+    size_x_level_depth: 0.4
+    rate: 0.0
+  flip_after_cancel: 0.0
+  gap_ticks: [3, 15]
+  n_accounts: 1
+  sources:
+    - "CFTC Release 8074-19 (7 Nov 2019): https://www.cftc.gov/PressRoom/PressReleases/8074-19"
+    - "DOJ, two traders plead guilty (2018): https://www.justice.gov/usao-sdtx/pr/two-traders-plead-guilty-60-million-commodities-fraud-and-spoofing-conspiracy"
+  verified:
+    - "large orders on one side of the market, cancelled once smaller genuine orders on the opposite side filled; E-mini index futures, March 2012 - March 2014"
+    - "Tower paid 67.4 million dollars (CFTC and DOJ); Gandhi and Mohan pleaded guilty"
+  approximated:
+    - "one large order of 6x level depth one level behind the touch, held 5-30 seconds unless the genuine order fills first"

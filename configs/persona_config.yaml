@@ -28,12 +28,13 @@ round_0:
     cancellation_delay_ticks: 5
     cover_rate: 0.0
     cover_size: 0.0
+    direction_persistence: 0.95
     enabled: true
     flip_after_cancel: 0.0
     frequency: 0.4
     n_accounts: 1
     n_split_orders: 1
-    order_size_multiplier: 8.0
+    order_size_multiplier: 5.0
     price_aggressiveness: 0.0005
     reprice_to_touch: 0
     size_jitter: 0.0

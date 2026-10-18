@@ -53,4 +53,10 @@ analyst_assistant:
   max_retries: 1
   timeout_seconds: 30
 
+# --- Live-data checker (scripts/predict_live.py --llm): one call per reviewed window
+live_checker:
+  max_tokens: {gemini: 2048, cerebras: 900}    # a JSON verdict with 3-5 sentences of reasoning
+  max_retries: 1
+  timeout_seconds: 45
+
 # --- Audit log: data/runs/<run_id>/llm_calls.jsonl (prompt, response, usage, cost; never API keys)

@@ -23,6 +23,9 @@ Design principle:
     microprice (bounded imbalance adjustment, see decide()), and the market
     maker leans its quotes on imbalance (see market_maker.py).
   - Unfilled orders are cancelled after a geometric lifetime (mean_order_ttl).
+  - Leans against its own position (`position_limit`): a random walk of fills
+    otherwise left each account holding 1,000-3,000 contracts by the end of a
+    session, which real retail risk limits do not allow.
 """
 
 from __future__ import annotations
@@ -63,6 +66,7 @@ class NoiseTrader(Agent):
         price_offset_ticks: float = 2.0,
         imbalance_sensitivity: float = 0.0,
         microprice_weight: float = 1.5,
+        position_limit: int = 2000,
     ) -> None:
         super().__init__(trader_id, rng)
         self.arrival_rate_lambda = arrival_rate_lambda
@@ -71,6 +75,11 @@ class NoiseTrader(Agent):
         self.price_offset_ticks = price_offset_ticks
         self.imbalance_sensitivity = imbalance_sensitivity
         self.microprice_weight = microprice_weight
+        self.position_limit = max(1, int(position_limit))
+        self.net_position = 0
+
+    def update_inventory(self, side: Side, quantity: int) -> None:
+        self.net_position += quantity if side == Side.BUY else -quantity
 
     def decide(self, book_state: BookState, tick: int) -> Order | None:
         if self.rng.random() > self.arrival_rate_lambda:
@@ -80,7 +89,8 @@ class NoiseTrader(Agent):
         if ref_price is None:
             return None
 
-        p_buy = float(np.clip(0.5 + self.imbalance_sensitivity * book_state.imbalance(), 0.15, 0.85))
+        lean = 0.35 * float(np.clip(self.net_position / self.position_limit, -1.0, 1.0))
+        p_buy = float(np.clip(0.5 + self.imbalance_sensitivity * book_state.imbalance() - lean, 0.15, 0.85))
         side = Side.BUY if self.rng.random() < p_buy else Side.SELL
         # Price around the microprice: mid shifted toward the heavier side of the
         # visible book by at most ~half the spread (Stoikov 2018). Bounded, so it

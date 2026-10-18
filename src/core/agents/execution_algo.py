@@ -21,6 +21,10 @@ Mechanism:
            cross the spread with a slice to stay on schedule, and with
            `hedge_prob` send a small opposite-side marketable order. The parent
            completes when the total has filled (or after `max_duration`).
+  inventory once its net position exceeds `inventory_cap_depths` x level depth,
+           the next parent order is in the reducing direction (an asset manager
+           does not keep buying in one account forever; positions reached
+           10,000-18,000 contracts without this).
 """
 
 from __future__ import annotations
@@ -43,12 +47,14 @@ class ExecutionAlgo(Agent):
         take_prob: float = 0.04,
         hedge_prob: float = 0.03,
         max_duration: int = 900,
+        inventory_cap_depths: float = 15.0,
     ) -> None:
         super().__init__(trader_id, rng)
         self.start_prob = start_prob
         self.take_prob = take_prob
         self.hedge_prob = hedge_prob
         self.max_duration = max_duration
+        self.inventory_cap_depths = float(inventory_cap_depths)
         self.net_inventory = 0
         self._depth_ref: float | None = None
         self._is_resting: Callable[[str], bool] = lambda _oid: True
@@ -84,6 +90,8 @@ class ExecutionAlgo(Agent):
         if self._side is None:
             if self.rng.random() < self.start_prob:
                 self._side = Side.BUY if self.rng.random() < 0.5 else Side.SELL
+                if abs(self.net_inventory) > self.inventory_cap_depths * self._depth_ref:
+                    self._side = Side.SELL if self.net_inventory > 0 else Side.BUY
                 self._remaining = int(self._depth_ref * self.rng.uniform(5, 20))
                 self._started = tick
                 self._inv_at_start = self.net_inventory

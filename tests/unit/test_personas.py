@@ -110,6 +110,30 @@ def test_spoof_reprice_follows_moving_touch():
     assert agent.decide_batch(_state(bid=100.0, ask=102.0), 12) == []  # no move -> no reprice
 
 
+def _spoof_sides(persistence: float, cycles: int = 400) -> list[Side]:
+    """Spoof side of each new cycle (the large order's side), for a 'both'-direction spoofer."""
+    agent = SpoofingAgent("sp", np.random.default_rng(3), frequency=1.0, cancellation_delay_ticks=1,
+                          direction_persistence=persistence, start_tick=0, end_tick=10**6)
+    sides, tick = [], 0
+    while len(sides) < cycles:
+        tick += 1
+        orders = agent.manipulate(_state(tick=tick), tick)
+        big = [o for o in orders if o.order_type != "cancel" and o.quantity >= 50]
+        if big:
+            sides.append(big[0].side)
+    return sides
+
+
+def test_spoof_campaigns_keep_one_side():
+    def switch_rate(sides):
+        return float(np.mean([a != b for a, b in zip(sides, sides[1:])]))
+
+    assert switch_rate(_spoof_sides(0.95)) < 0.1            # minutes-long one-sided campaigns
+    assert 0.35 < switch_rate(_spoof_sides(0.5)) < 0.65     # the old coin flip per cycle
+    both = _spoof_sides(0.95, 2000)
+    assert Side.BUY in both and Side.SELL in both            # campaigns still turn
+
+
 def test_spoof_flip_after_cancel():
     from src.core.order_book import Side as S
     agent = SpoofingAgent("sp", np.random.default_rng(0), frequency=1.0, spoof_side="buy", flip_after_cancel=1.0,

@@ -26,6 +26,7 @@ PERSONA_PARAM_MAP: dict[str, dict[str, tuple[str, type]]] = {
         "n_accounts": ("spoof_n_accounts", int),
         "reprice_to_touch": ("spoof_reprice", int),
         "flip_after_cancel": ("spoof_flip", float),
+        "direction_persistence": ("spoof_persistence", float),
         "busy_period_bias": ("spoof_busy_bias", float),
         "cover_rate": ("spoof_cover_rate", float),
         "cover_size": ("spoof_cover_size", float),

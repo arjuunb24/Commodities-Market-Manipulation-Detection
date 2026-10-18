@@ -54,7 +54,8 @@ PARAM_BOUNDS: dict[str, dict[str, tuple[type, float, float, str]]] = {
         "price_aggressiveness": (float, 0.0001, 0.01, "distance behind best price; >0.002 loses impact"),
         "reprice_to_touch": (int, 0, 1, "1 = keep the resting spoof pinned behind the moving best price (Sarao)"),
         "flip_after_cancel": (float, 0.0, 1.0, "chance of trading aggressively in the genuine direction when the spoof is pulled (Oystacher)"),
-        "busy_period_bias": (float, 0.0, 1.0, "skip quiet periods; act mainly when the market is busy (advisory #5)"),
+        "direction_persistence": (float, 0.5, 0.99, "chance each new cycle keeps the previous spoof side; high = minutes-long one-sided campaigns (Sarao, Coscia), low = alternating sides whose pushes cancel each other"),
+        "busy_period_bias": (float, 0.0, 1.0, "skip quiet periods; act mainly when the market is busy (design assumption)"),
         "cover_rate": (float, 0.0, 0.5, "per-account chance per tick of a genuine cover order inside the window (Sarao/Coscia traded genuinely too)"),
         "cover_size": (float, 0.0, 3.0, "cover order size x average level depth; the detector's ratios are volume-weighted, so small cover barely dilutes"),
     },
@@ -64,7 +65,7 @@ PARAM_BOUNDS: dict[str, dict[str, tuple[type, float, float, str]]] = {
         "ring_size": (int, 2, 6, "accounts per group; crosses rotate A->B->C->A"),
         "size_jitter": (float, 0.0, 0.9, "0 = fixed scripted lot; higher = varied sizes"),
         "camouflage_rate": (float, 0.0, 0.5, "share of cycles replaced by a genuine market trade"),
-        "busy_period_bias": (float, 0.0, 1.0, "skip quiet periods; act mainly when the market is busy (advisory #5)"),
+        "busy_period_bias": (float, 0.0, 1.0, "skip quiet periods; act mainly when the market is busy (design assumption)"),
     },
     "pump_and_dump": {
         "n_coordinated_accounts": (int, 2, 15, "colluding accounts"),
@@ -74,7 +75,7 @@ PARAM_BOUNDS: dict[str, dict[str, tuple[type, float, float, str]]] = {
         "stagger": (float, 0.0, 1.0, "per-account random start delay, x burst duration"),
         "ignition_aggression": (float, 0.0002, 0.005, "how far through the ask ignition buys go"),
         "decoy_rate": (float, 0.0, 0.4, "chance per tick of a small opposite-side trade"),
-        "busy_period_bias": (float, 0.0, 1.0, "skip quiet periods; act mainly when the market is busy (advisory #5)"),
+        "busy_period_bias": (float, 0.0, 1.0, "skip quiet periods; act mainly when the market is busy (design assumption)"),
     },
     "layering": {
         "n_layers": (int, 2, 8, "orders stacked on consecutive levels per cycle (Tower: 3-8)"),
@@ -84,7 +85,7 @@ PARAM_BOUNDS: dict[str, dict[str, tuple[type, float, float, str]]] = {
         "cancellation_delay_ticks": (int, 1, 30, "mean ticks the layers rest before being cancelled"),
         "cancel_jitter": (float, 0.0, 0.8, "cancel delay drawn from delay x U(1-j, 1+j)"),
         "frequency": (float, 0.05, 1.0, "chance per tick to start a new layering cycle"),
-        "busy_period_bias": (float, 0.0, 1.0, "skip quiet periods; act mainly when the market is busy (advisory #5)"),
+        "busy_period_bias": (float, 0.0, 1.0, "skip quiet periods; act mainly when the market is busy (design assumption)"),
         "placement_stagger": (int, 0, 5, "ticks between successive layers: 0 = whole ladder in one tick; k = one layer every k ticks (no same-tick multi-level batch, but the full ladder rests for less of the cycle)"),
         "cover_rate": (float, 0.0, 0.5, "per-account chance per tick of a genuine cover order inside the window (Sarao/Coscia traded genuinely too)"),
         "cover_size": (float, 0.0, 3.0, "cover order size x average level depth; the detector's ratios are volume-weighted, so small cover barely dilutes"),
@@ -100,7 +101,7 @@ MUTABLE_PERSONAS = tuple(PARAM_BOUNDS)
 #   ignition_pressure  peak 60-tick share of market volume bought aggressively
 # Used by the effect guard (at risk: undo these; surplus: spend them on evasion).
 EFFECT_COST: dict[str, dict[str, str]] = {
-    "spoofing": {"order_size_multiplier": "down", "price_aggressiveness": "up"},
+    "spoofing": {"order_size_multiplier": "down", "price_aggressiveness": "up", "direction_persistence": "down"},
     "layering": {"layer_spacing": "up", "n_layers": "down", "layer_size_multiplier": "down", "size_taper": "up",
                  "placement_stagger": "up"},
     "wash_trading": {"trade_frequency": "down", "camouflage_rate": "up"},

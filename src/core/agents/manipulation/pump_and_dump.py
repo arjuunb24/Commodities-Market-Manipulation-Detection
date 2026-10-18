@@ -20,18 +20,25 @@ Parameter semantics (unchanged names so persona_config / the strategist still wo
   n_coordinated_accounts  number of colluding accounts
   accumulation_size       target position PER ACCOUNT built during ACCUMULATE
 
-Evasion knobs (docs/enforcement_case_notes.md, Nefedova et al.):
+Evasion knobs (design assumptions: no futures case documents a multi-account pump with
+staggered entries or decoys; see docs/enforcement_case_notes.md):
   stagger              each account runs the schedule with its own random delay
                        of up to stagger x burst_duration ("staggered accumulation,
                        appearing like independent decisions")
   ignition_aggression  how far through the ask the ignition buys are priced
                        (lower = less impact and less detectable)
   decoy_rate           probability per tick of a small opposite-side trade while
-                       accumulating / distributing (interleaving, advisory #4)
+                       accumulating / distributing (interleaving)
 
 Detection footprint: at trader level, accounts that are net buyers (first
 passively, then aggressively) and later flip to net sellers, while their own
 buying coincides with the window's price rise.
+
+Order-id audit tags (simulator ground truth only, never read by the detector):
+"a" accumulate, "i" ignite, "x" distribute, "u" dump, "d" decoy. Activity-based
+labels (detector_config labels.mode) count ignite, distribute and dump only:
+quiet accumulation and decoys are deliberately indistinguishable from ordinary
+trading, and labelling them taught the classifier to flag ordinary traders.
 """
 
 from __future__ import annotations
@@ -186,18 +193,18 @@ class PumpDumpCoalition(ManipulationController):
             if phase == PumpPhase.ACCUMULATE:
                 if r < 0.25 and pos < target:
                     qty = min(int(acct.rng.integers(5, 25)), target - pos)
-                    orders.append(acct.limit(Side.BUY, state.best_bid, qty, tick, exact_ttl=20))
+                    orders.append(acct.limit(Side.BUY, state.best_bid, qty, tick, exact_ttl=20, tag="a"))
             elif phase == PumpPhase.IGNITE:
                 if r < 0.6 and pos < 2 * target:
                     price = state.best_ask * (1 + acct.rng.uniform(0.25, 1.0) * self.ignition_aggression)
-                    orders.append(acct.limit(Side.BUY, price, int(acct.rng.integers(20, 60)), tick, exact_ttl=3))
+                    orders.append(acct.limit(Side.BUY, price, int(acct.rng.integers(20, 60)), tick, exact_ttl=3, tag="i"))
             elif phase == PumpPhase.DISTRIBUTE:
                 if r < 0.35 and pos > 0:
                     qty = min(int(acct.rng.integers(10, 40)), pos)
-                    orders.append(acct.limit(Side.SELL, state.best_ask, qty, tick, exact_ttl=15))
+                    orders.append(acct.limit(Side.SELL, state.best_ask, qty, tick, exact_ttl=15, tag="x"))
             elif phase == PumpPhase.DUMP:
                 if r < 0.6 and pos > 0:
                     qty = min(int(acct.rng.integers(25, 70)), pos)
                     price = state.best_bid * (1 - acct.rng.uniform(0.0005, 0.002))
-                    orders.append(acct.limit(Side.SELL, price, qty, tick, exact_ttl=3))
+                    orders.append(acct.limit(Side.SELL, price, qty, tick, exact_ttl=3, tag="u"))
         return orders

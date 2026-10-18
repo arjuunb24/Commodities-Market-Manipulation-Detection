@@ -30,6 +30,7 @@ from typing import Callable
 import numpy as np
 
 from src.core.agents.base import Agent
+from src.core.agents.occasional_trader import discretionary_order
 from src.core.order_book import BookState, Order, Side
 
 
@@ -55,17 +56,8 @@ class ManipulatorAccount(Agent):
         self.net_position += quantity if side == Side.BUY else -quantity
 
     def decide(self, book_state: BookState, tick: int) -> Order | None:
-        if self.rng.random() > self.background_rate:
-            return None
-        ref = book_state.mid_price or book_state.last_trade_price
-        if ref is None or ref <= 0:
-            return None
-        # Lean against any accumulated position so background flow stays flat.
-        p_buy = 0.5 - 0.3 * float(np.clip(self.net_position / 200.0, -1, 1))
-        side = Side.BUY if self.rng.random() < p_buy else Side.SELL
-        price = ref * (1 + self.rng.uniform(-0.002, 0.002))
-        qty = int(self.rng.integers(5, 40))
-        return self.limit(side, price, qty, tick)
+        # Same code as the legitimate OccasionalTrader, so background flow is no fingerprint.
+        return discretionary_order(self, book_state, tick, self.background_rate)
 
     def cover_order(self, book_state: BookState, tick: int, size_mult: float = 0.0) -> Order | None:
         """One genuine order inside the manipulation window (audit tag "v")."""
@@ -123,7 +115,7 @@ class ManipulationController(ABC):
         self.agents: list[Agent] = list(accounts)
         self.start_tick = start_tick
         self.end_tick = end_tick
-        # CFTC 2020 staff advisory #5: act mainly when the market is busy, so the
+        # Design assumption (no documented case): act mainly when the market is busy, so the
         # manipulation hides among elevated, naturally explainable activity.
         # 0 = ignore market activity; 1 = never act in quiet periods.
         self.busy_period_bias = float(busy_period_bias)

@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -44,10 +44,12 @@ from src.core.agents.base import Agent
 from src.core.agents.manipulation.common import ManipulationController
 from src.core.agents.manipulation.layering import LayeringAgent
 from src.core.agents.manipulation.pump_and_dump import PumpDumpCoalition
+from src.core.agents.manipulation.replay import CaseReplayAgent
 from src.core.agents.manipulation.spoofing import SpoofingAgent
 from src.core.agents.manipulation.wash_trading import WashTradingPair
 from src.core.agents.execution_algo import ExecutionAlgo
 from src.core.agents.hft_liquidity_provider import HFTLiquidityProvider
+from src.core.agents.occasional_trader import OccasionalTrader
 from src.core.agents.market_maker import MarketMaker
 from src.core.agents.mean_reversion_trader import MeanReversionTrader
 from src.core.agents.momentum_trader import MomentumTrader
@@ -115,6 +117,10 @@ class SimConfig:
     # firms and institutional algos that rest and pull large orders.
     n_hft_liquidity_providers: int = 3
     n_execution_algos: int = 3
+    # Legitimate low-frequency traders that trade exactly like manipulator accounts'
+    # background flow (agents/occasional_trader.py), about as many as there are
+    # manipulator accounts in a market, so sparse irregular trading identifies nobody.
+    n_occasional_traders: int = 25
 
     # Agent parameters (relative to price unless stated)
     noise_lambda: float = 0.6
@@ -122,13 +128,22 @@ class SimConfig:
     noise_price_offset_pct: float = 0.0005
     momentum_lambda: float = 0.05
     momentum_lookback: int = 60             # ticks (seconds), sampled once per tick
-    momentum_threshold: float = 0.001
+    momentum_threshold: float = 0.0002   # floor; the trigger is momentum_vol_k x the typical move
+    momentum_vol_k: float = 1.5          # trend = move > 1.5x the typical move (tested: k 1.5 kept tails and clustering, uniform activity)
+    noise_position_limit: int = 2000     # noise traders lean against their own position (600 made gold trend more)
+    reversion_max_position: int = 0      # 0 = no cap: the mean-reversion traders are the market's value anchor
     reversion_lambda: float = 0.25
-    reversion_threshold: float = 0.001
+    reversion_threshold: float = 0.0005     # 5 bp: at 10 bp prices drifted after value and 1-minute returns trended (gold ac1 0.19 vs 0.00 real)
     market_maker_lambda: float = 0.95
     market_maker_spread: float = 2.0        # legacy; half-spread is market_maker_half_spread_pct
     market_maker_half_spread_pct: float = 0.0003
+    min_spread_ticks: float = 2.0           # floor on the half-spread and noise offset, in price ticks
     manipulator_background_rate: float = 0.05
+    # Documented real cases replayed as scripted episodes (configs/case_replays.yaml):
+    # [{"case": id, "script": {...}, "start_tick": int, "end_tick": int}, ...].
+    # They draw from their own random stream and do not change how the other
+    # agents are built (arrival order still includes them).
+    replay_scripts: list = field(default_factory=list)
 
     # Persona flags
     enable_spoofing: bool = True
@@ -137,7 +152,7 @@ class SimConfig:
     enable_layering: bool = False
 
     # Spoofing parameters
-    spoof_size_multiplier: float = 8.0
+    spoof_size_multiplier: float = 5.0   # x average level depth; documented spoofs ran ~5x the genuine order (Walleye) up to Sarao's ~25% of the book
     spoof_cancel_delay: int = 5
     spoof_frequency: float = 0.4
     spoof_aggressiveness: float = 0.0005
@@ -147,6 +162,7 @@ class SimConfig:
     spoof_n_accounts: int = 1
     spoof_reprice: int = 0
     spoof_flip: float = 0.0
+    spoof_persistence: float = 0.95   # campaign: chance a new spoof cycle keeps the previous side
     spoof_busy_bias: float = 0.0
     spoof_cover_rate: float = 0.0
     spoof_cover_size: float = 0.0
@@ -296,6 +312,7 @@ def _build_persona(persona, ep_idx, start, end, config, sub_rngs, jitter_rng) ->
             n_accounts=int(config.spoof_n_accounts),
             reprice_to_touch=int(config.spoof_reprice),
             flip_after_cancel=float(config.spoof_flip),
+            direction_persistence=float(config.spoof_persistence),
             busy_period_bias=float(config.spoof_busy_bias),
             start_tick=start, end_tick=end, background_rate=bg,
         )]
@@ -374,8 +391,8 @@ def _build_agents(
     """
     init_price = _initial_price(config)
     tick_size = COMMODITY_TICK_SIZES.get(config.commodity, 0.01)
-    mm_half_spread = max(2 * tick_size, init_price * config.market_maker_half_spread_pct)
-    noise_offset = max(2 * tick_size, init_price * config.noise_price_offset_pct)
+    mm_half_spread = max(config.min_spread_ticks * tick_size, init_price * config.market_maker_half_spread_pct)
+    noise_offset = max(config.min_spread_ticks * tick_size, init_price * config.noise_price_offset_pct)
 
     sub_rngs = iter(master_rng.spawn(200))
     agents: list[Agent] = []
@@ -386,6 +403,7 @@ def _build_agents(
             f"noise_{i}", next(sub_rngs),
             arrival_rate_lambda=config.noise_lambda,
             price_offset_ticks=noise_offset,
+            position_limit=config.noise_position_limit,
         ))
     for i in range(config.n_momentum_traders):
         agents.append(MomentumTrader(
@@ -393,12 +411,14 @@ def _build_agents(
             lookback_ticks=config.momentum_lookback,
             momentum_threshold=config.momentum_threshold,
             arrival_rate_lambda=config.momentum_lambda,
+            vol_k=config.momentum_vol_k,
         ))
     for i in range(config.n_mean_reversion_traders):
         agents.append(MeanReversionTrader(
             f"meanrev_{i}", next(sub_rngs),
             reversion_threshold=config.reversion_threshold,
             arrival_rate_lambda=config.reversion_lambda,
+            max_position=config.reversion_max_position,
         ))
     for i in range(config.n_market_makers):
         agents.append(MarketMaker(
@@ -411,6 +431,10 @@ def _build_agents(
         agents.append(HFTLiquidityProvider(f"hft_{i}", next(sub_rngs)))
     for i in range(config.n_execution_algos):
         agents.append(ExecutionAlgo(f"algo_{i}", next(sub_rngs)))
+    # Own random streams, so adding them does not shift the personas' streams.
+    if config.n_occasional_traders:
+        for i, rng in enumerate(master_rng.spawn(config.n_occasional_traders)):
+            agents.append(OccasionalTrader(f"occ_{i}", rng, activity_rate=config.manipulator_background_rate))
 
     flag_map = {
         "spoofing": config.enable_spoofing,
@@ -563,6 +587,13 @@ def run_simulation(
     )
 
     agents, controllers = _build_agents(config, master_rng)
+    if config.replay_scripts:
+        replay_rng = np.random.default_rng([seed, 991])
+        for k, rep in enumerate(config.replay_scripts):
+            controllers.append(CaseReplayAgent(
+                rep["case"], rep["script"], replay_rng.spawn(1)[0],
+                start_tick=int(rep["start_tick"]), end_tick=int(rep["end_tick"]),
+                background_rate=config.manipulator_background_rate, episode_index=k))
 
     # Run-scoped id prefix keeps ids unique when commodities/rounds are merged.
     id_prefix = f"{config.commodity[:3]}{seed}-"
@@ -587,7 +618,7 @@ def run_simulation(
     for a in agents:
         if hasattr(a, "bind_book"):
             a.bind_book(book.is_resting)
-    # Market-activity signal (advisory #5 "busy period" tactic): volume over the
+    # Market-activity signal (the "busy period" tactic, a design assumption): volume over the
     # last minute and a slow moving baseline of it.
     from collections import deque
     tick_volumes: deque[int] = deque(maxlen=60)

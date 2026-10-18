@@ -25,6 +25,7 @@ def _frame(sizes_by_trader: dict[str, list[float]]) -> pd.DataFrame:
         for w, s in enumerate(sizes):
             row = {"win": w, "trader_id": t}
             row.update({c: 0.1 for c in SELF_Z_COLUMNS})
+            row["n_orders"] = 20                 # normally active (evidence weighting ~0.8)
             row["max_order_size_rel"] = s
             rows.append(row)
     return pd.DataFrame(rows)
@@ -274,9 +275,11 @@ def test_staggered_layering_never_places_a_multi_level_batch_in_one_tick():
     assert sum(o.order_id.endswith("l") for o in flat.manipulate(state, 0)) == 4   # stagger 0: unchanged ladder
 
 
-def test_self_history_corroboration_needs_two_features():
+def test_self_history_corroboration_needs_several_features():
     from src.detector.pipeline import DetectorPipeline
     cfg = yaml.safe_load(open("configs/detector_config.yaml"))
+    corr = cfg["ensemble"]["iso_corroboration"]
+    need, k = float(corr["min_self_z"]), int(corr["min_self_z_cols"])
     pipe = DetectorPipeline(cfg)
 
     class _Iso:
@@ -289,15 +292,17 @@ def test_self_history_corroboration_needs_two_features():
         def predict_proba(self, X): return pd.DataFrame({p: 0.0 for p in cfg["personas"]}, index=X.index)
         def predict_flags(self, probs): return probs >= 0.8
 
-    idx = pd.MultiIndex.from_tuples([("gold", 0, "algo_0"), ("gold", 0, "x")], names=["commodity", "window_start", "trader_id"])
-    z = {f"self_z_{c}": [0.0, 0.0] for c in SELF_Z_COLUMNS}
-    z["self_z_max_order_size_rel"] = [20.0, 20.0]          # one feature jumps (new parent order) ...
-    z["self_z_n_orders"] = [0.0, 12.0]                       # ... vs. two features deviating at once
-    X = pd.DataFrame({"window_end": [179, 179], **z}, index=idx)
+    # Row i deviates strongly on i+1 features: one jumping feature (a new parent order) is not
+    # enough, only k features deviating at once corroborate the forest's flag.
+    idx = pd.MultiIndex.from_tuples([("gold", 0, f"acct_{i}") for i in range(k)], names=["commodity", "window_start", "trader_id"])
+    z = {f"self_z_{c}": [0.0] * k for c in SELF_Z_COLUMNS}
+    for j, c in enumerate(SELF_Z_COLUMNS[:k]):
+        z[f"self_z_{c}"] = [need + 1 if i >= j else 0.0 for i in range(k)]
+    X = pd.DataFrame({"window_end": [179] * k, **z}, index=idx)
     pipe.anomaly_detector, pipe.supervised_detector = _Iso(), _Sup()
     pipe._with_context = lambda X: X.assign(mkt_anomaly_score=0.0)
     pipe.is_trained = True
-    assert list(pipe.score(X)["alert_tier"]) == ["review", "alert"]
+    assert list(pipe.score(X)["alert_tier"]) == ["review"] * (k - 1) + ["alert"]
 
 
 def test_family_coverage_counts_sibling_label():
@@ -404,3 +409,21 @@ def test_analyst_applies_the_viewed_market_unless_the_question_overrides_it(tmp_
     a.ask("And across both markets?", context={"round": 0, "market": "A", "scope": "market"})
     a.ask("Which accounts were flagged?", context={"round": 0, "market": "A", "scope": "pooled"})
     assert [kw.get("market") for kw in seen] == ["A", None, None]
+
+
+def test_account_pnl_nets_internal_trades_and_marks_inventory():
+    """A ring's trades with itself net out; only trades with the rest of the market count."""
+    import pandas as pd
+    from src.adversarial.effectiveness import account_pnl
+    ev = pd.DataFrame([{"event_id": "E0", "persona": "wash_trading", "trader_ids": ["w_a", "w_b"],
+                        "commodity": "gold", "start_tick": 0, "end_tick": 10}])
+    tr = pd.DataFrame([
+        # internal wash print at a silly price: must not count
+        {"tick": 1, "price": 500.0, "quantity": 10, "buyer_trader_id": "w_a", "seller_trader_id": "w_b", "commodity": "gold"},
+        # buys 1 @100 from the market, market ends at 110 -> +10 on 100 gross notional
+        {"tick": 2, "price": 100.0, "quantity": 1, "buyer_trader_id": "w_a", "seller_trader_id": "noise_0", "commodity": "gold"},
+        {"tick": 3, "price": 110.0, "quantity": 1, "buyer_trader_id": "noise_1", "seller_trader_id": "noise_2", "commodity": "gold"},
+    ])
+    out = account_pnl(ev, tr)["wash_trading"]
+    assert out["episodes"] == 1 and out["profitable_share"] == 1.0
+    assert abs(out["pnl_bp_median"] - 1000.0) < 1e-6

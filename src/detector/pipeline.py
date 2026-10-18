@@ -29,6 +29,18 @@ logger = logging.getLogger(__name__)
 FEATURES_FILE = "features.parquet"
 LABELS_FILE = "labels.parquet"
 MIN_OVERLAP_TICKS = 15
+# Activity-based labels: order-id audit tags (simulator ground truth, never seen by the detector)
+# that mark an account's manipulative orders, per persona. A window is positive only if the account
+# placed at least one of them inside it. Quiet accumulation ("a"), pump-and-dump decoys ("d") and wash
+# camouflage ("c") are left out on purpose: they are built to be indistinguishable from ordinary
+# trading, and labelling them taught the classifiers to flag ordinary traders. Replayed real cases use
+# "s"/"g"/"f" (spoofing and layering scripts), "w" (wash crosses) and "p" (trade programmes).
+ACTIVITY_TAGS = {
+    "spoofing": {"s", "g", "f"},
+    "layering": {"l", "g", "s"},
+    "wash_trading": {"w"},
+    "pump_and_dump": {"i", "x", "u", "p"},
+}
 
 
 def clean_shap_dict(d) -> dict[str, float]:
@@ -78,8 +90,12 @@ class DetectorPipeline:
         run_dir = Path(run_dir)
         f_path, l_path = run_dir / FEATURES_FILE, run_dir / LABELS_FILE
         src = run_dir / "order_log.parquet"
+        from src.detector.features import FEATURE_VERSION
+        v_path = run_dir / "features.version"
+        cached_version = v_path.read_text().strip() if v_path.exists() else "1"
+        version = f"{FEATURE_VERSION}:{self.label_mode}"
         if use_cache and f_path.exists() and l_path.exists() and src.exists() \
-                and f_path.stat().st_mtime >= src.stat().st_mtime:
+                and f_path.stat().st_mtime >= src.stat().st_mtime and cached_version == version:
             X = pd.read_parquet(f_path)
             y = pd.read_parquet(l_path)
             from src.detector.features import SELF_Z_COLUMNS
@@ -92,17 +108,34 @@ class DetectorPipeline:
         order_df = pd.read_parquet(run_dir / "order_log.parquet")
         manip_df = pd.read_parquet(run_dir / "manipulation_events.parquet")
         X = self.feature_engine.generate_features(trade_df, order_df)
-        y = self.generate_labels(X, manip_df)
+        y = self.generate_labels(X, manip_df, order_df)
         if not X.empty:
             X.to_parquet(f_path)
             y.to_parquet(l_path)
+            v_path.write_text(version)
         return X, y
 
-    def generate_labels(self, X: pd.DataFrame, manip_df: pd.DataFrame) -> pd.DataFrame:
-        """Trader-level ground truth: account ∈ episode accounts AND window overlaps episode."""
+    @property
+    def label_mode(self) -> str:
+        """'activity' (default): windows where the account placed manipulative orders; 'span': the whole episode."""
+        return str(self.config.get("labels", {}).get("mode", "activity"))
+
+    def generate_labels(self, X: pd.DataFrame, manip_df: pd.DataFrame,
+                        order_df: pd.DataFrame | None = None) -> pd.DataFrame:
+        """
+        Trader-level ground truth.
+
+        activity (default, needs order_df): the account is one of the episode's accounts AND it
+            placed at least one of the persona's manipulative orders (ACTIVITY_TAGS) inside the
+            window, within the episode.
+        span (or no order log given): the account is one of the episode's accounts AND the
+            window overlaps the episode by MIN_OVERLAP_TICKS.
+        """
         y = pd.DataFrame(0, index=X.index, columns=self.personas, dtype=int)
         if X.empty or manip_df.empty:
             return y
+        if self.label_mode == "activity" and order_df is not None and not order_df.empty:
+            return self._activity_labels(X, manip_df, order_df, y)
         rows = X.reset_index()[["commodity", "window_start", "trader_id", "window_end"]]
         rows["_row"] = np.arange(len(rows))
         ev = manip_df[["commodity", "persona", "start_tick", "end_tick", "trader_ids"]].copy()
@@ -114,6 +147,38 @@ class DetectorPipeline:
         values = y.to_numpy()
         for persona in self.personas:
             hit = j.loc[j["persona"] == persona, "_row"].unique()
+            values[hit, self.personas.index(persona)] = 1
+        return pd.DataFrame(values, index=X.index, columns=self.personas)
+
+    def _activity_labels(self, X: pd.DataFrame, manip_df: pd.DataFrame, order_df: pd.DataFrame,
+                         y: pd.DataFrame) -> pd.DataFrame:
+        placed = order_df[order_df["event_type"] == "placed"][["order_id", "trader_id", "tick", "commodity"]]
+        ev = manip_df[["commodity", "persona", "start_tick", "end_tick", "trader_ids"]].copy()
+        ev["trader_ids"] = ev["trader_ids"].apply(list)
+        ev = ev.explode("trader_ids").rename(columns={"trader_ids": "trader_id"})
+        ev = ev[ev["persona"].isin(self.personas)]
+        acts = placed[placed["trader_id"].isin(set(ev["trader_id"]))].copy()
+        if acts.empty:
+            return y
+        acts["tag"] = acts["order_id"].astype(str).str.extract(r"-\d+([a-z]*)$")[0].fillna("")
+        acts = acts.merge(ev, on=["commodity", "trader_id"], how="inner")
+        acts = acts[acts["tick"].between(acts["start_tick"], acts["end_tick"])]
+        keep = np.array([t in ACTIVITY_TAGS.get(p, set()) for t, p in zip(acts["tag"], acts["persona"])], dtype=bool)
+        acts = acts[keep]
+        if acts.empty:
+            return y
+        rows = X.reset_index()[["commodity", "window_start", "trader_id", "window_end"]]
+        rows["_row"] = np.arange(len(rows))
+        rows = rows[rows["trader_id"].isin(set(acts["trader_id"]))]
+        values = y.to_numpy()
+        for (com, tid, persona), g in acts.groupby(["commodity", "trader_id", "persona"]):
+            ticks = np.sort(g["tick"].to_numpy())
+            w = rows[(rows["commodity"] == com) & (rows["trader_id"] == tid)]
+            if w.empty:
+                continue
+            lo = np.searchsorted(ticks, w["window_start"].to_numpy(), side="left")
+            hi = np.searchsorted(ticks, w["window_end"].to_numpy(), side="right")
+            hit = w["_row"].to_numpy()[hi > lo]
             values[hit, self.personas.index(persona)] = 1
         return pd.DataFrame(values, index=X.index, columns=self.personas)
 
@@ -129,12 +194,13 @@ class DetectorPipeline:
         X["mkt_anomaly_score"] = self.market_detector.score(X).to_numpy()
         return X
 
-    def train(self, X: pd.DataFrame, y: pd.DataFrame, save_dir: Path | None = None) -> None:
-        """Fit the market IF, the trader IF and the per-persona classifiers."""
+    def train(self, X: pd.DataFrame, y: pd.DataFrame, save_dir: Path | None = None,
+              sample_weight: np.ndarray | None = None) -> None:
+        """Fit the market IF, the trader IF and the per-persona classifiers (optionally row-weighted)."""
         self.market_detector.fit(X)
         Xc = self._with_context(X)
         self.anomaly_detector.fit(Xc)
-        self.supervised_detector.fit(Xc, y)
+        self.supervised_detector.fit(Xc, y, sample_weight=sample_weight)
         self.is_trained = True
         if save_dir is not None:
             self.save_importances(Xc, Path(save_dir))

@@ -2,14 +2,14 @@
 # vol_scale multiplies the sourced daily volatility INSIDE the simulator so that realised
 # 5-minute volatility matches the sourced target. The sourced values are unchanged.
 vol_scale:
-  crude_oil_wti: 1.027
-  brent_crude: 1.01
-  gold: 1.176
-  silver: 0.834
-  natural_gas: 1.131
-  copper: 0.761
-  wheat: 0.819
-  corn: 0.655
+  crude_oil_wti: 1.074
+  brent_crude: 1.073
+  gold: 1.025
+  silver: 1.077
+  natural_gas: 1.103
+  copper: 1.012
+  wheat: 0.969
+  corn: 0.934
 fit:
   horizon_ticks: 300
   seeds:
@@ -17,37 +17,37 @@ fit:
   - 7002
   - 7003
   ticks: 10000
-  iterations: 4
+  iterations: 1
   realised_over_target:
     crude_oil_wti:
-      1min: 1.178
-      5min: 1.018
-      30min: 0.912
+      1min: 1.15
+      5min: 0.967
+      30min: 0.943
     brent_crude:
-      1min: 1.14
-      5min: 0.992
-      30min: 0.889
+      1min: 1.137
+      5min: 1.019
+      30min: 0.956
     gold:
-      1min: 0.902
-      5min: 1.046
-      30min: 1.029
+      1min: 1.06
+      5min: 1.015
+      30min: 0.961
     silver:
-      1min: 1.256
-      5min: 1.06
-      30min: 0.816
+      1min: 1.239
+      5min: 1.03
+      30min: 0.97
     natural_gas:
-      1min: 1.291
-      5min: 0.986
-      30min: 0.993
-    copper:
-      1min: 1.167
-      5min: 1.007
-      30min: 0.626
-    wheat:
-      1min: 1.608
-      5min: 1.0
-      30min: 0.698
-    corn:
-      1min: 1.959
+      1min: 1.161
       5min: 0.977
-      30min: 0.647
+      30min: 0.962
+    copper:
+      1min: 1.098
+      5min: 0.994
+      30min: 0.958
+    wheat:
+      1min: 1.354
+      5min: 0.981
+      30min: 0.93
+    corn:
+      1min: 1.511
+      5min: 1.062
+      30min: 0.943

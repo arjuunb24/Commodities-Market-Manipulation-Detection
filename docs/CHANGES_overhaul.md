@@ -4,6 +4,12 @@ This document records every change made in this overhaul: the simulator, the man
 
 Nothing in this overhaul has been committed yet; all changes are in the working tree on branch `harsh`.
 
+> **Correction (Oct 2026).** Entries below cite a "CFTC 2020 staff advisory" (#1-#5), "CFTC v. Nefedova
+> et al. (2020)", Coinbase "cyclical" washes and a Kraft "round 2". None of these could be verified in
+> public CFTC records. The case notes (`docs/enforcement_case_notes.md`), tactic cards and code comments
+> were rewritten to cite only documented cases and to mark the remaining tactics as design assumptions.
+> The entries below are kept as they were written.
+
 ---
 
 ## Contents

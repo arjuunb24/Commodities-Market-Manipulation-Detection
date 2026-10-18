@@ -142,6 +142,7 @@ class TestMomentumTrader:
             lookback_ticks=5,
             momentum_threshold=0.001,
             arrival_rate_lambda=1.0,
+            vol_k=0.0,  # fixed threshold only
         )
         # Build a strong uptrend
         for p in [100.0, 101.0, 102.0, 103.0, 105.0]:
@@ -158,6 +159,7 @@ class TestMomentumTrader:
             lookback_ticks=5,
             momentum_threshold=0.001,
             arrival_rate_lambda=1.0,
+            vol_k=0.0,  # fixed threshold only
         )
         for p in [105.0, 103.0, 102.0, 101.0, 100.0]:
             trader.update_price(p)
@@ -165,6 +167,19 @@ class TestMomentumTrader:
         order = trader.decide(normal_book_state(mid=100.0), tick=5)
         assert order is not None
         assert order.side == Side.SELL
+
+    def test_vol_scaled_trigger_ignores_ordinary_moves(self) -> None:
+        """A move no bigger than the typical move is not a trend; a much bigger one is."""
+        trader = MomentumTrader("MT", rng(0), lookback_ticks=5, momentum_threshold=0.0001,
+                                arrival_rate_lambda=1.0, vol_k=1.5)
+        for i in range(400):   # steady 1% moves over the lookback set the typical move
+            trader.update_price(100.0 * 1.0025 ** i)
+        assert trader.decide(normal_book_state(mid=trader._price_history[-1]), tick=400) is None
+        last = trader._price_history[-1]
+        for p in [last * 1.01, last * 1.02, last * 1.03, last * 1.04]:   # 4x the typical move
+            trader.update_price(p)
+        order = trader.decide(normal_book_state(mid=last * 1.04), tick=401)
+        assert order is not None and order.side == Side.BUY
 
     def test_no_action_on_flat_market(self) -> None:
         trader = MomentumTrader(
@@ -179,7 +194,7 @@ class TestMomentumTrader:
         assert result is None
 
     def test_order_quantity_positive(self) -> None:
-        trader = MomentumTrader("MT", rng(0), arrival_rate_lambda=1.0, momentum_threshold=0.001)
+        trader = MomentumTrader("MT", rng(0), arrival_rate_lambda=1.0, momentum_threshold=0.001, vol_k=0.0)
         for p in [90.0, 95.0, 100.0, 105.0, 110.0]:
             trader.update_price(p)
         order = trader.decide(normal_book_state(mid=110.0), tick=5)

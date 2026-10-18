@@ -128,7 +128,7 @@ class SupervisedDetector:
         return best
 
     def _tune_threshold(self, Xp: pd.DataFrame, y: np.ndarray, groups: np.ndarray, spw: float,
-                        previous: float | None = None, kept: int = 0) -> float:
+                        previous: float | None = None, kept: int = 0, sample_weight: np.ndarray | None = None) -> float:
         pos_groups = np.unique(groups[y == 1])
         n_splits = min(self.cv_folds, len(np.unique(groups)))
         if len(pos_groups) < 2 or n_splits < 2:
@@ -138,7 +138,7 @@ class SupervisedDetector:
             if y[tr_idx].sum() == 0 or y[tr_idx].sum() == len(tr_idx):
                 continue
             m = self._make_model(spw, len(tr_idx))
-            m.fit(Xp.iloc[tr_idx], y[tr_idx])
+            m.fit(Xp.iloc[tr_idx], y[tr_idx], sample_weight=None if sample_weight is None else sample_weight[tr_idx])
             oof[va_idx] = m.predict_proba(Xp.iloc[va_idx])[:, 1]
         ok = ~np.isnan(oof)
         if ok.sum() == 0 or y[ok].sum() == 0:
@@ -151,9 +151,11 @@ class SupervisedDetector:
                     float(np.interp(best, grid, scores)), max(scores))
         return best
 
-    def fit(self, X: pd.DataFrame, y: pd.DataFrame) -> None:
+    def fit(self, X: pd.DataFrame, y: pd.DataFrame, sample_weight: np.ndarray | None = None) -> None:
         """
-        Train one classifier per persona.
+        Train one classifier per persona. `sample_weight` (optional, one per row) lets
+        training keep earlier patterns in view, e.g. weighting the baseline round up so
+        later adversarial rounds do not crowd out what it taught (see orchestrator).
 
         Raises:
             InsufficientLabelsError: if require_all_personas is set and a persona
@@ -183,10 +185,10 @@ class SupervisedDetector:
             spw = n_neg / n_pos
             logger.info("[%s] training on %d rows (%d positive, scale_pos_weight=%.1f)", persona, len(target), n_pos, spw)
             prev, kept = previous.get(persona), self._kept_rounds.get(persona, 0)
-            self.thresholds[persona] = self._tune_threshold(Xm, target, groups, spw, prev, kept)
+            self.thresholds[persona] = self._tune_threshold(Xm, target, groups, spw, prev, kept, sample_weight)
             self._kept_rounds[persona] = kept + 1 if prev is not None and self.thresholds[persona] == prev else 0
             model = self._make_model(spw, len(target))
-            model.fit(Xm, target)
+            model.fit(Xm, target, sample_weight=sample_weight)
             self.models[persona] = model
 
     def is_trained(self) -> bool:

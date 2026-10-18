@@ -30,7 +30,9 @@ Trader-level behavioural features, grouped by the persona they target:
                side while executing on the other — the Coscia/Sarao signature)
   Wash trading reciprocal_ratio (volume traded back and forth with the same
                counterparty), top_cpty_share, net_flatness, price_dev_bp,
-               trade_size_cv
+               trade_size_cv; and for rings that rotate wash trades over several
+               accounts (where pairwise features fade): mutual_cpty_share,
+               ring_size, ring_volume_share (see _add_ring_features)
   Pump & dump  exec_side_imbalance, aggressor_ratio, signed_flow_return
                (own buying while the price rises), reversal_score (net buyer in
                prior windows, net seller now), long_net_ratio (~12-minute
@@ -72,8 +74,36 @@ SELF_Z_COLUMNS = [
     "avg_order_size_rel", "max_order_size_rel", "large_order_share", "cancel_ratio",
     "fast_cancel_ratio", "n_orders", "gross_volume_share", "layered_order_share",
 ]
-SELF_Z_MIN_HISTORY = 5          # past active windows needed before a self z-score is reported
-SELF_Z_SCALE_FLOOR = {"n_orders": 2.0, "avg_order_size_rel": 0.5, "max_order_size_rel": 0.5}
+# Bumped whenever feature definitions change, so cached features.parquet files are recomputed.
+FEATURE_VERSION = 3
+SELF_Z_MIN_HISTORY = 10         # past active windows (5 min) needed before a self z-score is reported
+# Minimum scales: a sparse account's history barely varies, so tiny changes became huge z-scores
+# (cancel_ratio drove most alerts on manipulator accounts outside their episodes).
+SELF_Z_SCALE_FLOOR = {"n_orders": 2.0, "avg_order_size_rel": 0.5, "max_order_size_rel": 0.5,
+                      "cancel_ratio": 0.10, "fast_cancel_ratio": 0.10, "large_order_share": 0.10,
+                      "layered_order_share": 0.10, "gross_volume_share": 0.02}
+# Past windows that were themselves this unusual (first pass, any self-z column) are left out of
+# the account's baseline, so a burst of abnormal behaviour does not distort what "normal" means
+# for the account afterwards. Uses no labels: only the account's own earlier deviations.
+SELF_Z_TRIM = 4.0
+SELF_Z_TRIM_PASSES = 4
+# Evidence weighting: a self z-score is scaled by n / (n + K), n = orders the account placed in the
+# window. Two orders say little about a cancel ratio; fifty say a lot. Without it, sparse but
+# innocent accounts (occasional traders) collected alerts from noise. 0 turns it off. n_orders' own
+# z-score is not scaled (it IS the count).
+SELF_Z_EVIDENCE_K = 5.0
+# activity_vs_history baseline: trimmed median of the account's earlier activity (same iterative
+# cleaning as the self z-scores) instead of the plain mean, which a single long burst (a pump with a
+# dozen accounts) inflated for the rest of the session, so normal trading afterwards looked like a
+# collapse in activity and drew pump-and-dump alerts. False = the old mean.
+ACTIVITY_ROBUST = True
+ACTIVITY_TRIM_LOG = 1.5           # a window more than e^1.5 (~4.5x) above/below the baseline is unusual
+# Wash rings: a pair is "mutual" when each side is at least MUTUAL_MIN_SHARE of the other's traded
+# volume in the window and they traded at least RING_MIN_PAIR_SIZES x the median order size together.
+# Ring partners are mutually important; a trader and a big market maker or HFT are not.
+MUTUAL_MIN_SHARE = 0.10
+RING_MIN_PAIR_SIZES = 2.0
+RING_COLUMNS = ["mutual_cpty_share", "ring_size", "ring_volume_share"]
 MARKET_CONTEXT_COLUMNS = [
     "mkt_return_bp", "mkt_volatility_bp", "mkt_range_bp", "mkt_volume_spike",
     "mkt_trade_imbalance", "mkt_order_imbalance", "mkt_cancel_ratio", "mkt_abnormal_return_z",
@@ -370,6 +400,7 @@ class FeatureEngine:
         tw[["top_pair", "recip", "n_cpty"]] = tw[["top_pair", "recip", "n_cpty"]].fillna(0.0)
 
         feats = self._trader_features(tw, median_size)
+        feats = self._add_ring_features(feats, pair_win, median_size)
         feats = self._add_temporal(feats)
         feats = feats.merge(market[["win", *MARKET_CONTEXT_COLUMNS, "mkt_volume"]], on="win", how="left")
         feats["gross_volume_share"] = _safe_div(feats["exec_vol"], feats["mkt_volume"])
@@ -463,6 +494,75 @@ class FeatureEngine:
         f["net_qty"] = tw["exec_buy"] - tw["exec_sell"]
         return f
 
+    def _add_ring_features(self, f: pd.DataFrame, pair_win: pd.DataFrame, median_size: float) -> pd.DataFrame:
+        """
+        Wash-ring features per (window, account), from volume traded with each counterparty:
+          mutual_cpty_share  share of the account's volume with MUTUAL partners (each side at least
+                             MUTUAL_MIN_SHARE of the other's volume, pair volume >= RING_MIN_PAIR_SIZES
+                             x median order size)
+          ring_size          accounts in the connected group of mutual partners (1 = none)
+          ring_volume_share  share of the account's volume traded inside that group
+        Pairwise features (reciprocal_ratio, top_cpty_share) fade when washing rotates around a ring
+        of five or six accounts; the group stays visible.
+        """
+        for c in RING_COLUMNS:
+            f[c] = 1.0 if c == "ring_size" else 0.0
+        if pair_win is None or pair_win.empty:
+            return f
+        pw = pair_win[["win", "trader_id", "cpty", "bought", "sold"]].copy()
+        excl = tuple(self.exclude_prefixes)
+        pw = pw[~pw["trader_id"].astype(str).str.startswith(excl) & ~pw["cpty"].astype(str).str.startswith(excl)]
+        if pw.empty:
+            return f
+        pw["gross"] = pw["bought"] + pw["sold"]
+        vol = pw.groupby(["win", "trader_id"])["gross"].transform("sum")
+        pw["share"] = _safe_div(pw["gross"], vol)
+        rev = pw[["win", "trader_id", "cpty", "share"]].rename(columns={"trader_id": "cpty", "cpty": "trader_id", "share": "share_rev"})
+        pw = pw.merge(rev, on=["win", "trader_id", "cpty"], how="left")
+        pw["mutual"] = (pw["share"] >= MUTUAL_MIN_SHARE) & (pw["share_rev"].fillna(0) >= MUTUAL_MIN_SHARE) \
+            & (pw["gross"] >= RING_MIN_PAIR_SIZES * median_size)
+        mutual_share = pw.loc[pw["mutual"]].groupby(["win", "trader_id"])["share"].sum()
+
+        # Connected groups of mutual partners, per window (union-find over the few mutual edges)
+        edges = pw.loc[pw["mutual"], ["win", "trader_id", "cpty"]]
+        comp: dict[tuple, tuple] = {}
+        for win, g in edges.groupby("win"):
+            parent: dict[str, str] = {}
+
+            def find(x):
+                while parent.setdefault(x, x) != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            for a, b in zip(g["trader_id"], g["cpty"]):
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[ra] = rb
+            members: dict[str, list] = {}
+            for x in list(parent):
+                members.setdefault(find(x), []).append(x)
+            for root, ms in members.items():
+                for x in ms:
+                    comp[(win, x)] = (root, len(ms))
+        if comp:
+            cdf = pd.DataFrame([(w, t, root, n) for (w, t), (root, n) in comp.items()],
+                               columns=["win", "trader_id", "ring", "ring_size"])
+            pw = pw.merge(cdf[["win", "trader_id", "ring"]], on=["win", "trader_id"], how="left")
+            pw = pw.merge(cdf[["win", "trader_id", "ring"]].rename(columns={"trader_id": "cpty", "ring": "ring_cpty"}),
+                          on=["win", "cpty"], how="left")
+            inside = pw["ring"].notna() & (pw["ring"] == pw["ring_cpty"])
+            ring_share = pw.loc[inside].groupby(["win", "trader_id"])["share"].sum()
+            sizes = cdf.set_index(["win", "trader_id"])["ring_size"]
+        else:
+            ring_share = pd.Series(dtype=float)
+            sizes = pd.Series(dtype=float)
+        key = pd.MultiIndex.from_frame(f[["win", "trader_id"]])
+        f["mutual_cpty_share"] = mutual_share.reindex(key).fillna(0.0).clip(0, 1).to_numpy()
+        f["ring_volume_share"] = ring_share.reindex(key).fillna(0.0).clip(0, 1).to_numpy()
+        f["ring_size"] = sizes.reindex(key).fillna(1.0).to_numpy()
+        return f
+
     def _add_temporal(self, f: pd.DataFrame) -> pd.DataFrame:
         """Per-account history: position build-up/reversal and activity change."""
         W = self.n_steps
@@ -479,7 +579,20 @@ class FeatureEngine:
         long_net = net + net.shift(W).fillna(0) + net.shift(2 * W).fillna(0) + net.shift(3 * W).fillna(0)
         long_gross = gross + gross.shift(W).fillna(0) + gross.shift(2 * W).fillna(0) + gross.shift(3 * W).fillna(0)
         long_ratio = pd.DataFrame(_safe_div(long_net, long_gross), index=net.index, columns=net.columns)
-        hist = activity.shift(W).expanding().mean().fillna(0.0)
+        if ACTIVITY_ROBUST:
+            # Trimmed median: windows far from the account's (cleaned) baseline leave it, iteratively.
+            la = np.log1p(activity)
+            keep = None
+            for _ in range(SELF_Z_TRIM_PASSES):
+                base = activity if keep is None else activity.where(keep)
+                hist = base.shift(W).expanding().median()
+                new_keep = ~((la - np.log1p(hist)).abs() > ACTIVITY_TRIM_LOG)
+                if keep is not None and new_keep.equals(keep):
+                    break
+                keep = new_keep
+            hist = hist.fillna(0.0)
+        else:
+            hist = activity.shift(W).expanding().mean().fillna(0.0)
         act_change = np.log1p(activity) - np.log1p(hist)
 
         stack = lambda df, name: df.stack().rename(name)  # noqa: E731
@@ -507,19 +620,46 @@ class FeatureEngine:
         Robust z-score of each account against its own history: median and IQR of its
         values in earlier windows that do not overlap the current one (shifted by one
         full window length). 0 until SELF_Z_MIN_HISTORY past active windows exist.
+
+        Two passes: the first marks windows where the account deviated strongly from its
+        own history on any column (|z| >= SELF_Z_TRIM); the second recomputes the baseline
+        without those windows. Each window is still scored; it just stops counting as
+        "normal" for later windows.
         """
         W = self.n_steps
         grid_wins = np.arange(f["win"].min(), f["win"].max() + 1)
-        out = []
-        for col in SELF_Z_COLUMNS:
-            grid = f.pivot_table(index="win", columns="trader_id", values=col, aggfunc="first").reindex(grid_wins)
-            past = grid.shift(W)
-            exp = past.expanding(min_periods=SELF_Z_MIN_HISTORY)
+        grids = {col: f.pivot_table(index="win", columns="trader_id", values=col, aggfunc="first").reindex(grid_wins)
+                 for col in SELF_Z_COLUMNS}
+
+        def zscores(col: str, keep: pd.DataFrame | None) -> pd.DataFrame:
+            grid = grids[col]
+            base = grid if keep is None else grid.where(keep.reindex_like(grid).fillna(True).astype(bool))
+            exp = base.shift(W).expanding(min_periods=SELF_Z_MIN_HISTORY)
             med = exp.median()
             iqr = exp.quantile(0.75) - exp.quantile(0.25)
-            floor = SELF_Z_SCALE_FLOOR.get(col, 0.05)
-            scale = np.maximum(iqr / 1.349, floor)
-            z = ((grid - med) / scale).clip(-20, 20)
+            scale = np.maximum(iqr / 1.349, SELF_Z_SCALE_FLOOR.get(col, 0.05))
+            return ((grid - med) / scale).clip(-20, 20)
+
+        # Iterate: each pass judges windows against the baseline cleaned by the previous one.
+        # A single pass is not enough for a long burst: once its first windows enter the
+        # history, later ones stop looking unusual and the burst absorbs itself.
+        keep = None
+        for _ in range(SELF_Z_TRIM_PASSES):
+            zs = [zscores(col, keep).abs() for col in SELF_Z_COLUMNS]
+            unusual = zs[0].ge(SELF_Z_TRIM)
+            for z1 in zs[1:]:
+                unusual = unusual | z1.reindex_like(unusual).ge(SELF_Z_TRIM)
+            new_keep = ~unusual
+            if keep is not None and new_keep.equals(keep):
+                break
+            keep = new_keep
+        out = []
+        n_orders = f.pivot_table(index="win", columns="trader_id", values="n_orders", aggfunc="first").reindex(grid_wins)
+        weight = (n_orders / (n_orders + SELF_Z_EVIDENCE_K)) if SELF_Z_EVIDENCE_K > 0 else None
+        for col in SELF_Z_COLUMNS:
+            z = zscores(col, keep)
+            if weight is not None and col != "n_orders":
+                z = z * weight.reindex_like(z).fillna(0.0)
             s = z.stack(future_stack=True).rename(f"self_z_{col}")
             out.append(s)
         sz = pd.concat(out, axis=1)
