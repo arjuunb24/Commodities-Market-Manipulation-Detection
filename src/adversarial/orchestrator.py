@@ -64,19 +64,38 @@ PROBE_SEEDS = (9101, 9102)
 PROBE_TICKS = 6000
 
 
-def _probe_market(args) -> str:
-    """Process-pool worker: simulate one probe market with the given persona config and write it."""
+def _probe_market(args) -> tuple[str, pd.DataFrame, pd.DataFrame]:
+    """
+    Process-pool worker: simulate one probe market with the given persona config, write it,
+    cache its features (when `detector_config` is given) and measure its episodes' effect.
+    Doing the feature and effect work here runs it in parallel across markets.
+    """
     import logging as _lg, warnings as _w
     _w.filterwarnings("ignore"); _lg.disable(_lg.WARNING)
     from src.core.calibration import CalibrationEngine
     from src.core.persona_params import apply_persona_config
     from src.core.simulation import SimConfig, run_simulation
-    active, commodity, seed, ticks, out_dir = args
+    active, commodity, seed, ticks, out_dir, detector_config = args
     ou, _ = CalibrationEngine().get_fallback(commodity)
     cfg = SimConfig(commodity=commodity, fundamental_value_drift=ou.drift, fundamental_value_vol=ou.volatility,
                     n_ticks=ticks, data_dir=Path(out_dir), overwrite=True, write_to_disk=True)
     apply_persona_config(cfg, active)
-    return str(run_simulation(cfg, seed).run_dir)
+    run_dir = Path(run_simulation(cfg, seed).run_dir)
+    if detector_config is not None:
+        DetectorPipeline(detector_config).load_and_preprocess(run_dir)   # writes the features cache
+    ev = pd.read_parquet(run_dir / "manipulation_events.parquet")
+    eff = episode_effectiveness(ev, pd.read_parquet(run_dir / "trade_log.parquet"),
+                                pd.read_parquet(run_dir / "order_log.parquet"))
+    return str(run_dir), ev, eff
+
+
+def _cache_features(args) -> str:
+    """Process-pool worker: compute and cache one market's features/labels (read back from the cache)."""
+    import logging as _lg, warnings as _w
+    _w.filterwarnings("ignore"); _lg.disable(_lg.WARNING)
+    detector_config, run_dir = args
+    DetectorPipeline(detector_config).load_and_preprocess(Path(run_dir))
+    return run_dir
 
 
 class RoundOrchestrator:
@@ -97,7 +116,7 @@ class RoundOrchestrator:
         detector_config: dict[str, Any],
         sim_ticks: int = 5000,
         sim_seed: int = 42,
-        commodity: str = "crude_oil_wti",
+        commodity: str = "all",
         n_test_markets: int = 2,
         persona_config_path: Path | None = None,
     ) -> None:
@@ -113,6 +132,11 @@ class RoundOrchestrator:
 
         self.pipeline = DetectorPipeline(detector_config)
         self.personas = detector_config.get("personas", ["spoofing", "wash_trading", "pump_and_dump"])
+        loop = detector_config.get("loop", {}) or {}
+        self.feature_workers = max(1, int(loop.get("feature_workers", 3)))   # parallel feature extraction (round markets)
+        self.probe_workers = max(1, int(loop.get("probe_workers", 8)))       # parallel probe markets
+        self.replay_check_every = max(1, int(loop.get("replay_check_every", 1)))
+        self.last_round: int | None = None   # set by the driver so the final round always runs the replay check
 
         # Cumulative metrics list — grows each round
         self._all_metrics: list[dict] = []
@@ -139,6 +163,7 @@ class RoundOrchestrator:
         same short markets (PROBE_COMMODITIES x PROBE_SEEDS, PROBE_TICKS ticks; common
         random numbers, so candidates differ only by their parameters) and returns, per
         persona, any-alert coverage, effect ratio vs. round 0 and the mutation score.
+        `round_num` is the last COMPLETED round (its metrics.json anchors the effect estimate).
         """
         import yaml
         if not self.pipeline.is_trained:
@@ -159,19 +184,24 @@ class RoundOrchestrator:
         real = json.loads((self.master_run_dir / f"round_{round_num}" / "metrics.json").read_text()) \
             if round_num is not None and (self.master_run_dir / f"round_{round_num}" / "metrics.json").exists() else {}
         real_ratio, ref_params = real.get("effectiveness_ratio") or {}, real.get("params_used") or {}
-        ref_eff: dict = {}
+        # The reference and every candidate are simulated in ONE process pool (one batch of
+        # markets instead of a pool per set, with features computed in the workers).
+        specs = []
         if real_ratio and ref_params:
             ref_active = {p: dict(v) for p, v in base_active.items()}
             for p in set().union(*configs) if configs else ():
                 if p in ref_params:
                     ref_active[p] = {**ref_active.get(p, {}), **ref_params[p]}
-            _, _, _, ref_eff = self._simulate_probe_set(ref_active, root / "reference", features=False)
-        out: list[dict[str, dict]] = []
+            specs.append((ref_active, root / "reference", False))
         for k, overrides in enumerate(configs):
             active = {p: dict(v) for p, v in base_active.items()}
             for p, params in overrides.items():
                 active[p] = {**active.get(p, {}), **params}
-            X, y, ev, eff = self._simulate_probe_set(active, root / f"cand{k}")
+            specs.append((active, root / f"cand{k}", True))
+        sets = self._simulate_probe_sets(specs)
+        ref_eff: dict = sets.pop(0)[3] if len(sets) > len(configs) else {}
+        out: list[dict[str, dict]] = []
+        for k, (overrides, (X, y, ev, eff)) in enumerate(zip(configs, sets)):
             met = compute_round_metrics(self.pipeline.score(X), y, self.personas, events=ev)
             res = {}
             for p in overrides:
@@ -198,21 +228,38 @@ class RoundOrchestrator:
 
     def _simulate_probe_set(self, active: dict, root: Path, features: bool = True):
         """Simulate the probe markets under `active`; returns (X, y, events, summarised effect)."""
+        return self._simulate_probe_sets([(active, root, features)])[0]
+
+    def _simulate_probe_sets(self, specs: list[tuple[dict, Path, bool]]) -> list[tuple]:
+        """
+        Simulate the probe markets for several (active, root, features) sets in one process
+        pool; returns one (X, y, events, summarised effect) per set, in order.
+        """
         from concurrent.futures import ProcessPoolExecutor
-        jobs = [(active, c, s, PROBE_TICKS, str(root / f"{c}_{s}")) for c in PROBE_COMMODITIES for s in PROBE_SEEDS]
-        with ProcessPoolExecutor(min(len(jobs), 8)) as ex:
-            dirs = list(ex.map(_probe_market, jobs))
-        Xs, Ys, Es, effs = [], [], [], []
-        for d in dirs:
-            if features:
-                X, y = self.pipeline.load_and_preprocess(Path(d))
-                Xs.append(X); Ys.append(y)
-            ev = pd.read_parquet(Path(d) / "manipulation_events.parquet"); Es.append(ev)
-            effs.append(episode_effectiveness(ev, pd.read_parquet(Path(d) / "trade_log.parquet"),
-                                              pd.read_parquet(Path(d) / "order_log.parquet")))
-        X = pd.concat(Xs) if Xs else None
-        y = pd.concat(Ys) if Ys else None
-        return X, y, pd.concat(Es, ignore_index=True), summarize(pd.concat(effs, ignore_index=True))
+        jobs, owner = [], []
+        for i, (active, root, features) in enumerate(specs):
+            for c in PROBE_COMMODITIES:
+                for s in PROBE_SEEDS:
+                    jobs.append((active, c, s, PROBE_TICKS, str(Path(root) / f"{c}_{s}"),
+                                 self.detector_config if features else None))
+                    owner.append(i)
+        if not jobs:
+            return []
+        with ProcessPoolExecutor(min(len(jobs), self.probe_workers)) as ex:
+            done = list(ex.map(_probe_market, jobs))
+        out = []
+        for i, (_, _, features) in enumerate(specs):
+            Xs, Ys, Es, effs = [], [], [], []
+            for (d, ev, eff), o in zip(done, owner):
+                if o != i:
+                    continue
+                if features:
+                    X, y = self.pipeline.load_and_preprocess(Path(d))   # cache written by the worker
+                    Xs.append(X); Ys.append(y)
+                Es.append(ev); effs.append(eff)
+            out.append((pd.concat(Xs) if Xs else None, pd.concat(Ys) if Ys else None,
+                        pd.concat(Es, ignore_index=True), summarize(pd.concat(effs, ignore_index=True))))
+        return out
 
     def _probe_baseline(self, base_active: dict, root: Path) -> dict:
         """
@@ -290,6 +337,7 @@ class RoundOrchestrator:
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as executor:
             for f in [executor.submit(self._run_simulation, *job) for job in jobs]:
                 f.result()
+        self._cache_features([*test_dirs, train_dir])
 
         X_parts, y_parts, ev_parts, eff_parts, tr_parts = [], [], [], [], []
         per_market = []   # (market name, row index, labels, events, per-episode effect) for by-market metrics
@@ -379,7 +427,7 @@ class RoundOrchestrator:
             },
         )
         self._save_models(round_num, round_dir)
-        replay_check = self._replay_check(round_num)
+        replay_check = self._replay_check(round_num) if self._replay_check_due(round_num) else {}
         if replay_check:
             with open(round_dir / "replay_check.json", "w") as f:
                 json.dump(replay_check, f, indent=2)
@@ -389,6 +437,15 @@ class RoundOrchestrator:
         self._all_metrics.append(entry)
         self._save_cumulative_metrics()
         return post_metrics
+
+    def _cache_features(self, dirs: list[Path]) -> None:
+        """Compute the round markets' features in parallel worker processes (load_and_preprocess then hits the cache)."""
+        if self.feature_workers <= 1 or len(dirs) <= 1:
+            return
+        from concurrent.futures import ProcessPoolExecutor
+        logger.info("Computing features for %d markets (%d workers)...", len(dirs), self.feature_workers)
+        with ProcessPoolExecutor(min(len(dirs), self.feature_workers)) as ex:
+            list(ex.map(_cache_features, [(self.detector_config, str(d)) for d in dirs]))
 
     def _replay_markets(self, block: str) -> list[Path]:
         """Replay markets (simulated once, cached) for detector_config[block] = {cases, seeds, ticks}."""
@@ -418,6 +475,10 @@ class RoundOrchestrator:
             if self._aug_cache:
                 logger.info("Replay augmentation: %d labelled real-case markets added to training", len(self._aug_cache))
         return self._aug_cache
+
+    def _replay_check_due(self, round_num: int) -> bool:
+        """Round 0, every `replay_check_every`-th round and the final round (when the driver set it)."""
+        return round_num == 0 or round_num % self.replay_check_every == 0 or round_num == self.last_round
 
     def _replay_check(self, round_num: int) -> dict:
         """

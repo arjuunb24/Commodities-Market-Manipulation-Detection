@@ -63,10 +63,17 @@ class _PercentileForest:
         self.columns: list[str] = []
         self._train_scores: np.ndarray = np.array([])
 
+    # Percentile calibration uses at most this many training rows: scoring all 2M+ cumulative
+    # rows took a minute per retrain, and 300k rows put the 99th percentile within ~0.02 points.
+    max_calibration_rows = 300_000
+
     def fit(self, X: pd.DataFrame, columns: list[str]) -> None:
         self.columns = columns
         Z = self.scaler.fit_transform(X[columns].to_numpy(dtype=float))
         self.model.fit(Z)
+        if len(Z) > self.max_calibration_rows:
+            rng = np.random.default_rng(0)
+            Z = Z[rng.choice(len(Z), self.max_calibration_rows, replace=False)]
         self._train_scores = np.sort(-self.model.score_samples(Z))
 
     def transform(self, X: pd.DataFrame) -> np.ndarray:
@@ -141,9 +148,11 @@ class MarketAnomalyDetector:
 
     @staticmethod
     def _windows(X: pd.DataFrame) -> pd.DataFrame:
+        """One row per market window. Deduplicated on the market VALUES, not on (commodity,
+        window_start): cumulative training stacks markets whose keys repeat, and key-based
+        dedup kept only the first market's windows."""
         cols = market_columns(X)
-        keys = [n for n in ("commodity", "window_start") if n in X.index.names]
-        return X[cols].reset_index().drop_duplicates(keys).set_index(keys)[cols]
+        return X.loc[~pd.util.hash_pandas_object(X[cols], index=False).duplicated().to_numpy(), cols]
 
     def fit(self, X: pd.DataFrame) -> None:
         cols = market_columns(X)
@@ -157,7 +166,14 @@ class MarketAnomalyDetector:
         """Per-row market-regime anomaly percentile (rows of the same window share it)."""
         if not self.is_fitted:
             return pd.Series(0.0, index=X.index, name="mkt_anomaly_score")
-        return pd.Series(self._forest.percentile(X), index=X.index, name="mkt_anomaly_score")
+        # Market features are identical for every account in a window: score each distinct row of
+        # market values once. Distinct VALUES, not (commodity, window_start) keys: cumulative
+        # training stacks many markets whose keys repeat (replay markets all start at tick 0).
+        cols = self._forest.columns
+        codes, _ = pd.factorize(pd.util.hash_pandas_object(X[cols], index=False))
+        rep = pd.Series(np.arange(len(X))).groupby(codes).first().to_numpy()
+        per_row = self._forest.percentile(X.iloc[rep])
+        return pd.Series(per_row[codes], index=X.index, name="mkt_anomaly_score")
 
 
 def _top_abs(d: dict[str, float], n: int) -> dict[str, float]:

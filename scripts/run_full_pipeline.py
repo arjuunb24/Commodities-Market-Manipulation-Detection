@@ -176,7 +176,9 @@ def main():
     parser.add_argument("--rounds",    type=int, default=3,               help="Number of adversarial rounds (including baseline Round 0)")
     parser.add_argument("--ticks",     type=int, default=5000,            help="Simulation ticks per round")
     parser.add_argument("--seed",      type=int, default=42,              help="Random seed for simulation")
-    parser.add_argument("--commodity", type=str, default="crude_oil_wti", help="Commodity to simulate")
+    parser.add_argument("--commodity", type=str, default="all",
+                        help="'all' (default: all 8 commodities per market) or one commodity, e.g. crude_oil_wti "
+                             "(1/8 of the episodes per round; run seed314 got 4 per persona and an undertrained detector)")
     parser.add_argument("--persona",   type=str, default="all",           help="Persona to target for adversarial mutation (or 'all' for all enabled personas)")
     parser.add_argument("--mutations", choices=["llm", "hand"], default="llm",
                         help="llm = Adversarial Strategist (falls back to the hand-authored library on failure); "
@@ -235,6 +237,7 @@ def main():
         commodity=args.commodity,
         n_test_markets=args.test_markets,
     )
+    orchestrator.last_round = args.rounds - 1   # the final round always runs the replay check
 
     # Initialise LLM strategist (uses real disk reads via ToolRegistry)
     strategist = AdversarialStrategist(
@@ -280,9 +283,12 @@ def main():
                                 result["reasoning"][p] = (result["reasoning"].get(p, "") + f"\n[effect guard] reverted {rev}").strip()
                     else:
                         # Candidates are scored against the detector trained at the end of the previous
-                        # round, i.e. exactly the detector that will be frozen for this round.
+                        # round, i.e. exactly the detector that will be frozen for this round. probe()
+                        # anchors effects on the last COMPLETED round (round_num - 1): passing this
+                        # round's number read a metrics.json that does not exist yet, so the anchored
+                        # estimate was never used.
                         strategist.probe_fn = None if args.no_probe else (
-                            lambda cfgs, _r=round_num: orchestrator.probe(cfgs, round_num=_r))
+                            lambda cfgs, _r=round_num - 1: orchestrator.probe(cfgs, round_num=_r))
                         result = strategist.run_strategist_round(
                             round_num=round_num - 1,  # Strategist reads the PREVIOUS round's metrics
                             personas=personas_to_mutate,

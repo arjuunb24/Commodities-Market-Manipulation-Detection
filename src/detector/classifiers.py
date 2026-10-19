@@ -67,6 +67,12 @@ class SupervisedDetector:
         self.threshold_plateau_tol = float(sup.get("threshold_plateau_tol", 0.005))
         self.threshold_keep_tol = float(sup.get("threshold_keep_tol", 0.01))
         self.threshold_max_keep = int(sup.get("threshold_max_keep", 2))
+        # Negative subsampling (all positives kept, negatives re-weighted by 1/fraction so the class
+        # balance and the F1 counts stay unbiased). ~99% of rows are negatives and the cumulative
+        # training set reaches 2M+ rows, so this is where retraining time goes.
+        self.cv_negative_fraction = float(sup.get("cv_negative_fraction", 1.0))   # threshold-tuning folds
+        self.negative_fraction = float(sup.get("negative_fraction", 1.0))         # final models
+        self.subsample_min_rows = int(sup.get("subsample_min_rows", 50_000))      # smaller sets: never subsampled
         self._kept_rounds: dict[str, int] = {}   # consecutive retrains each persona's threshold was kept
         self.default_threshold = float(config.get("ensemble", {}).get("supervised_threshold", 0.5))
         self.models: dict[str, Any] = {}
@@ -127,8 +133,20 @@ class SupervisedDetector:
                 return float(previous)
         return best
 
+    def _negative_subsample(self, y: np.ndarray, fraction: float) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Row indices (all positives + `fraction` of negatives) and their 1/fraction weights; (None, None) = all rows."""
+        if fraction >= 1.0 or len(y) < self.subsample_min_rows:
+            return None, None
+        rng = np.random.default_rng(int(self.xgb_config.get("random_state", 42)))
+        idx = np.flatnonzero((y == 1) | (rng.random(len(y)) < fraction))
+        return idx, np.where(y[idx] == 1, 1.0, 1.0 / fraction)
+
     def _tune_threshold(self, Xp: pd.DataFrame, y: np.ndarray, groups: np.ndarray, spw: float,
                         previous: float | None = None, kept: int = 0, sample_weight: np.ndarray | None = None) -> float:
+        idx, eval_w = self._negative_subsample(y, self.cv_negative_fraction)
+        if idx is not None:
+            Xp, y, groups = Xp.iloc[idx], y[idx], groups[idx]
+            sample_weight = eval_w if sample_weight is None else sample_weight[idx] * eval_w
         pos_groups = np.unique(groups[y == 1])
         n_splits = min(self.cv_folds, len(np.unique(groups)))
         if len(pos_groups) < 2 or n_splits < 2:
@@ -145,7 +163,8 @@ class SupervisedDetector:
             return self.default_threshold
         lo, hi = self.threshold_bounds
         grid = np.linspace(lo, hi, 27)
-        scores = [f1_score(y[ok], (oof[ok] >= t).astype(int), zero_division=0) for t in grid]
+        w_ok = None if eval_w is None else eval_w[ok]   # negatives count 1/fraction each, as in the full set
+        scores = [f1_score(y[ok], (oof[ok] >= t).astype(int), sample_weight=w_ok, zero_division=0) for t in grid]
         best = self._pick_threshold(grid, scores, previous, kept)
         logger.info("    tuned threshold %.2f (OOF F1 %.3f there, max %.3f)", best,
                     float(np.interp(best, grid, scores)), max(scores))
@@ -188,7 +207,12 @@ class SupervisedDetector:
             self.thresholds[persona] = self._tune_threshold(Xm, target, groups, spw, prev, kept, sample_weight)
             self._kept_rounds[persona] = kept + 1 if prev is not None and self.thresholds[persona] == prev else 0
             model = self._make_model(spw, len(target))
-            model.fit(Xm, target, sample_weight=sample_weight)
+            idx, sub_w = self._negative_subsample(target, self.negative_fraction)
+            if idx is None:
+                model.fit(Xm, target, sample_weight=sample_weight)
+            else:
+                w = sub_w if sample_weight is None else sample_weight[idx] * sub_w
+                model.fit(Xm.iloc[idx], target[idx], sample_weight=w)
             self.models[persona] = model
 
     def is_trained(self) -> bool:

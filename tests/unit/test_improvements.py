@@ -152,10 +152,67 @@ def test_exploration_candidate_spends_effect_surplus(tmp_path):
     _pnd_round(run, 1, base, 2.5, 0.2)                     # surplus: 2.5x of the round-0 effect
     tools = ToolRegistry(run_dir=run, persona_config_path=tmp_path / "none.yaml")
     strat = AdversarialStrategist({"max_tool_calls": 1}, run_dir=run, tools=tools)
-    ex = strat._exploration_candidate("pump_and_dump", base)
+    ex = strat._exploration_candidates("pump_and_dump", base, 1, 1)[0]
     # the first two effect-costing knobs move 40% towards their effect-lowering bound
     assert ex["ignition_aggression"] == pytest.approx(0.002 + 0.4 * (0.0002 - 0.002))
     assert ex["accumulation_size"] == round(150 + 0.4 * (50 - 150))
+    # already probed in an earlier round: the directed candidate goes further instead of repeating
+    import json
+    (run / "round_1" / "strategist.json").write_text(json.dumps(
+        {"personas": {"pump_and_dump": {"probe": {"candidates": [{"changes": ex, "coverage": 0.96}]}}}}))
+    again = strat._exploration_candidates("pump_and_dump", base, 2, 1)[0]
+    assert again["accumulation_size"] == round(150 + 0.6 * (50 - 150))
+
+
+def test_exploration_jumps_are_large_new_and_keep_effect_when_at_risk(tmp_path):
+    from src.agentic.adversarial_strategist import MIN_JUMP, AdversarialStrategist, _change_key
+    from src.agentic.tools import EFFECT_COST, PARAM_BOUNDS, ToolRegistry
+    run = tmp_path / "run"
+    base = {"ignition_aggression": 0.002, "accumulation_size": 500, "n_coordinated_accounts": 8, "burst_duration_ticks": 300}
+    _pnd_round(run, 0, base, 1.0, None)
+    _pnd_round(run, 1, base, 0.6, 0.05)                     # at risk: effect 0.6x
+    strat = AdversarialStrategist({"max_tool_calls": 1}, run_dir=run, tools=ToolRegistry(run_dir=run, persona_config_path=tmp_path / "x.yaml"))
+    cands = strat._exploration_candidates("pump_and_dump", base, 1, 3)
+    assert len(cands) == 3 and len({_change_key(c) for c in cands}) == 3
+    bounds, cost = PARAM_BOUNDS["pump_and_dump"], EFFECT_COST["pump_and_dump"]
+    for c in cands:
+        for k, v in c.items():
+            typ, lo, hi, _ = bounds[k]
+            cur = base.get(k, lo)
+            if not (typ is int and hi - lo == 1):
+                assert abs(v - cur) >= MIN_JUMP * (hi - lo) - 1      # a real jump, not a tweak
+            if cost.get(k) == "down":
+                assert v >= cur                                       # never in the effect-costing direction
+            elif cost.get(k) == "up":
+                assert v <= cur
+    assert cands == strat._exploration_candidates("pump_and_dump", base, 1, 3)   # seeded: reproducible
+
+
+def test_breakthroughs_stall_and_repeated_alternatives(tmp_path):
+    import json
+    from src.agentic.adversarial_strategist import AdversarialStrategist
+    from src.agentic.tools import ToolRegistry
+    run = tmp_path / "run"
+    rows = [(0, {"decoy_rate": 0.0}, None), (1, {"decoy_rate": 0.2}, 0.37), (2, {"decoy_rate": 0.3}, 0.95)]
+    for r, params, cov in rows:
+        d = run / f"round_{r}"; d.mkdir(parents=True)
+        (d / "metrics.json").write_text(json.dumps({"params_used": {"pump_and_dump": params},
+            "pre_retrain": {"pump_and_dump": {"caught_coverage": cov}} if cov is not None else {}}))
+    (run / "round_2" / "strategist.json").write_text(json.dumps({"personas": {"pump_and_dump": {"probe": {"candidates": [
+        {"changes": {"decoy_rate": 0.3}, "coverage": 0.95}, {"changes": {"stagger": 0.4}, "coverage": 0.91}]}}}}))
+    cfg = tmp_path / "persona_config.yaml"; cfg.write_text(yaml.dump({"pump_and_dump": {"decoy_rate": 0.3}}))
+    tools = ToolRegistry(run_dir=run, persona_config_path=cfg)
+    strat = AdversarialStrategist({"max_tool_calls": 1, "explore_candidates": 0, "explore_candidates_stalled": 0},
+                                  run_dir=run, tools=tools)
+    wins = strat._breakthroughs("pump_and_dump")
+    assert [(b["round"], b["changes"]) for b in wins] == [(1, {"decoy_rate": 0.2})]
+    assert "0.95" in strat._stalled(2, "pump_and_dump") and strat._stalled(1, "pump_and_dump") is None
+    # the model re-proposes {"stagger": 0.4} (probed before round 2): dropped, the new alternative is probed
+    tools.propose_mutation("pump_and_dump", {"decoy_rate": 0.35}, "r", alternatives=[{"stagger": 0.4}, {"dump_delay_ticks": 300}])
+    seen = []
+    strat.probe_fn = lambda cfgs: seen.extend(cfgs) or [{"pump_and_dump": {"score": 0.1}} for _ in cfgs]
+    strat._probe_candidates(2, ["pump_and_dump"], {"pump_and_dump": "agentic"}, {})
+    assert len(seen) == 2 and all(c["pump_and_dump"].get("stagger") != 0.4 for c in seen)
 
 
 def test_last_probe_lines_mark_failed_and_kept(tmp_path):
@@ -332,7 +389,7 @@ def test_probe_effect_is_anchored_on_last_real_round(tmp_path):
     def fake(active, root, features=True):
         e = {"layering": {"fake_depth_share": depth[active["layering"]["n_layers"]], "primary_metric": "fake_depth_share"}}
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), e
-    orch._simulate_probe_set = fake
+    orch._simulate_probe_sets = lambda specs: [fake(*s) for s in specs]   # reference + candidates in one batch
     orch.pipeline.score = lambda X: pd.DataFrame()
     import src.adversarial.orchestrator as om
     om_compute = om.compute_round_metrics
@@ -427,3 +484,40 @@ def test_account_pnl_nets_internal_trades_and_marks_inventory():
     out = account_pnl(ev, tr)["wash_trading"]
     assert out["episodes"] == 1 and out["profitable_share"] == 1.0
     assert abs(out["pnl_bp_median"] - 1000.0) < 1e-6
+
+
+def test_negative_subsample_keeps_positives_and_reweights():
+    from src.detector.classifiers import SupervisedDetector
+    det = SupervisedDetector({"personas": ["spoofing"], "supervised": {"subsample_min_rows": 1000}})
+    y = np.zeros(100_000, dtype=int); y[::100] = 1
+    idx, w = det._negative_subsample(y, 0.25)
+    assert y[idx].sum() == y.sum()                                    # every positive kept
+    assert np.all(w[y[idx] == 1] == 1.0) and np.all(w[y[idx] == 0] == 4.0)
+    assert abs(w[y[idx] == 0].sum() - (y == 0).sum()) / (y == 0).sum() < 0.02   # negatives' weight ~ full count
+    assert det._negative_subsample(y, 1.0) == (None, None)
+    assert det._negative_subsample(y[:500], 0.25) == (None, None)    # below subsample_min_rows
+
+
+def test_market_score_per_window_matches_per_row():
+    from src.detector.anomaly import MarketAnomalyDetector
+    rng = np.random.default_rng(0)
+    idx = pd.MultiIndex.from_tuples([(c, w, f"t{i}") for c in ("gold", "corn") for w in range(0, 3000, 30) for i in range(4)],
+                                    names=["commodity", "window_start", "trader_id"])
+    win = {(c, w): rng.normal(size=3) for c, w, _ in idx}
+    X = pd.DataFrame([win[(c, w)] for c, w, _ in idx], index=idx, columns=["mkt_a", "mkt_b", "mkt_c"])
+    X["ttr"] = rng.normal(size=len(X))
+    # a second market with the SAME (commodity, window_start) keys but other values (cumulative training data)
+    X2 = X.copy(); X2[["mkt_a", "mkt_b", "mkt_c"]] += rng.normal(size=(len(X2), 1))
+    X = pd.concat([X, X2])
+    md = MarketAnomalyDetector({"isolation_forest": {"n_estimators": 20}})
+    md.fit(X)
+    assert np.allclose(md.score(X).to_numpy(), md._forest.percentile(X))
+
+
+def test_replay_check_runs_on_cadence_and_final_round(tmp_path):
+    from src.adversarial.orchestrator import RoundOrchestrator
+    cfg = yaml.safe_load(open("configs/detector_config.yaml"))
+    cfg["loop"] = {"replay_check_every": 3}
+    orch = RoundOrchestrator(tmp_path / "run", cfg, persona_config_path=tmp_path / "none.yaml")
+    orch.last_round = 7
+    assert [r for r in range(8) if orch._replay_check_due(r)] == [0, 3, 6, 7]

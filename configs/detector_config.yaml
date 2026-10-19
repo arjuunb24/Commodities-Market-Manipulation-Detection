@@ -50,6 +50,12 @@ supervised:
   threshold_plateau_tol: 0.005   # thresholds within this (smoothed) OOF F1 of the best form the plateau; its centre is used
   threshold_keep_tol: 0.01       # on retrain, keep the previous threshold while its OOF F1 is within this of the best
   threshold_max_keep: 2          # ... but for at most this many retrains in a row, then re-tune
+  # Negative subsampling: all positive rows are kept, a random share of negatives is used with weight
+  # 1/fraction (unbiased class balance and F1). ~99% of the 2M+ cumulative rows are negatives; the 12
+  # threshold-tuning fits took 572 s and the 4 final fits 249 s of the round-7 retrain (run seed888).
+  cv_negative_fraction: 0.25     # threshold-tuning folds
+  negative_fraction: 1.0         # final models
+  subsample_min_rows: 50000      # smaller training sets are never subsampled
 
 # --- Ensemble Scorer ---
 ensemble:
@@ -115,3 +121,9 @@ replay_check:
 # span:     every window of the account overlapping its episode (the earlier definition).
 labels:
   mode: activity
+
+# --- Adversarial loop execution (speed only; results do not depend on these) ---
+loop:
+  feature_workers: 3      # round markets' features computed in parallel processes (~2 GB RAM each at 10,000 ticks)
+  probe_workers: 8        # probe markets (all candidate sets) simulated + featurised in one pool
+  replay_check_every: 2   # held-out replay check on round 0, every 2nd round and always the final round
