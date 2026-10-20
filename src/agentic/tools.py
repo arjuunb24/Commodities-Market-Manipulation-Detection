@@ -28,6 +28,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.core.agents.manipulation.common import BAND as NEAR_TOUCH_BAND
 from src.detector.pipeline import read_flags
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,15 @@ EFFECT_COST: dict[str, dict[str, str]] = {
     "wash_trading": {"trade_frequency": "down", "camouflage_rate": "up"},
     "pump_and_dump": {"ignition_aggression": "down", "accumulation_size": "down",
                       "n_coordinated_accounts": "down", "burst_duration_ticks": "up"},
+}
+
+# Values past which an effect-costing knob takes the scheme outside what its effect
+# metric measures, so the effect collapses instead of fading: a spoof resting further
+# than the near-touch band behind the best price adds no near-touch fake depth. Code
+# exploration stays short of these (every probed price_aggressiveness jump from 0.001
+# landed at 0.0036-0.0086 and scored effect 0.00 in rounds 1-3 of run 113045Z_seed314).
+EFFECT_CLIFF: dict[str, dict[str, float]] = {
+    "spoofing": {"price_aggressiveness": NEAR_TOUCH_BAND},
 }
 
 

@@ -188,6 +188,28 @@ def test_exploration_jumps_are_large_new_and_keep_effect_when_at_risk(tmp_path):
     assert cands == strat._exploration_candidates("pump_and_dump", base, 1, 3)   # seeded: reproducible
 
 
+def test_exploration_stays_short_of_effect_cliffs_and_lost_effect_values(tmp_path):
+    import json
+    from src.agentic.adversarial_strategist import AdversarialStrategist
+    from src.agentic.tools import EFFECT_CLIFF, ToolRegistry
+    run = tmp_path / "run"
+    base = {"ignition_aggression": 0.002, "accumulation_size": 150, "n_coordinated_accounts": 3, "burst_duration_ticks": 200}
+    _pnd_round(run, 0, base, 1.0, None)
+    _pnd_round(run, 1, base, 2.5, 0.2)                     # surplus: the directed candidate lowers ignition_aggression
+    # an earlier probe lowered ignition_aggression to 0.001 and lost the effect
+    (run / "round_1" / "strategist.json").write_text(json.dumps({"personas": {"pump_and_dump": {"probe": {"candidates": [
+        {"changes": {"ignition_aggression": 0.001, "stagger": 0.5}, "coverage": 0.9, "effect_ratio": 0.3}]}}}}))
+    strat = AdversarialStrategist({"max_tool_calls": 1}, run_dir=run, tools=ToolRegistry(run_dir=run, persona_config_path=tmp_path / "x.yaml"))
+    ign = [c["ignition_aggression"] for r in range(2, 8)
+           for c in strat._exploration_candidates("pump_and_dump", base, r, 3) if "ignition_aggression" in c]
+    assert ign and all(v > 0.001 for v in ign)              # still explored, never back at the lost value
+    cliff = EFFECT_CLIFF["spoofing"]["price_aggressiveness"]
+    spoof = [c["price_aggressiveness"] for r in range(1, 12)
+             for c in strat._exploration_candidates("spoofing", {"price_aggressiveness": 0.001}, r, 3)
+             if "price_aggressiveness" in c]
+    assert spoof and all(v < cliff for v in spoof)          # spoofs stay inside the near-touch band
+
+
 def test_breakthroughs_stall_and_repeated_alternatives(tmp_path):
     import json
     from src.agentic.adversarial_strategist import AdversarialStrategist

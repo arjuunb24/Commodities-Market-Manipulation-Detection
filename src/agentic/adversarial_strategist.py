@@ -471,9 +471,13 @@ class AdversarialStrategist:
         effect-keeping direction. Change sets already probed in this run (or in `avoid`)
         are never repeated - the single deterministic candidate used before was probed
         unchanged in up to three consecutive rounds.
+        Effect-costing knobs also stay short of their EFFECT_CLIFF and of any value at which
+        an earlier probe in this run lost the effect (ratio below EFFECTIVENESS_FLOOR), and
+        MIN_JUMP is measured on that usable range.
         """
         import numpy as np
-        from src.agentic.tools import EFFECT_COST, PARAM_BOUNDS, validate_mutation
+        from src.adversarial.effectiveness import EFFECTIVENESS_FLOOR
+        from src.agentic.tools import EFFECT_CLIFF, EFFECT_COST, PARAM_BOUNDS, validate_mutation
         bounds = PARAM_BOUNDS.get(persona, {})
         if not bounds or n <= 0:
             return []
@@ -481,8 +485,33 @@ class AdversarialStrategist:
         status = self.tools.effect_status(persona).get("status")
         protect = status in ("at_risk", "failed")
         rng = np.random.default_rng([max(0, int(round_num)), sorted(PARAM_BOUNDS).index(persona)])
-        seen = [_change_key(h["changes"]) for h in self._probed_history(persona)] + [_change_key(c) for c in avoid]
+        history = self._probed_history(persona)
+        seen = [_change_key(h["changes"]) for h in history] + [_change_key(c) for c in avoid]
         out: list[dict] = []
+
+        # Limits in each effect-costing knob's costing direction: the known cliff, and every
+        # value a probe that lost the effect moved it to (a set changing two such knobs blames both).
+        limits: dict[str, list[float]] = {k: [v] for k, v in EFFECT_CLIFF.get(persona, {}).items()}
+        for h in history:
+            if h.get("effect_ratio") is not None and h["effect_ratio"] < EFFECTIVENESS_FLOOR:
+                for k, v in h["changes"].items():
+                    if k in cost and isinstance(v, (int, float)):
+                        limits.setdefault(k, []).append(float(v))
+
+        def usable(knob: str) -> tuple[float, float]:
+            """(lo, hi) for `knob`: its bounds, kept 20% short of the nearest limit past the current value."""
+            typ, lo, hi, _ = bounds[knob]
+            cur = current.get(knob, lo)
+            d = cost.get(knob)
+            if d == "up":
+                past = [v for v in limits.get(knob, ()) if v > cur]
+                if past:
+                    hi = min(hi, (min(past) - 1) if typ is int else cur + 0.8 * (min(past) - cur))
+            elif d == "down":
+                past = [v for v in limits.get(knob, ()) if v < cur]
+                if past:
+                    lo = max(lo, (max(past) + 1) if typ is int else cur - 0.8 * (cur - max(past)))
+            return lo, hi
 
         def accept(change: dict) -> bool:
             change = {k: v for k, v in change.items() if v is not None and current.get(k) != v}
@@ -495,8 +524,11 @@ class AdversarialStrategist:
             return True
 
         def jump(knob: str):
-            typ, lo, hi, _ = bounds[knob]
-            cur = current.get(knob, lo)
+            typ = bounds[knob][0]
+            lo, hi = usable(knob)
+            cur = current.get(knob, bounds[knob][1])
+            if hi <= lo:
+                return None                                         # no room left short of a limit
             if typ is int and hi - lo == 1:
                 return hi if cur == lo else lo                      # binary: switch it
             a, b = lo, hi
@@ -515,8 +547,9 @@ class AdversarialStrategist:
             for frac in (0.4, 0.6, 0.8):
                 change = {}
                 for knob, direction in list(cost.items())[:2]:
-                    typ, lo, hi, _ = bounds[knob]
-                    cur = current.get(knob, lo)
+                    typ = bounds[knob][0]
+                    lo, hi = usable(knob)
+                    cur = current.get(knob, bounds[knob][1])
                     val = cur + frac * ((lo if direction == "down" else hi) - cur)
                     change[knob] = typ(round(val)) if typ is int else round(float(val), 6)
                 if accept(change):
