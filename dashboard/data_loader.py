@@ -220,7 +220,7 @@ def load_cumulative_metrics(run_dir_str: str, phase: str | None = "post") -> pd.
             if d.is_dir() and d.name.startswith("round_") and (d / "metrics.json").exists():
                 data = json.loads((d / "metrics.json").read_text())
                 rnd = int(d.name.split("_")[1])
-                for ph, key in (("post", "personas"), ("pre", "pre_retrain")):
+                for ph, key in (("post", "personas"), ("pre", "pre_retrain"), ("r0", "round0_detector")):
                     for persona, m in (data.get(key) or {}).items():
                         rows.append({"round": rnd, "persona": persona, "phase": ph, **m})
         df = pd.DataFrame(rows)

@@ -77,12 +77,12 @@ spoofing:
 wash_trading:
   - tactic: Account rings instead of a fixed pair
     source: "design assumption (documented washes are between two commonly owned accounts: Cargill, Aralia/Vintage, Shinhan)"
-    knobs: {ring_size: 3-6}
+    knobs: {ring_size: 3-8}
     weakens: [top_cpty_share, reciprocal_ratio]
     cost: "more accounts to control; ring members are still mutual major partners, so mutual_cpty_share, ring_size and ring_volume_share see the ring at any size"
   - tactic: Account proliferation (several groups)
     source: "partly documented: wash trades across several accounts of one owner (Shinhan); independent groups are a design assumption"
-    knobs: {n_groups: 2-5}
+    knobs: {n_groups: 2-6}
     weakens: [gross_volume_share, max_order_size_rel, activity_vs_history]
     cost: "none on total volume (the rate is split across groups); each group is still a visible ring"
   - tactic: Trade in busy periods
@@ -90,6 +90,11 @@ wash_trading:
     knobs: {busy_period_bias: up}
     weakens: [gross_volume_share, activity_vs_history, mkt_volume_spike]
     cost: fewer crosses when the market is quiet (less wash volume)
+  - tactic: Space out the crossing legs
+    source: "design assumption (pre-arranged crosses spaced out so the legs look unrelated)"
+    knobs: {cross_lag_ticks: 1-5}
+    weakens: [mutual_cpty_share, ring_volume_share, top_cpty_share, reciprocal_ratio]
+    cost: "strangers hit the resting leg while it waits: real exposure and less wash volume (effect falls with the lag)"
   - tactic: Irregular sizes
     source: "design assumption (documented washes matched quantity exactly: Cargill)"
     knobs: {size_jitter: up}
@@ -139,6 +144,11 @@ pump_and_dump:
     cost: price may revert before the coalition has sold
 
 layering:
+  - tactic: Spread the ladder over several accounts
+    source: "design assumption (multi-account spoofing: Sarao, Oystacher)"
+    knobs: {n_accounts: 2-4}
+    weakens: [spoof_signature, layered_order_share, cancel_exec_opposition, self_z_layered_order_share]
+    cost: "none on fake depth; each layer account still rests large orders and cancels them unfilled"
   - tactic: Taper layer sizes
     source: "design assumption"
     knobs: {size_taper: up}

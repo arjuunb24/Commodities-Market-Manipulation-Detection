@@ -1,0 +1,6 @@
+%%{init: {'theme':'neutral'}}%%
+flowchart LR
+  B["Browser<br/>React 18 + TypeScript"] -->|"JSON over HTTP"| API["FastAPI + Uvicorn<br/>15 JSON endpoints"]
+  API --> RUNS[("data/runs/<br/>Parquet + JSON per round")]
+  API --> LLM["LLM client<br/>case notes, analyst chat"]
+  T["Cloudflare tunnel<br/>optional public access"] --> API

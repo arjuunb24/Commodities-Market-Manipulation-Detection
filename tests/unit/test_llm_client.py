@@ -15,8 +15,9 @@ import src.agentic.llm_client as lc
 
 
 class _Resp:
-    def __init__(self, prompt=1000, completion=200):
-        self._d = {"choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+    def __init__(self, prompt=1000, completion=200, finish_reason="stop"):
+        self._d = {"choices": [{"message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": finish_reason}],
                    "usage": {"prompt_tokens": prompt, "completion_tokens": completion}}
 
     def model_dump_json(self):
@@ -71,6 +72,22 @@ def test_cache_prevents_repeat_billing(cerebras, monkeypatch, tmp_path):
     assert len(calls) == 1
 
 
+def test_truncated_response_is_not_cached(cerebras, monkeypatch, tmp_path):
+    _, calls = cerebras
+    responses = iter([_Resp(finish_reason="length"), _Resp()])
+
+    def complete(**_kwargs):
+        calls.append(1)
+        return next(responses)
+
+    monkeypatch.setattr(lc.litellm, "completion", complete)
+    c = _client(tmp_path)
+    request = [{"role": "user", "content": "same"}]
+    c.complete("sys", request)
+    c.complete("sys", request)
+    assert len(calls) == 2
+
+
 def test_budget_refuses_before_sending(cerebras, monkeypatch, tmp_path):
     ledger, calls = cerebras
     ledger.state["spent_usd"] = 0.0099
@@ -79,6 +96,48 @@ def test_budget_refuses_before_sending(cerebras, monkeypatch, tmp_path):
         _client(tmp_path).complete("sys", [{"role": "user", "content": "x" * 4000}])
     assert calls == []
     assert lc.llm_unavailable_reason({}) is None or "budget" in lc.llm_unavailable_reason({})
+
+
+def test_tpm_reservation_waits_for_rolling_window(monkeypatch, tmp_path):
+    clock = [100.0]
+    waits = []
+
+    def sleep(seconds):
+        waits.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(lc.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(lc.time, "time", lambda: clock[0])
+    monkeypatch.setattr(lc.time, "sleep", sleep)
+    ledger = lc.CostLedger({
+        "budget_usd": 1.0,
+        "ledger_file": str(tmp_path / "spend.json"),
+        "tokens_per_minute": 1000,
+        "min_seconds_between_calls": 0,
+    })
+    ledger.path = tmp_path / "spend.json"
+
+    ledger.reserve(400, 100)
+    ledger.reserve(400, 100)
+    ledger.reserve(400, 100)
+
+    assert waits and waits[0] >= 60
+    assert sum(tokens for _, tokens in ledger._token_reservations) == 500
+
+
+def test_tpm_reservation_refuses_oversized_single_request(tmp_path):
+    ledger = lc.CostLedger({
+        "budget_usd": 1.0,
+        "ledger_file": str(tmp_path / "spend.json"),
+        "tokens_per_minute": 1000,
+        "min_seconds_between_calls": 0,
+    })
+    ledger.path = tmp_path / "spend.json"
+
+    with pytest.raises(lc.BudgetExceededError, match="TPM budget"):
+        ledger.reserve(900, 101)
+
+    assert ledger.calls_this_process == 0
 
 
 def test_fatal_error_not_retried_and_disables_provider(cerebras, monkeypatch, tmp_path):
@@ -109,6 +168,23 @@ def test_rate_limit_retries_are_bounded(cerebras, monkeypatch, tmp_path):
     with pytest.raises(lc.LLMUnavailableError):
         _client(tmp_path).complete("sys", [{"role": "user", "content": "a"}])
     assert len(calls) == 3  # 1 + max_retries(2), never more
+
+
+def test_cerebras_tokens_per_minute_error_is_rate_limited(cerebras, monkeypatch, tmp_path):
+    _, calls = cerebras
+
+    def limited(**kw):
+        calls.append(1)
+        raise Exception(
+            "litellm.RateLimitError: CerebrasException - Tokens per minute limit exceeded - "
+            "too many tokens processed."
+        )
+
+    monkeypatch.setattr(lc.litellm, "completion", limited)
+    with pytest.raises(lc.LLMUnavailableError):
+        _client(tmp_path, max_retries=1).complete("sys", [{"role": "user", "content": "a"}])
+    assert len(calls) == 2
+    assert lc._classify(Exception("Tokens per minute limit exceeded")) == "rate"
 
 
 def test_gemini_switch_never_reads_cerebras_key(monkeypatch, tmp_path):

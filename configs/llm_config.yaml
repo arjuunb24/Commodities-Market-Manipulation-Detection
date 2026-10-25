@@ -30,6 +30,7 @@ cerebras_budget:
   output_usd_per_million: 0.75
   max_calls_per_process: 60        # a whole pipeline run uses ~1-3 calls per round
   min_seconds_between_calls: 6.0   # stays under the account's requests-per-minute limit
+  tokens_per_minute: 20000        # conservative rolling-window ceiling; set to your account's Cerebras TPM
   ledger_file: "data/llm_cache/cerebras_spend.json"
 
 # --- 4A: Narrative generator (one call per button click; 1 retry on grounding failure)
@@ -40,11 +41,17 @@ narrative_generator:
 
 # --- 4B: Adversarial strategist (once per round)
 adversarial_strategist:
-  max_tokens: {gemini: 4096, cerebras: 4000}   # 2500 was cut off mid-reasoning twice in one round (finish_reason=length)
-  reasoning_effort: {cerebras: "medium"}  # the one place deeper thinking pays off (~$0.002-0.004/round)
-  max_tool_calls: 5              # model turns per round (4 personas; gpt-oss sometimes proposes one per turn)
+  max_tokens: {gemini: 4096, cerebras: 3000}   # gpt-oss bills hidden reasoning as output: 1200 left seed444's spoofing calls empty
+  reasoning_effort: {cerebras: "low"}  # keep reasoning from consuming the proposal's output budget
+  max_tool_calls: 16             # one proposal per persona plus retries (the shape rules below reject more)
+  max_attempts_per_persona: 3    # LLM calls per persona before code exploration takes over
   explore_candidates: 2          # code exploration candidates probed per persona (random, larger jumps; never repeated)
   explore_candidates_stalled: 3  # ... when the search stalled (last round caught >= 90%, no candidate < 85%)
+  # Code-enforced shape of the LLM's candidates (primary + 2 alternatives), so its mutations are bold
+  # and broad enough to challenge the frozen detector. The retry only checks the primary.
+  min_llm_knobs: 4               # every candidate changes at least 4 knobs
+  min_knob_move: 0.10            # ... each by at least 10% of the knob's range (smaller moves do not count)
+  llm_knob_coverage: 0.6         # primary + alternatives together use >= 60% of the persona's knobs
   max_retries: 1
   timeout_seconds: 60
 

@@ -17,7 +17,8 @@ from api import data
 from api.data import clean
 
 METRIC_COLS = ["precision", "recall", "f1", "fpr", "support", "events_total", "events_detected",
-               "detection_latency_ticks", "episode_coverage", "caught_coverage", "caught_weak_share", "family_coverage"]
+               "detection_latency_ticks", "episode_coverage", "caught_coverage", "caught_weak_share", "family_coverage",
+               "family_precision", "family_recall", "family_f1"]
 
 
 def _round_dirs(run: str):
@@ -57,13 +58,39 @@ def _scoped(run: str, market: str | None) -> dict[int, dict]:
     return out
 
 
+@data.ttl_cache(600, maxsize=64)
+def _family_post(run: str, rnd: int, market: str | None) -> dict:
+    """Retrained-detector family P/R/F1 from flags.parquet + labels, for runs recorded before metrics.py had it."""
+    import pandas as pd
+    from src.adversarial.metrics import PERSONA_FAMILY, family_prf
+    try:
+        flags = data.flags_for_market(run, rnd, market)
+        dirs = [d for d in data.test_dirs(run, rnd) if market is None or d.name == market]
+        lab = pd.concat([pd.read_parquet(d / "labels.parquet") for d in dirs if (d / "labels.parquet").exists()])
+    except Exception:   # noqa: BLE001 - a missing file only means no fallback
+        return {}
+    if flags.empty or lab.empty:
+        return {}
+    lab = lab[~lab.index.duplicated()]
+    f = flags.set_index(["commodity", "window_start", "trader_id"])[["final_flag", "predicted_persona"]]
+    # the API's flags table holds only alerted windows: every other labelled window is "no alert"
+    f = f[~f.index.duplicated()].reindex(lab.index)
+    f["final_flag"] = f["final_flag"].fillna(False).astype(bool)
+    f["predicted_persona"] = f["predicted_persona"].fillna("none")
+    return family_prf(f, lab, PERSONA_FAMILY["spoofing"])
+
+
 def cumulative(run: str, market: str | None = None) -> list[dict]:
+    from src.adversarial.metrics import PERSONA_FAMILY
     rows = []
     for rnd, m in _scoped(run, market).items():
         for phase, key in (("post", "personas"), ("pre", "pre_retrain")):
             for persona, v in (m.get(key) or {}).items():
-                rows.append({"round": rnd, "persona": persona, "phase": phase,
-                             **{c: v.get(c) for c in METRIC_COLS if c in v}})
+                row = {"round": rnd, "persona": persona, "phase": phase,
+                       **{c: v.get(c) for c in METRIC_COLS if c in v}}
+                if phase == "post" and persona in PERSONA_FAMILY and row.get("family_f1") is None:
+                    row.update(_family_post(run, rnd, market))
+                rows.append(row)
     return clean(rows)
 
 
@@ -156,7 +183,11 @@ def strategist(run: str, market: str | None = None) -> list[dict]:
                 "probe": {"chosen": probe.get("chosen"),
                           "candidates": [{"changes": c.get("changes"), "coverage": c.get("coverage"),
                                           "effect_ratio": c.get("effect_ratio"), "score": c.get("score"),
-                                          "origin": c.get("origin")} for c in probe.get("candidates", [])]} if probe else None,
+                                          "origin": c.get("origin"),
+                                          # older runs only marked exploration candidates with "origin"
+                                          "source": c.get("candidate_source")
+                                          or ("code_exploration" if c.get("origin") else "llm")}
+                                         for c in probe.get("candidates", [])]} if probe else None,
             }
         out.append({"round": rnd, "personas": personas})
     return clean(out)

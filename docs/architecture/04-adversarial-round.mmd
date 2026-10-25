@@ -1,0 +1,16 @@
+%%{init: {'theme':'neutral'}}%%
+sequenceDiagram
+  autonumber
+  participant S as LLM strategist
+  participant P as Probe markets
+  participant M as Simulator
+  participant D as Detector
+  S->>P: candidate mutations per persona
+  P->>D: score against the frozen detector
+  D-->>S: coverage, effect kept, score
+  S->>M: keep the best candidate
+  M->>D: 1 train + 1 variant + 2 test markets
+  Note over M,D: PRE: frozen detector scores the test markets
+  D->>D: retrain on all rounds so far
+  Note over M,D: POST and BENCH scoring
+  D-->>S: metrics + SHAP for the next round

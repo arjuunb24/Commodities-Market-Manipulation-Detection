@@ -50,13 +50,13 @@ scripts\webapp stop      # turn it off
 scripts\webapp restart   # stop, then start again (use this to change options)
 ```
 
-| Option | What it does |
-|---|---|
-| `-Build` | Rebuild the React app before starting (after you change files in `web\src`) |
-| `-Port 8010` | Use another port, if 8000 is taken |
-| `-Password <pw>` | Ask visitors for a password (see [Password](#password)) |
-| `-Lan` | Also accept devices on your Wi-Fi ([section 2](#2-on-your-private-network-wi-fi)) |
-| `-Public` | Also open an internet link ([section 3](#3-on-the-public-internet-cloudflare-tunnel)) |
+| Option             | What it does                                                                         |
+| ------------------ | ------------------------------------------------------------------------------------ |
+| `-Build`         | Rebuild the React app before starting (after you change files in `web\src`)        |
+| `-Port 8010`     | Use another port, if 8000 is taken                                                   |
+| `-Password <pw>` | Ask visitors for a password (see [Password](#password))                               |
+| `-Lan`           | Also accept devices on your Wi-Fi ([section 2](#2-on-your-private-network-wi-fi))     |
+| `-Public`        | Also open an internet link ([section 3](#3-on-the-public-internet-cloudflare-tunnel)) |
 
 Logs are in `.webapp\server.log` and `.webapp\server.err.log`, a folder git ignores.
 
@@ -176,18 +176,18 @@ The password covers the whole app, including the data API and the analyst chat. 
 
 ## Troubleshooting
 
-| Problem | Fix |
-|---|---|
-| `Port 8000 is already in use` | Another server is running (often a manual uvicorn). Stop it, run `scripts\webapp stop`, or use `-Port 8010`. |
+| Problem                                               | Fix                                                                                                                      |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `Port 8000 is already in use`                       | Another server is running (often a manual uvicorn). Stop it, run `scripts\webapp stop`, or use `-Port 8010`.         |
 | Yellow banner: "The API server is running older code" | The server started before the code changed. Run `scripts\webapp restart` (or restart uvicorn), then press `Ctrl+F5`. |
-| Page shows an old version after an update | Rebuild with `scripts\webapp restart -Build`, then `Ctrl+F5`. On phones, close and reopen the tab. |
-| "No adversarial runs yet" | There is nothing in `data/runs/`. Run the pipeline first. |
-| Top bar says "AI offline" | No LLM key in `.env`, or the budget is used up. Hover over the label for the reason. The rest of the app still works. |
-| `cloudflared is not installed` | Install it (see above) and open a new terminal. |
-| Tunnel starts but prints no link | Check `.webapp\tunnel.log`. Usually a network or firewall block on outgoing connections. |
-| Other devices cannot reach the Wi-Fi address | Check the firewall and network-type notes in [section 2](#2-on-your-private-network-wi-fi). |
-| `running scripts is disabled on this system` | Use `scripts\webapp` (the `.cmd` wrapper), not `scripts\webapp.ps1`. |
-| Server fails to start | Read `.webapp\server.err.log`. The script also prints its last lines. |
+| Page shows an old version after an update             | Rebuild with `scripts\webapp restart -Build`, then `Ctrl+F5`. On phones, close and reopen the tab.                   |
+| "No adversarial runs yet"                             | There is nothing in `data/runs/`. Run the pipeline first.                                                              |
+| Top bar says "AI offline"                             | No LLM key in `.env`, or the budget is used up. Hover over the label for the reason. The rest of the app still works.  |
+| `cloudflared is not installed`                      | Install it (see above) and open a new terminal.                                                                          |
+| Tunnel starts but prints no link                      | Check `.webapp\tunnel.log`. Usually a network or firewall block on outgoing connections.                               |
+| Other devices cannot reach the Wi-Fi address          | Check the firewall and network-type notes in [section 2](#2-on-your-private-network-wi-fi).                               |
+| `running scripts is disabled on this system`        | Use `scripts\webapp` (the `.cmd` wrapper), not `scripts\webapp.ps1`.                                               |
+| Server fails to start                                 | Read `.webapp\server.err.log`. The script also prints its last lines.                                                  |
 
 ---
 
@@ -202,10 +202,10 @@ browser ──► uvicorn :8000 ──► api/main.py ──► data/runs/<run>/
 -Public  cloudflared ──► Cloudflare edge ──► https://….trycloudflare.com
 ```
 
-| Path | What it is |
-|---|---|
-| `web/` | React + TypeScript source (Vite, Tailwind, ECharts) |
-| `web/dist/` | The built app (git-ignored; created by `npm run build`) |
-| `api/` | FastAPI server |
-| `scripts/webapp.ps1`, `scripts/webapp.cmd` | Start/stop script |
-| `.webapp/` | Script state and logs (git-ignored) |
+| Path                                           | What it is                                                |
+| ---------------------------------------------- | --------------------------------------------------------- |
+| `web/`                                       | React + TypeScript source (Vite, Tailwind, ECharts)       |
+| `web/dist/`                                  | The built app (git-ignored; created by `npm run build`) |
+| `api/`                                       | FastAPI server                                            |
+| `scripts/webapp.ps1`, `scripts/webapp.cmd` | Start/stop script                                         |
+| `.webapp/`                                   | Script state and logs (git-ignored)                       |

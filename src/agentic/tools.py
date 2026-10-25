@@ -62,10 +62,11 @@ PARAM_BOUNDS: dict[str, dict[str, tuple[type, float, float, str]]] = {
     },
     "wash_trading": {
         "trade_frequency": (float, 0.05, 1.0, "total cross rate per tick (split across groups)"),
-        "n_groups": (int, 1, 5, "independent colluding groups (dilutes, same volume)"),
-        "ring_size": (int, 2, 6, "accounts per group; crosses rotate A->B->C->A"),
+        "n_groups": (int, 1, 6, "independent colluding groups (dilutes, same volume)"),
+        "ring_size": (int, 2, 8, "accounts per group; crosses rotate A->B->C->A"),
         "size_jitter": (float, 0.0, 0.9, "0 = fixed scripted lot; higher = varied sizes"),
         "camouflage_rate": (float, 0.0, 0.5, "share of cycles replaced by a genuine market trade"),
+        "cross_lag_ticks": (int, 0, 5, "ticks before the partner takes the resting leg; strangers can hit it meanwhile (less wash volume, other counterparties)"),
         "busy_period_bias": (float, 0.0, 1.0, "skip quiet periods; act mainly when the market is busy (design assumption)"),
     },
     "pump_and_dump": {
@@ -90,6 +91,7 @@ PARAM_BOUNDS: dict[str, dict[str, tuple[type, float, float, str]]] = {
         "placement_stagger": (int, 0, 5, "ticks between successive layers: 0 = whole ladder in one tick; k = one layer every k ticks (no same-tick multi-level batch, but the full ladder rests for less of the cycle)"),
         "cover_rate": (float, 0.0, 0.5, "per-account chance per tick of a genuine cover order inside the window (Sarao/Coscia traded genuinely too)"),
         "cover_size": (float, 0.0, 3.0, "cover order size x average level depth; the detector's ratios are volume-weighted, so small cover barely dilutes"),
+        "n_accounts": (int, 1, 4, "accounts the ladder is spread over: genuine order from the first, layers rotate over the others"),
     },
 }
 MUTABLE_PERSONAS = tuple(PARAM_BOUNDS)
@@ -105,7 +107,7 @@ EFFECT_COST: dict[str, dict[str, str]] = {
     "spoofing": {"order_size_multiplier": "down", "price_aggressiveness": "up", "direction_persistence": "down"},
     "layering": {"layer_spacing": "up", "n_layers": "down", "layer_size_multiplier": "down", "size_taper": "up",
                  "placement_stagger": "up"},
-    "wash_trading": {"trade_frequency": "down", "camouflage_rate": "up"},
+    "wash_trading": {"trade_frequency": "down", "camouflage_rate": "up", "cross_lag_ticks": "up"},
     "pump_and_dump": {"ignition_aggression": "down", "accumulation_size": "down",
                       "n_coordinated_accounts": "down", "burst_duration_ticks": "up"},
 }
@@ -216,19 +218,21 @@ PROPOSE_MUTATION_SCHEMA = _fn(
     "THIS IS THE ONLY TOOL WITH A SIDE EFFECT (writes configs/persona_config.yaml).",
     {
         "persona": {"type": "string", "enum": list(MUTABLE_PERSONAS)},
-        "parameters": {"type": "object", "description": "Parameter dict, e.g. {'cancellation_delay_ticks': 10}"},
+        "parameters": {"type": "object", "description": "Parameter dict changing at least 4 knobs by meaningful steps, "
+                                                         "e.g. {'cancellation_delay_ticks': 10, 'cancel_jitter': 0.5, ...}"},
         "reasoning": {
             "type": "string",
             "description": "Step-by-step justification referencing the metrics, SHAP drift and case notes.",
         },
         "alternatives": {
-            "type": "array", "maxItems": 2,
+            "type": "array", "minItems": 2, "maxItems": 2,
             "items": {"type": "object", "description": "A parameter dict, same shape as `parameters`"},
-            "description": "Up to 2 alternative parameter dicts using DIFFERENT tactics. Every candidate is "
+            "description": "Exactly 2 alternative parameter dicts (at least 4 knobs each) using DIFFERENT tactics "
+                           "and knobs. Every candidate is "
                            "probe-tested against the frozen detector and the best-scoring one is kept.",
         },
     },
-    ["persona", "parameters", "reasoning"],
+    ["persona", "parameters", "reasoning", "alternatives"],
 )
 STRATEGIST_TOOLS = [GET_ROUND_METRICS_SCHEMA, GET_SHAP_DRIFT_SCHEMA, GET_ENFORCEMENT_NOTES_SCHEMA, PROPOSE_MUTATION_SCHEMA]
 

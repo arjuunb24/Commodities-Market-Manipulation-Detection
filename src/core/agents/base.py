@@ -120,3 +120,34 @@ class Agent(ABC):
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(trader_id={self.trader_id!r})"
+
+
+DEPTH_WARMUP_TICKS = 300   # ticks of book observation before a size reference is fixed
+
+
+class DepthReference:
+    """
+    Average visible level depth, frozen after a warm-up at the median of what was seen.
+
+    Participants that size their orders off the book must not track the live depth
+    continuously: their own resting orders deepen the book, the next orders grow, and
+    the agents that follow the depth (execution algos, HFT quoters) inflate each other.
+    Adding large-size legitimate quoters made that loop run away (one natural-gas
+    trade of 2.5e16 lots; algo order sizes x10 within a 10,000-tick session).
+    """
+
+    def __init__(self, warmup: int = DEPTH_WARMUP_TICKS) -> None:
+        self.warmup = int(warmup)
+        self._samples: list[float] = []
+        self.value: float | None = None
+
+    def update(self, state: BookState) -> float:
+        if self.value is not None:
+            return self.value
+        levels = state.bid_depth + state.ask_depth
+        self._samples.append(sum(q for _, q in levels) / len(levels) if levels else 40.0)
+        ref = float(np.median(self._samples))
+        if len(self._samples) >= self.warmup:
+            self.value = ref
+        return ref
+

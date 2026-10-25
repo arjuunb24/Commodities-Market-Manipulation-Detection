@@ -35,6 +35,11 @@ Evasion knobs (docs/enforcement_case_notes.md):
   camouflage_rate  share of cycles in which an account instead takes a small
                    genuine directional trade from the market (design
                    assumption) — costs real exposure and wash volume
+  cross_lag_ticks  ticks between the resting leg and the partner's taking leg (design
+                   assumption; real pre-arranged crosses are sometimes spaced out to look
+                   unrelated). Meanwhile anyone can hit the resting leg, so part of it
+                   trades with strangers: real exposure and less wash volume, but the
+                   ring's counterparties are no longer only each other
 price_deviation_from_mid only moves the cross price inside the spread, so it
 has almost no market effect and is not offered to the strategist.
 """
@@ -68,6 +73,7 @@ class WashTradingRing(ManipulationController):
         camouflage_rate: float = 0.0,
         n_groups: int = 1,
         busy_period_bias: float = 0.0,
+        cross_lag_ticks: int = 0,
     ) -> None:
         super().__init__(accounts, start_tick, end_tick, busy_period_bias=busy_period_bias)
         self.rng = rng
@@ -76,6 +82,8 @@ class WashTradingRing(ManipulationController):
         self.size_jitter = float(np.clip(size_jitter, 0.0, 0.95))
         self.camouflage_rate = float(np.clip(camouflage_rate, 0.0, 0.9))
         self.n_groups = max(1, int(n_groups))
+        self.cross_lag_ticks = max(0, int(cross_lag_ticks))
+        self._pending: list[tuple[int, ManipulatorAccount, Side, float, int]] = []   # delayed taking legs
         self._next = 0
 
     @classmethod
@@ -94,6 +102,7 @@ class WashTradingRing(ManipulationController):
         camouflage_rate: float = 0.0,
         n_groups: int = 1,
         busy_period_bias: float = 0.0,
+        cross_lag_ticks: int = 0,
     ) -> "WashTradingRing":
         ring_size = max(2, int(ring_size))
         ctrl_rng, *acct_rngs = rng.spawn(ring_size + 1)
@@ -107,7 +116,7 @@ class WashTradingRing(ManipulationController):
             price_deviation_from_mid=price_deviation_from_mid,
             start_tick=start_tick, end_tick=end_tick,
             size_jitter=size_jitter, camouflage_rate=camouflage_rate, n_groups=n_groups,
-            busy_period_bias=busy_period_bias,
+            busy_period_bias=busy_period_bias, cross_lag_ticks=cross_lag_ticks,
         )
 
     @property
@@ -127,6 +136,7 @@ class WashTradingRing(ManipulationController):
             "size_jitter": self.size_jitter,
             "camouflage_rate": self.camouflage_rate,
             "busy_period_bias": self.busy_period_bias,
+            "cross_lag_ticks": self.cross_lag_ticks,
         }
 
     def _lot(self) -> int:
@@ -134,10 +144,14 @@ class WashTradingRing(ManipulationController):
         return max(5, int(round(WASH_BASE_LOT * self.rng.uniform(1 - j, 1 + j))))
 
     def manipulate(self, state: BookState, tick: int) -> list[Order]:
+        # Delayed partner legs that are due: take whatever of the resting leg is left.
+        due = [p for p in self._pending if p[0] <= tick]
+        self._pending = [p for p in self._pending if p[0] > tick]
+        orders = [acct.limit(side, price, qty, tick, exact_ttl=1, tag="w") for _, acct, side, price, qty in due]
         if self.rng.random() > self.trade_frequency:
-            return []
+            return orders
         if state.best_bid is None or state.best_ask is None:
-            return []
+            return orders
 
         n = len(self.accounts)
         a = self.accounts[self._next % n]
@@ -148,21 +162,25 @@ class WashTradingRing(ManipulationController):
             # Genuine directional trade against the market, sized like normal flow.
             side = Side.BUY if a.net_position <= 0 else Side.SELL
             price = state.best_ask if side == Side.BUY else state.best_bid
-            return [a.limit(side, price, int(self.rng.integers(10, 40)), tick, exact_ttl=2, tag="c")]
+            return orders + [a.limit(side, price, int(self.rng.integers(10, 40)), tick, exact_ttl=2, tag="c")]
 
         tick_size = a.tick_size
         lo, hi = state.best_bid + tick_size, state.best_ask - tick_size
         if hi < lo - 1e-12:
-            return []  # no price strictly inside the spread: wait rather than trade with strangers
+            return orders  # no price strictly inside the spread: wait rather than trade with strangers
         mid = (state.best_bid + state.best_ask) / 2
         price = float(np.clip(mid * (1 + self.price_deviation_from_mid * self.rng.uniform(-1, 1)), lo, hi))
         qty = self._lot()
         rest_side = Side.SELL if self.rng.random() < 0.5 else Side.BUY
         take_side = Side.BUY if rest_side == Side.SELL else Side.SELL
         # Unmatched remainders are pulled on the next tick.
-        leg1 = a.limit(rest_side, price, qty, tick, exact_ttl=1, tag="w")
+        lag = self.cross_lag_ticks
+        leg1 = a.limit(rest_side, price, qty, tick, exact_ttl=1 + lag, tag="w")
+        if lag:
+            self._pending.append((tick + lag, b, take_side, leg1.price, qty))
+            return orders + [leg1]
         leg2 = b.limit(take_side, leg1.price, qty, tick, exact_ttl=1, tag="w")
-        return [leg1, leg2]
+        return orders + [leg1, leg2]
 
 
 # Backward-compatible name (a pair is a ring of size 2).

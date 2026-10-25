@@ -96,6 +96,8 @@ def test_alternatives_validated_and_best_probe_candidate_kept(tmp_path):
     log = {}
     out = strat._probe_candidates(0, ["spoofing"], {"spoofing": "agentic"}, log)
     assert out["spoofing"]["chosen"] == 1
+    assert out["spoofing"]["chosen_source"] == "llm_alternative"
+    assert out["spoofing"]["llm_proposals"][0]["candidate_source"] == "llm_primary"
     written = yaml.safe_load(cfg.read_text())["spoofing"]
     assert written["frequency"] == 0.1 and written["n_accounts"] == 1        # alternative applied on the base params
     assert "[probe]" in log["spoofing"]
@@ -114,11 +116,31 @@ def test_opposite_fill_flags_match_cross_join():
     legs["buy"], legs["sell"] = np.where(is_buy, 10, 0), np.where(is_buy, 0, 10)
     # reference: the original cross join
     j = lc.merge(legs.rename(columns={"tick": "fill_tick"}), on="trader_id")
-    j = j[(j["fill_tick"] >= j["placed_tick"]) & (j["fill_tick"] <= j["tick"] + 2)]
+    j = j[(j["fill_tick"] >= j["placed_tick"]) & (j["fill_tick"] <= j["tick"])]
     j = j[((j["side"] == "buy") & (j["sell"] > 0)) | ((j["side"] == "sell") & (j["buy"] > 0))]
     expected = lc["cid"].isin(j["cid"].unique()).astype(float).to_numpy()
     got = _opposite_fill_flags(lc, legs)
     assert expected.sum() > 50 and (got == expected).all()
+    got_with_grace = _opposite_fill_flags(lc, legs, grace=2)
+    assert (got_with_grace >= got).all()
+
+
+def test_threshold_cv_groups_whole_source_markets_and_excludes_group_metadata():
+    from src.detector.classifiers import SupervisedDetector, model_columns
+
+    idx = pd.MultiIndex.from_tuples(
+        [("gold", 0, "a"), ("gold", 30, "a"), ("gold", 0, "a"), ("gold", 30, "a")],
+        names=["commodity", "window_start", "trader_id"],
+    )
+    features = pd.DataFrame(
+        {"cv_group": ["market_a", "market_a", "market_b", "market_b"], "signal": [0, 1, 2, 3]},
+        index=idx,
+    )
+    detector = SupervisedDetector({"xgboost": {}, "personas": ["spoofing"]})
+    groups = detector._groups(features)
+    assert groups.tolist() == ["market_a", "market_a", "market_b", "market_b"]
+    assert model_columns(features) == ["signal"]
+    assert len(np.unique(detector._groups(features.drop(columns="cv_group")))) == 1
 
 
 def test_model_proposal_shapes_are_normalised(tmp_path):
@@ -233,8 +255,62 @@ def test_breakthroughs_stall_and_repeated_alternatives(tmp_path):
     tools.propose_mutation("pump_and_dump", {"decoy_rate": 0.35}, "r", alternatives=[{"stagger": 0.4}, {"dump_delay_ticks": 300}])
     seen = []
     strat.probe_fn = lambda cfgs: seen.extend(cfgs) or [{"pump_and_dump": {"score": 0.1}} for _ in cfgs]
-    strat._probe_candidates(2, ["pump_and_dump"], {"pump_and_dump": "agentic"}, {})
-    assert len(seen) == 2 and all(c["pump_and_dump"].get("stagger") != 0.4 for c in seen)
+    result = strat._probe_candidates(2, ["pump_and_dump"], {"pump_and_dump": "agentic"}, {})
+    record = result["pump_and_dump"]
+    assert len(seen) > 2
+    assert all(c["novelty_eligible"] for c in record["candidates"] if c["candidate_source"] != "code_exploration")
+    assert all(c["candidate_source"] == "code_exploration" or c["changes"] != {"stagger": 0.4}
+               for c in record["candidates"])
+
+
+def test_round3_probes_novel_candidates_and_discards_stale_tactics(tmp_path):
+    import json
+    from src.agentic.adversarial_strategist import AdversarialStrategist, _similar_change_set
+    from src.agentic.tools import ToolRegistry
+
+    run = tmp_path / "run"
+    cfg = tmp_path / "persona_config.yaml"
+    base = {
+        "ignition_aggression": 0.002, "stagger": 0.2, "busy_period_bias": 0.0,
+        "decoy_rate": 0.0, "n_coordinated_accounts": 3,
+    }
+    params = [
+        base,
+        {**base, "stagger": 0.4},
+        {**base, "stagger": 0.4, "decoy_rate": 0.1},
+    ]
+    for r, active in enumerate(params):
+        _pnd_round(run, r, active, 1.0, 0.1)
+        path = run / f"round_{r}" / "metrics.json"
+        metrics = json.loads(path.read_text())
+        metrics["params_used"]["pump_and_dump"] = active
+        metrics["pre_retrain"] = {"pump_and_dump": {"caught_coverage": 0.96}}
+        path.write_text(json.dumps(metrics))
+    cfg.write_text(yaml.dump({"pump_and_dump": base}))
+
+    tools = ToolRegistry(run_dir=run, persona_config_path=cfg)
+    tools.propose_mutation(
+        "pump_and_dump", {"busy_period_bias": 0.7}, "repeat recent tactic",
+        alternatives=[{"decoy_rate": 0.3}, {"n_coordinated_accounts": 5}],
+    )
+    scored = []
+
+    def probe(configs):
+        scored.extend(configs)
+        return [{"pump_and_dump": {"score": 0.2 + i * 0.01, "effect_ratio": 1.0}}
+                for i in range(len(configs))]
+
+    strat = AdversarialStrategist(
+        {"max_tool_calls": 1}, run_dir=run, tools=tools, probe_fn=probe,
+    )
+    # Round 3 mutation runs after round 2 completes, so the strategist receives round_num=2.
+    result = strat._probe_candidates(2, ["pump_and_dump"], {"pump_and_dump": "agentic"}, {})
+    record = result["pump_and_dump"]
+    assert len([c for c in record["candidates"] if c["candidate_source"] == "code_exploration"]) == 4
+    assert all(c["novelty_eligible"] for c in record["candidates"])
+    assert record["chosen_source"] == "code_exploration"
+    assert all(not _similar_change_set(c["changes"], [{"stagger"}, {"decoy_rate"}])
+               for c in record["candidates"] if c["novelty_eligible"])
 
 
 def test_last_probe_lines_mark_failed_and_kept(tmp_path):
@@ -307,7 +383,7 @@ def test_probe_baseline_uses_round0_params_and_is_cached(tmp_path):
     assert seen == [0.5]                                   # second call reads probe_baseline.json
 
 
-def test_truncated_replies_do_not_use_up_persona_turns(tmp_path, monkeypatch):
+def test_truncated_replies_retry_persona_within_budget(tmp_path, monkeypatch):
     import json
     import src.agentic.adversarial_strategist as strat_mod
     from src.agentic.adversarial_strategist import AdversarialStrategist
@@ -330,11 +406,11 @@ def test_truncated_replies_do_not_use_up_persona_turns(tmp_path, monkeypatch):
         def complete(self, **kw): return {"choices": [next(replies)]}
 
     monkeypatch.setattr(strat_mod, "llm_unavailable_reason", lambda cfg: None)
-    strat = AdversarialStrategist({"max_tool_calls": 5}, run_dir=run, tools=tools)
+    strat = AdversarialStrategist({"max_tool_calls": 8}, run_dir=run, tools=tools)
     strat.client = _Client()
     monkeypatch.setattr(strat, "_build_context", lambda *a, **k: "ctx")
     out = strat.run_strategist_round(0, personas)
-    assert out["source"] == {p: "agentic" for p in personas}     # 2 cut-off replies + 4 calls fit in 5 turns
+    assert out["source"] == {p: "agentic" for p in personas}     # 2 retries + 4 proposals fit in 8 turns
 
 
 def test_staggered_layering_never_places_a_multi_level_batch_in_one_tick():

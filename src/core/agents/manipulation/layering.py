@@ -29,6 +29,11 @@ Evasion knobs (design assumptions unless noted; docs/enforcement_case_notes.md):
                    one tick; k > 0 builds it one layer every k ticks, so no single
                    tick shows a multi-level batch (design assumption). The
                    ladder is complete for less of the cycle, so fake depth falls.
+  n_accounts       accounts the ladder is spread over (design assumption; Sarao-style
+                   schemes ran several accounts): the genuine order comes from the
+                   first, the layers rotate over all of them, so no single account
+                   shows a same-tick multi-level batch AND the opposite-side fill.
+                   The fake depth is unchanged; the cost is coordinating accounts.
 
 Order ids carry audit tags ("l" layer leg, "g" genuine leg) used only for
 effectiveness accounting, never by the detector.
@@ -65,9 +70,13 @@ class LayeringAgent(ManipulationController):
         start_tick: int = 0,
         end_tick: int = 10000,
         background_rate: float = 0.05,
+        n_accounts: int = 1,
     ) -> None:
-        account = ManipulatorAccount(trader_id, rng.spawn(1)[0], background_rate=background_rate)
-        super().__init__([account], start_tick, end_tick, busy_period_bias=busy_period_bias)
+        n_accounts = max(1, int(n_accounts))
+        acct_rngs = rng.spawn(n_accounts)
+        accounts = [ManipulatorAccount(trader_id if k == 0 else f"{trader_id}{chr(ord('a') + k)}", acct_rngs[k],
+                                       background_rate=background_rate) for k in range(n_accounts)]
+        super().__init__(accounts, start_tick, end_tick, busy_period_bias=busy_period_bias)
         self.trader_id = trader_id
         self.rng = rng
         self.n_layers = max(2, int(n_layers))
@@ -100,6 +109,7 @@ class LayeringAgent(ManipulationController):
             "busy_period_bias": self.busy_period_bias,
             "layer_side": self.layer_side,
             "placement_stagger": self.placement_stagger,
+            "n_accounts": len(self.accounts),
             "realised_fake_depth_share": round(float(np.mean(self._depth_shares)), 4) if self._depth_shares else 0.0,
         }
 
@@ -110,6 +120,13 @@ class LayeringAgent(ManipulationController):
             return Side.SELL
         return Side.BUY if self.rng.random() < 0.5 else Side.SELL
 
+    def _layer_account(self, i: int) -> ManipulatorAccount:
+        """Layer i's account: rotates over the accounts, skipping the genuine one when there are others."""
+        if len(self.accounts) == 1:
+            return self.account
+        others = self.accounts[1:]
+        return others[i % len(others)]
+
     def _layer(self, state: BookState, side: Side, i: int, base_size: float, step: float, tick: int, ttl: int) -> Order:
         tick_size = self.account.tick_size
         if side == Side.BUY:
@@ -118,7 +135,7 @@ class LayeringAgent(ManipulationController):
             price = max(state.best_ask + step * (i + 1), state.best_bid + tick_size)
         taper = 1.0 - self.size_taper * (i / max(1, self.n_layers - 1))
         qty = max(5, int(round(base_size * taper * self.rng.uniform(0.9, 1.1))))
-        return self.account.limit(side, price, qty, tick, exact_ttl=max(1, ttl), tag="l")
+        return self._layer_account(i).limit(side, price, qty, tick, exact_ttl=max(1, ttl), tag="l")
 
     def _continue_build(self, state: BookState, tick: int) -> list[Order]:
         side, i, due, cancel_at, base_size, step = self._building

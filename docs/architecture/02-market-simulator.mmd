@@ -1,0 +1,30 @@
+%%{init: {'theme':'neutral'}}%%
+flowchart LR
+  subgraph L["Legitimate participants"]
+    direction TB
+    L1["Noise traders x20"]
+    L2["Momentum x8 · Mean reversion x6"]
+    L3["Market maker · HFT quoters x3"]
+    L4["Execution algos x3 · Occasional x25"]
+  end
+  subgraph K["Legitimate look-alikes"]
+    direction TB
+    K1["Liquidity providers x3"]
+    K2["Ladder hedgers x3"]
+    K3["Fund families x2"]
+    K4["Crossing desks x2"]
+  end
+  subgraph M["Manipulation personas"]
+    direction TB
+    M1["Spoofing"]
+    M2["Layering"]
+    M3["Wash trading"]
+    M4["Pump and dump"]
+  end
+  FV["Fundamental value<br/>jump-diffusion"] --> L
+  L --> OB[("Order book<br/>price-time priority")]
+  K --> OB
+  M --> OB
+  OB --> OUT["order_log · trade_log<br/>manipulation_events · OHLCV bars"]
+  classDef adv fill:#fbeee5,stroke:#b4531a,color:#14202b
+  class M1,M2,M3,M4 adv

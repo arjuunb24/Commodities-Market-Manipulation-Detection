@@ -34,6 +34,10 @@ export interface PersonaMetrics {
   caught_latency_ticks?: number | null;
   caught_weak_share?: number | null;
   family_coverage?: number | null;
+  /** spoofing + layering scored as one fake-depth class (label swaps between them are not errors) */
+  family_precision?: number | null;
+  family_recall?: number | null;
+  family_f1?: number | null;
 }
 
 export interface RoundSummary {
@@ -104,7 +108,7 @@ export interface CommodityView {
   bucket_ticks: { bar: number; flow: number; heat: number };
 }
 
-export type CaseStatus = "confirmed" | "other_persona" | "no_episode";
+export type CaseStatus = "confirmed" | "other_persona" | "near_episode" | "no_episode";
 
 export interface CaseRow {
   id: string;
@@ -119,6 +123,9 @@ export interface CaseRow {
   status: CaseStatus;
   gt_event: string | null;
   gt_persona: string | null;
+  /** "brief" = fewer consecutive flagged windows than kpi.min_case_windows; not counted in the KPIs. */
+  tier: "case" | "brief";
+  near_event: string | null;
 }
 
 export interface CasesResponse {
@@ -128,7 +135,13 @@ export interface CasesResponse {
     confirmed: number;
     no_episode: number;
     other_persona: number;
+    near_episode: number;
     missed: number;
+    missed_brief: number;
+    brief: number;
+    brief_confirmed: number;
+    brief_no_episode: number;
+    min_case_windows: number;
     anomalies: number;
     anomalies_on_episode: number;
     sibling_label: number;
@@ -208,7 +221,7 @@ export interface StrategistPersona {
   guard_reverts: KnobChange[];
   probe: {
     chosen: number | null;
-    candidates: { changes: Record<string, unknown>; coverage: number | null; effect_ratio: number | null; score: number | null; origin?: string | null }[];
+    candidates: { changes: Record<string, unknown>; coverage: number | null; effect_ratio: number | null; score: number | null; origin?: string | null; source?: string | null }[];
   } | null;
 }
 

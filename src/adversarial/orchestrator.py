@@ -9,6 +9,7 @@ The full multi-round loop is driven by scripts/run_full_pipeline.py.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import shutil
@@ -136,10 +137,18 @@ class RoundOrchestrator:
         self.feature_workers = max(1, int(loop.get("feature_workers", 3)))   # parallel feature extraction (round markets)
         self.probe_workers = max(1, int(loop.get("probe_workers", 8)))       # parallel probe markets
         self.replay_check_every = max(1, int(loop.get("replay_check_every", 1)))
+        # Randomised persona variants (src/adversarial/variants.py): extra training markets per
+        # round, and a fixed benchmark of unseen variants scored every round. Both are
+        # simulated alongside the round's own markets and are half length by default.
+        self.train_variants = max(0, int(loop.get("train_variants", 1)))
+        self.benchmark_markets = max(0, int(loop.get("benchmark_markets", 2)))
+        self.variant_ticks = max(1000, int(self.sim_ticks * float(loop.get("variant_ticks_fraction", 0.5))))
         self.last_round: int | None = None   # set by the driver so the final round always runs the replay check
 
         # Cumulative metrics list — grows each round
         self._all_metrics: list[dict] = []
+        self._round0 = None   # copy of the round-0 detector (scores later rounds' markets too)
+        self._concurrent_sims = 1   # simulations running at once (they share the CPUs)
 
     # ------------------------------------------------------------------
     # Public API
@@ -328,16 +337,28 @@ class RoundOrchestrator:
         params_used = self._params_in_force()
 
         logger.info("=" * 60)
-        logger.info(f"ROUND {round_num} — simulating 1 train + {len(test_dirs)} test markets...")
+        variant_dirs = [round_dir / ("train_variant" if v == 0 else f"train_variant_{v}") for v in range(self.train_variants)]
+        bench_dirs = [] if self._benchmark_ready() else self._benchmark_dirs()
+        logger.info(f"ROUND {round_num} — simulating 1 train + {len(variant_dirs)} variant + {len(test_dirs)} test"
+                    + (f" + {len(bench_dirs)} benchmark" if bench_dirs else "") + " markets...")
         T = self.sim_ticks
         jobs = [(train_dir, self.sim_seed + round_num * 10, round_num * T)]
         for m, d in enumerate(test_dirs):
             jobs.append((d, self.sim_seed + round_num * 10 + 1 + m, (round_num * self.n_test_markets + m) * T))
+        # Variant and benchmark seeds live in their own ranges, clear of every round's train/test seeds.
+        for v, d in enumerate(variant_dirs):
+            cfg = self._write_variant_config(d, self._params_active(), seed=(self.sim_seed, round_num, v))
+            jobs.append((d, self.sim_seed + 50_000 + round_num * 10 + v, 0, cfg, self.variant_ticks))
+        for b, d in enumerate(bench_dirs):
+            cfg = self._write_variant_config(d, self._baseline_active(), seed=(self.sim_seed, 99_999, b))
+            jobs.append((d, self.sim_seed + 90_000 + b, 0, cfg, self.variant_ticks))
         import concurrent.futures
+        self._concurrent_sims = len(jobs)
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as executor:
             for f in [executor.submit(self._run_simulation, *job) for job in jobs]:
                 f.result()
-        self._cache_features([*test_dirs, train_dir])
+        self._concurrent_sims = 1
+        self._cache_features([*test_dirs, train_dir, *variant_dirs, *bench_dirs])
 
         X_parts, y_parts, ev_parts, eff_parts, tr_parts = [], [], [], [], []
         per_market = []   # (market name, row index, labels, events, per-episode effect) for by-market metrics
@@ -372,24 +393,35 @@ class RoundOrchestrator:
             logger.info(f"Round {round_num} — PRE-retrain scoring with frozen detector...")
             pre_results = self.pipeline.score(X_test)
             pre_metrics = compute_round_metrics(pre_results, y_test, self.personas, events=events_test)
+        # The round-0 detector on this round's markets: how far the personas have moved from
+        # the baseline overall (round 1's pre-retrain detector already is the round-0 one).
+        round0_metrics = None
+        if round_num >= 2 and (r0 := self._round0_detector()) is not None:
+            logger.info(f"Round {round_num} — scoring with the round-0 detector...")
+            round0_metrics = compute_round_metrics(r0.score(X_test), y_test, self.personas, events=events_test)
 
         # --- Retrain on cumulative training data ---
         logger.info(f"Round {round_num} — retraining on rounds 0..{round_num}...")
         X_tr, y_tr, w_tr = [], [], []
         anchor = float(self.detector_config.get("continual", {}).get("anchor_round_weight", 1.0))
         for r in range(round_num + 1):
-            X_r, y_r = self.pipeline.load_and_preprocess(self.master_run_dir / f"round_{r}" / "train")
-            if not X_r.empty:
-                X_tr.append(X_r)
-                y_tr.append(y_r)
-                w_tr.append(np.full(len(X_r), anchor if r == 0 else 1.0))
+            rd = self.master_run_dir / f"round_{r}"
+            markets = [rd / "train"] + sorted(d for d in rd.glob("train_variant*") if d.is_dir())
+            for market in markets:
+                x_train_market, y_train_market = self.pipeline.load_and_preprocess(market)
+                if not x_train_market.empty:
+                    x_train_market = x_train_market.copy()
+                    x_train_market["cv_group"] = f"round_{r}:{market.name}"
+                    X_tr.append(x_train_market)
+                    y_tr.append(y_train_market)
+                    w_tr.append(np.full(len(x_train_market), anchor if r == 0 and market.name == "train" else 1.0))
         if not X_tr:
             logger.warning(f"Round {round_num}: empty training data. Skipping.")
             return {}
-        for X_a, y_a in self._replay_training_markets():
-            X_tr.append(X_a)
-            y_tr.append(y_a)
-            w_tr.append(np.ones(len(X_a)))
+        for x_replay, y_replay in self._replay_training_markets():
+            X_tr.append(x_replay)
+            y_tr.append(y_replay)
+            w_tr.append(np.ones(len(x_replay)))
         weights = np.concatenate(w_tr)
         self.pipeline.train(pd.concat(X_tr), pd.concat(y_tr), save_dir=round_dir,
                             sample_weight=None if np.all(weights == 1.0) else weights)
@@ -400,6 +432,7 @@ class RoundOrchestrator:
         unsup = compute_unsupervised_metrics(results, y_test)
         flags = self.pipeline.build_flags(X_test, results)
         self.pipeline.write_flags(flags, round_dir / "flags.parquet")
+        bench_metrics = self._score_benchmark()
 
         # --- Effectiveness and strategist objective ---
         baseline = eff if round_num == 0 else self._baseline_effectiveness()
@@ -417,6 +450,33 @@ class RoundOrchestrator:
                 "thresholds": self.pipeline.supervised_detector.thresholds,
                 "n_flags": int(flags["final_flag"].sum()),
                 "n_test_markets": len(test_dirs),
+                "evaluation_protocol": {
+                    "threshold_cv_grouping": "simulation_market",
+                    "test_markets_in_model_training": False,
+                    "window_rows_are_independent": False,
+                    "primary_evaluation_unit": "manipulation_episode",
+                    "train_seeds": [self.sim_seed + round_num * 10],
+                    "test_seeds": [
+                        self.sim_seed + round_num * 10 + 1 + m
+                        for m in range(len(test_dirs))
+                    ],
+                    "probe_seeds": list(PROBE_SEEDS),
+                    "probe_run_seed_overlap": bool(set(PROBE_SEEDS) & {
+                        self.sim_seed + r * 10 + m
+                        for r in range(round_num + 1)
+                        for m in range(self.n_test_markets + 1)
+                    }),
+                    "probe_commodities": list(PROBE_COMMODITIES),
+                    "held_out_case_replays": list(
+                        (self.detector_config.get("replay_check", {}) or {}).get("cases", [])
+                    ),
+                    "note": (
+                        "Post-retrain metrics use held-out test markets; frozen pre-retrain "
+                        "metrics measure mutation evasion. Test markets are not used for "
+                        "model fitting or threshold tuning. Test markets share the simulator "
+                        "persona implementations with training markets."
+                    ),
+                },
                 "params_used": params_used,
                 "mutation_source": mutation_source or {p: ("baseline" if round_num == 0 else "unknown") for p in self.personas},
                 "effectiveness": eff,
@@ -424,9 +484,13 @@ class RoundOrchestrator:
                 "effectiveness_ratio": ratios,
                 "mutation_score": scores,
                 "by_market": by_market,
+                **({"round0_detector": round0_metrics} if round0_metrics is not None else {}),
+                **({"benchmark": bench_metrics} if bench_metrics else {}),
             },
         )
         self._save_models(round_num, round_dir)
+        if round_num == 0:
+            self._round0 = copy.deepcopy(self.pipeline)
         replay_check = self._replay_check(round_num) if self._replay_check_due(round_num) else {}
         if replay_check:
             with open(round_dir / "replay_check.json", "w") as f:
@@ -434,9 +498,68 @@ class RoundOrchestrator:
         entry = {"round": round_num, "personas": post_metrics, "effectiveness_ratio": ratios, "mutation_score": scores}
         if pre_metrics is not None:
             entry["pre_retrain"] = pre_metrics
+        if round0_metrics is not None:
+            entry["round0_detector"] = round0_metrics
+        if bench_metrics:
+            entry["benchmark"] = bench_metrics
         self._all_metrics.append(entry)
         self._save_cumulative_metrics()
         return post_metrics
+
+    # ---- randomised variants and the benchmark (src/adversarial/variants.py) ----
+
+    def _persona_doc(self) -> dict:
+        import yaml
+        return (yaml.safe_load(self.persona_config_path.read_text()) if self.persona_config_path.exists() else {}) or {}
+
+    def _params_active(self) -> dict:
+        return resolve_persona_config(self._persona_doc())
+
+    def _baseline_active(self) -> dict:
+        return resolve_persona_config({"round_0": self._persona_doc().get("round_0") or {}})
+
+    def _write_variant_config(self, market_dir: Path, base: dict, seed: tuple) -> str:
+        """Write a random variant of `base` next to the market and return its path."""
+        import yaml
+        from src.adversarial.variants import variant_config
+        market_dir.mkdir(parents=True, exist_ok=True)
+        doc = variant_config(base, np.random.default_rng(list(seed)), self.personas)
+        path = market_dir / "variant_persona_config.yaml"
+        path.write_text(yaml.safe_dump(doc, sort_keys=True))
+        return str(path)
+
+    def _benchmark_dirs(self) -> list[Path]:
+        return [self.master_run_dir / "benchmark" / f"market_{b}" for b in range(self.benchmark_markets)]
+
+    def _benchmark_ready(self) -> bool:
+        return all((d / "order_log.parquet").exists() for d in self._benchmark_dirs())
+
+    def _score_benchmark(self) -> dict:
+        """Metrics of the just-retrained detector on the fixed benchmark of unseen variants."""
+        dirs = [d for d in self._benchmark_dirs() if (d / "order_log.parquet").exists()]
+        Xs, ys, evs = [], [], []
+        for d in dirs:
+            X_b, y_b = self.pipeline.load_and_preprocess(d)
+            if not X_b.empty:
+                Xs.append(X_b)
+                ys.append(y_b)
+                evs.append(pd.read_parquet(d / "manipulation_events.parquet"))
+        if not Xs:
+            return {}
+        return compute_round_metrics(self.pipeline.score(pd.concat(Xs)), pd.concat(ys), self.personas,
+                                     events=pd.concat(evs, ignore_index=True))
+
+    def _round0_detector(self):
+        """The detector trained in round 0 (kept in memory; loaded from round_0/models after a restart)."""
+        if self._round0 is None:
+            path = self.master_run_dir / "round_0" / "models" / "detector.joblib"
+            if path.exists():
+                try:
+                    import joblib
+                    self._round0 = joblib.load(path)
+                except Exception as exc:  # pragma: no cover - logged, not fatal
+                    logger.warning("Could not load the round-0 detector: %s", exc)
+        return self._round0
 
     def _cache_features(self, dirs: list[Path]) -> None:
         """Compute the round markets' features in parallel worker processes (load_and_preprocess then hits the cache)."""
@@ -471,6 +594,8 @@ class RoundOrchestrator:
             for d in self._replay_markets("replay_augmentation"):
                 X_a, y_a = self.pipeline.load_and_preprocess(d)
                 if not X_a.empty:
+                    X_a = X_a.copy()
+                    X_a["cv_group"] = f"replay:{d.resolve()}"
                     self._aug_cache.append((X_a, y_a))
             if self._aug_cache:
                 logger.info("Replay augmentation: %d labelled real-case markets added to training", len(self._aug_cache))
@@ -542,30 +667,41 @@ class RoundOrchestrator:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _run_simulation(self, out_dir: Path, seed: int, tick_offset: int = 0) -> None:
+    def _run_simulation(self, out_dir: Path, seed: int, tick_offset: int = 0,
+                        persona_config: str | None = None, ticks: int | None = None) -> None:
         """
         Calls run_simulation.py as a subprocess, writing outputs directly
         into out_dir so each run has isolated Parquet files.
         """
         python_exe = sys.executable
         script = REPO_ROOT / "scripts" / "run_simulation.py"
+        import os
+        # Each concurrent simulation gets a share of the CPUs: 8 markets x one worker per CPU
+        # (64 processes on 8 cores) broke a worker pool (seed222: "semaphore or lock released
+        # too many times") and left a market with 1 of 8 commodities.
+        workers = max(1, (os.cpu_count() or 4) * 2 // max(1, self._concurrent_sims))
 
         cmd = [
             python_exe, str(script),
-            "--ticks",       str(self.sim_ticks),
+            "--ticks",       str(ticks or self.sim_ticks),
             "--seed",        str(seed),
             "--outdir",      str(out_dir),
             "--commodity",   self.commodity,
             "--tick-offset", str(tick_offset),
+            "--workers",     str(workers),
+            *(["--persona-config", str(persona_config)] if persona_config else []),
         ]
 
         logger.info(f"Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=False, text=True)
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Simulation subprocess failed with code {result.returncode}"
-            )
+        for attempt in (1, 2):
+            result = subprocess.run(cmd, capture_output=False, text=True)
+            if result.returncode == 0:
+                break
+            # The script exits non-zero when any commodity failed; retry once from a clean folder.
+            shutil.rmtree(Path(out_dir) / "runs", ignore_errors=True)
+            if attempt == 2:
+                raise RuntimeError(f"Simulation subprocess failed twice with code {result.returncode} ({out_dir})")
+            logger.warning("Simulation for %s failed (code %d); retrying once.", out_dir, result.returncode)
 
         # run_simulation.py writes to outdir/<timestamp>_<seed>/
         # We need to move those files up one level into out_dir

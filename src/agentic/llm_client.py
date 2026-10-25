@@ -39,6 +39,7 @@ import re
 import socket
 import threading
 import time
+from collections import deque
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
@@ -148,9 +149,11 @@ class CostLedger:
         self.out_price = float(cfg.get("output_usd_per_million", 0.75)) / 1e6
         self.max_calls = int(cfg.get("max_calls_per_process", 80))
         self.min_interval = float(cfg.get("min_seconds_between_calls", 2.0))
+        self.tokens_per_minute = int(cfg.get("tokens_per_minute", 20_000))
         self.path = REPO_ROOT / cfg.get("ledger_file", "data/llm_cache/cerebras_spend.json")
         self.calls_this_process = 0
         self._last_call = 0.0
+        self._token_reservations: deque[tuple[float, int]] = deque()
         self.state = {"spent_usd": 0.0, "calls": 0, "input_tokens": 0, "output_tokens": 0}
         if self.path.exists():
             try:
@@ -172,21 +175,42 @@ class CostLedger:
         return input_tokens * self.in_price + max_tokens * self.out_price
 
     def reserve(self, input_tokens: int, max_tokens: int) -> None:
-        """Raise instead of sending a request that could break the budget or call caps."""
+        """Reserve worst-case spend and TPM capacity before sending a request."""
         with self._lock:
             if self.calls_this_process >= self.max_calls:
                 raise BudgetExceededError(
                     f"Per-process Cerebras call cap reached ({self.max_calls}); raise "
                     "cerebras_budget.max_calls_per_process in llm_config.yaml if intended.")
+            request_tokens = input_tokens + max_tokens
+            if self.tokens_per_minute > 0 and request_tokens > self.tokens_per_minute:
+                raise BudgetExceededError(
+                    f"Request reserves {request_tokens} tokens, exceeding the configured Cerebras "
+                    f"TPM budget of {self.tokens_per_minute}; reduce prompt or max_tokens.")
             cost = self.worst_case(input_tokens, max_tokens)
             if cost > self.remaining():
                 raise BudgetExceededError(
                     f"Request worst-case ${cost:.4f} exceeds remaining Cerebras budget ${self.remaining():.4f}.")
+            if self.tokens_per_minute > 0:
+                while True:
+                    now = time.monotonic()
+                    while self._token_reservations and now - self._token_reservations[0][0] >= 60:
+                        self._token_reservations.popleft()
+                    used = sum(tokens for _, tokens in self._token_reservations)
+                    if used + request_tokens <= self.tokens_per_minute:
+                        break
+                    wait = 60 - (now - self._token_reservations[0][0]) + 0.1
+                    logger.info(
+                        "[Cerebras] TPM budget reserved (%d/%d tokens); waiting %.1fs before request.",
+                        used, self.tokens_per_minute, wait,
+                    )
+                    time.sleep(wait)
             wait = self.min_interval - (time.time() - self._last_call)
             if wait > 0:
                 time.sleep(wait)
             self._last_call = time.time()
             self.calls_this_process += 1
+            if self.tokens_per_minute > 0:
+                self._token_reservations.append((time.monotonic(), request_tokens))
 
     def record(self, prompt_tokens: int, completion_tokens: int) -> float:
         cost = prompt_tokens * self.in_price + completion_tokens * self.out_price
@@ -268,7 +292,10 @@ def get_gemini_pool() -> GeminiKeyPool:
 
 _FATAL_PATTERNS = ("401", "403", "402", "invalid api key", "authentication", "unauthorized",
                    "permission", "insufficient", "billing", "payment", "credit", "exceeded your")
-_RATE_PATTERNS = ("429", "rate limit", "rate_limit", "too many requests", "resource_exhausted", "quota")
+_RATE_PATTERNS = (
+    "429", "rate limit", "rate_limit", "too many requests", "resource_exhausted", "quota",
+    "ratelimiterror", "tokens per minute", "token per minute", "too many tokens processed", "tpm limit",
+)
 _TRANSIENT_PATTERNS = ("500", "502", "503", "504", "timeout", "timed out", "unavailable",
                        "connection", "overloaded", "high demand")
 
@@ -436,7 +463,10 @@ class LLMClient:
         else:
             response = self._complete_gemini(call_kwargs)
 
-        if self.use_cache:
+        if self.use_cache and not any(
+            choice.get("finish_reason") == "length"
+            for choice in response.get("choices", [])
+        ):
             self._write_cache(cache_key, response)
         return response
 
@@ -464,7 +494,7 @@ class LLMClient:
                     raise LLMUnavailableError(f"Cerebras rejected the request: {str(exc)[:200]}") from exc
                 if kind == "bad_request" or attempt == attempts:
                     raise LLMUnavailableError(f"Cerebras call failed: {str(exc)[:200]}") from exc
-                time.sleep(_retry_after(exc, 20.0 * attempt) if kind == "rate" else 2.0 * attempt)
+                time.sleep(_retry_after(exc, 60.0) if kind == "rate" else 2.0 * attempt)
                 continue
             usage = response.get("usage") or {}
             cost = ledger.record(int(usage.get("prompt_tokens") or est_in),

@@ -44,8 +44,7 @@ xgboost:
 supervised:
   min_positives: 5             # fewer positive rows → classifier skipped with a warning
   require_all_personas: false  # true → raise InsufficientLabelsError instead (SRS FR-2.3 strict mode)
-  cv_folds: 3                  # GroupKFold folds for out-of-fold threshold tuning
-  cv_block_ticks: 600          # time-block size for CV groups (keeps overlapping windows together)
+  cv_folds: 3                  # GroupKFold folds; source-market groups keep overlapping windows together
   threshold_bounds: [0.25, 0.9]  # tuned thresholds are kept inside this range (few-episode robustness)
   threshold_plateau_tol: 0.005   # thresholds within this (smoothed) OOF F1 of the best form the plateau; its centre is used
   threshold_keep_tol: 0.01       # on retrain, keep the previous threshold while its OOF F1 is within this of the best
@@ -54,8 +53,20 @@ supervised:
   # 1/fraction (unbiased class balance and F1). ~99% of the 2M+ cumulative rows are negatives; the 12
   # threshold-tuning fits took 572 s and the 4 final fits 249 s of the round-7 retrain (run seed888).
   cv_negative_fraction: 0.25     # threshold-tuning folds
-  negative_fraction: 1.0         # final models
+  negative_fraction: 0.5         # final models (negatives re-weighted x2; offsets the variant markets and family model: retrain time stays ~flat)
   subsample_min_rows: 50000      # smaller training sets are never subsampled
+  # Hard negatives: benign windows of the accounts built to resemble a persona (look-alikes, and
+  # manipulator accounts outside their episodes) are never subsampled and weigh more in the final
+  # fits. Run seed555: 63% of no-episode cases were the crossing desk (rebalance_*) called wash
+  # trading, the rest mostly hedgers / LPs / fund families. Training weights only; never a feature.
+  hard_negatives:
+    trader_prefixes: [lp_, hedger_, fund_, rebalance_, hft_, algo_, occ_, spoofer_, layerer_, wash_, pnd_]
+    weight: 3.0
+  # Extra classifier per family of personas the features cannot always tell apart (a split spoof
+  # looks like a ladder); a family flag goes to the member closest to its own threshold.
+  family_models:
+    fake_depth: [spoofing, layering]
+  iso_score_feature: true        # the trader-level anomaly percentile is also a classifier input
 
 # --- Ensemble Scorer ---
 ensemble:
@@ -126,4 +137,16 @@ labels:
 loop:
   feature_workers: 3      # round markets' features computed in parallel processes (~2 GB RAM each at 10,000 ticks)
   probe_workers: 8        # probe markets (all candidate sets) simulated + featurised in one pool
+  # Randomised persona variants (src/adversarial/variants.py), simulated in parallel with each
+  # round's own markets: `train_variants` extra training markets per round (domain randomisation),
+  # and `benchmark_markets` fixed markets of unseen variants (simulated once, never trained on)
+  # scored by every round's retrained detector: the transfer curve ("bench" phase).
+  train_variants: 1
+  benchmark_markets: 2
+  variant_ticks_fraction: 0.5   # their length as a share of --ticks
   replay_check_every: 2   # held-out replay check on round 0, every 2nd round and always the final round
+
+# How the web app turns flagged windows into analyst cases (display only; does not change the detector).
+alert_cases:
+  min_windows: 2     # a case needs this many consecutive flagged windows; shorter alerts are "brief"
+  edge_ticks: 120    # a flag on a manipulator account within this many ticks of its own episode is "near episode"

@@ -230,9 +230,10 @@ export default function ModelLab() {
     { key: "round", label: "Round", align: "right" as const },
     { key: "persona", label: "Persona", format: (v: unknown) => <span className="flex items-center gap-1.5"><PersonaMark persona={String(v)} />{PERSONA_META[String(v)]?.label}</span> },
     { key: "phase", label: "Detector", format: (v: unknown) => (v === "pre" ? "Frozen" : "Retrained") },
-    ...(["precision", "recall", "f1", "fpr", "caught_coverage", "family_coverage", "caught_weak_share", "support"] as const).map((k) => ({
+    ...(["precision", "recall", "f1", "family_f1", "fpr", "caught_coverage", "family_coverage", "caught_weak_share", "support"] as const).map((k) => ({
       key: k,
-      label: k === "caught_coverage" ? "Any-alert cov." : k === "family_coverage" ? "Family cov." : k === "caught_weak_share" ? "Barely caught" : k === "fpr" ? "FPR" : k[0].toUpperCase() + k.slice(1),
+      label:
+        k === "caught_coverage" ? "Any-alert cov." : k === "family_coverage" ? "Family cov." : k === "family_f1" ? "Fake-depth F1" : k === "caught_weak_share" ? "Barely caught" : k === "fpr" ? "FPR" : k[0].toUpperCase() + k.slice(1),
       align: "right" as const,
       format: (v: unknown) => (typeof v === "number" ? (k === "support" ? String(v) : v.toFixed(k === "fpr" ? 4 : 3)) : "-"),
     })),

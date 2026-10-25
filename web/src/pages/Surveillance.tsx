@@ -34,7 +34,8 @@ export default function Surveillance() {
 
   const personas = useMemo(() => ORDER.filter((p) => data?.cases.some((c) => c.persona === p)), [data]);
   const [personaFilter, setPersonaFilter] = useState<string[] | null>(null);
-  const [statusFilter, setStatusFilter] = useState<string[]>(["confirmed", "other_persona", "no_episode"]);
+  const [statusFilter, setStatusFilter] = useState<string[]>(["confirmed", "other_persona", "near_episode", "no_episode"]);
+  const [showBrief, setShowBrief] = useState(false);
   const [minScore, setMinScore] = useState(0);
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
@@ -52,10 +53,11 @@ export default function Surveillance() {
       (c) =>
         activePersonas.includes(c.persona) &&
         statusFilter.includes(c.status) &&
+        (showBrief || c.tier !== "brief") &&
         c.score >= minScore &&
         (!s || c.trader_id.toLowerCase().includes(s) || c.commodity.includes(s)),
     );
-  }, [data, activePersonas, statusFilter, minScore, search]);
+  }, [data, activePersonas, statusFilter, showBrief, minScore, search]);
 
   const pages = Math.max(1, Math.ceil(view.length / PAGE));
   const pageRows = view.slice(page * PAGE, page * PAGE + PAGE);
@@ -105,7 +107,7 @@ export default function Surveillance() {
       ) : (
         <>
           <StatGrid className="grid-cols-2 lg:grid-cols-5">
-            <StatTile label="Persona cases" value={k!.persona_cases} format={fmtInt} icon={<Siren size={15} />} sub="Raised by a persona classifier" />
+            <StatTile label="Persona cases" value={k!.persona_cases} format={fmtInt} icon={<Siren size={15} />} sub={`${k!.min_case_windows}+ consecutive flagged windows`} />
             <StatTile label="Confirmed" value={k!.confirmed} format={fmtInt} tone="good" icon={<ShieldCheck size={15} />} sub="Account, persona and span match" />
             <StatTile label="No matching episode" value={k!.no_episode} format={fmtInt} tone={k!.no_episode ? "warn" : "good"} icon={<ShieldAlert size={15} />} sub="Each costs an investigation" />
             <StatTile label="Missed episodes" value={k!.missed} format={fmtInt} tone={k!.missed ? "critical" : "good"} icon={<ShieldQuestion size={15} />} sub="Never flagged with the right persona" />
@@ -117,6 +119,13 @@ export default function Surveillance() {
               <Callout title={`${fmtInt(k!.review_windows)} review-tier windows`}>
                 The IsolationForest found them unusual, but neither a classifier nor a strong deviation from the account's own history backed it up, so they
                 are not alerts. These are typically legitimate HFT firms and execution algorithms.
+              </Callout>
+            )}
+            {k!.brief > 0 && (
+              <Callout title={`${fmtInt(k!.brief)} brief alerts not counted as cases`}>
+                Flags lasting fewer than {k!.min_case_windows} consecutive windows. Real schemes persist, so a one-window blip is not worth an
+                investigation: {fmtInt(k!.brief_no_episode)} of these had no ground-truth episode and {fmtInt(k!.brief_confirmed)} were confirmed
+                {k!.missed_brief > 0 ? `; ${k!.missed_brief} missed episodes were caught only by a brief alert` : ""}. Use the Brief alerts filter to list them.
               </Callout>
             )}
             {k!.sibling_label > 0 && (
@@ -174,6 +183,12 @@ export default function Surveillance() {
                   {t.label.replace("Ground truth confirms", "Confirmed")}
                 </Chip>
               ))}
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="eyebrow mr-1">Length</span>
+              <Chip active={showBrief} onClick={() => { setShowBrief(!showBrief); setPage(0); }}>
+                Brief alerts ({fmtInt(k!.brief)})
+              </Chip>
             </div>
             <label className="flex items-center gap-2">
               <span className="eyebrow">Min score</span>
@@ -285,7 +300,10 @@ function CaseItem({ c, active, onClick, index }: { c: CaseRow; active: boolean; 
           <span className="truncate text-[11.5px] text-fg-muted">
             {PERSONA_META[c.persona]?.label} · {COMMODITY_META[c.commodity]?.label ?? c.commodity} · {tickClock(c.start_tick)}
           </span>
-          <StatusBadge kind={st.kind}>{c.status === "confirmed" ? "Confirmed" : c.status === "other_persona" ? "Other persona" : "No episode"}</StatusBadge>
+          <StatusBadge kind={st.kind}>
+            {c.status === "confirmed" ? "Confirmed" : c.status === "other_persona" ? "Other persona" : c.status === "near_episode" ? "Near episode" : "No episode"}
+            {c.tier === "brief" ? " · brief" : ""}
+          </StatusBadge>
         </div>
         <div className="mt-2 h-[3px] w-full rounded-full bg-tint/[0.05]">
           <div className="h-full rounded-full" style={{ width: `${Math.max(4, c.score * 100)}%`, background: PERSONA_META[c.persona]?.color }} />

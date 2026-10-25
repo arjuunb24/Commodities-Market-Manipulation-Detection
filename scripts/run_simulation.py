@@ -70,6 +70,12 @@ def main() -> None:
     parser.add_argument("--outdir", type=str, default="data/runs", help="Output directory")
     parser.add_argument("--commodity", type=str, default="gold", help="Commodity to simulate (e.g. gold, crude_oil_wti) or 'all' for all 8.")
     parser.add_argument("--tick-offset", type=int, default=0, help="Tick offset for uninterrupted multi-round datasets")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="Worker processes for the commodities (0 = one per CPU). The adversarial loop runs "
+                             "several of these scripts at once and passes a share of the CPUs to each.")
+    parser.add_argument("--persona-config", type=str, default="",
+                        help="Persona config YAML to use instead of configs/persona_config.yaml "
+                             "(randomised training variants and the benchmark markets)")
     
     args = parser.parse_args()
 
@@ -91,14 +97,15 @@ def main() -> None:
     run_id = f"{ts}_{args.seed}"
     run_dir = io_utils.ensure_run_dir(Path(args.outdir), run_id, overwrite=True)
 
-    persona_config_path = Path(__file__).parent.parent / "configs" / "persona_config.yaml"
+    persona_config_path = Path(args.persona_config) if args.persona_config else         Path(__file__).parent.parent / "configs" / "persona_config.yaml"
     p_cfg = {}
     if persona_config_path.exists():
         with open(persona_config_path) as f:
             p_cfg = yaml.safe_load(f) or {}
 
     from concurrent.futures import ProcessPoolExecutor, as_completed
-    with ProcessPoolExecutor() as executor:
+    failed: list[str] = []
+    with ProcessPoolExecutor(max_workers=args.workers or None) as executor:
         futures = {}
         for com in coms_to_run:
             # If multiple commodities are run, decouple seeds to avoid identical price trajectories
@@ -116,6 +123,12 @@ def main() -> None:
                 all_bars_logs.append(bars_log)
             except Exception as e:
                 print(f" -> Error simulating {com}: {e}")
+                failed.append(com)
+
+    if failed:
+        # A market missing commodities must not be written as if complete: the caller retries.
+        print(f"\nSimulation FAILED for {len(failed)} of {len(coms_to_run)} commodities: {failed}")
+        sys.exit(1)
 
     print("\nMerging datasets...")
     final_trade_df = pd.concat(all_trade_logs, ignore_index=True)

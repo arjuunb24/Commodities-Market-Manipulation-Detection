@@ -49,6 +49,8 @@ from src.core.agents.manipulation.spoofing import SpoofingAgent
 from src.core.agents.manipulation.wash_trading import WashTradingPair
 from src.core.agents.execution_algo import ExecutionAlgo
 from src.core.agents.hft_liquidity_provider import HFTLiquidityProvider
+from src.core.agents.institutional_crossing import InstitutionalCrossingDesk
+from src.core.agents.lookalikes import FundFamily, LadderHedger, QuoteProtectingLP
 from src.core.agents.occasional_trader import OccasionalTrader
 from src.core.agents.market_maker import MarketMaker
 from src.core.agents.mean_reversion_trader import MeanReversionTrader
@@ -117,6 +119,14 @@ class SimConfig:
     # firms and institutional algos that rest and pull large orders.
     n_hft_liquidity_providers: int = 3
     n_execution_algos: int = 3
+    n_institutional_crossing_desks: int = 2
+    # Legitimate look-alikes of each persona (agents/lookalikes.py): large-size liquidity
+    # providers that pull the opposite quote when hit (spoofing), hedgers working one-sided
+    # ladders (layering) and fund families allocating one decision over sub-accounts
+    # (pump-and-dump). Real surveillance has to clear exactly these.
+    n_quote_protecting_lps: int = 3
+    n_ladder_hedgers: int = 3
+    n_fund_families: int = 2
     # Legitimate low-frequency traders that trade exactly like manipulator accounts'
     # background flow (agents/occasional_trader.py), about as many as there are
     # manipulator accounts in a market, so sparse irregular trading identifies nobody.
@@ -139,6 +149,9 @@ class SimConfig:
     market_maker_half_spread_pct: float = 0.0003
     min_spread_ticks: float = 2.0           # floor on the half-spread and noise offset, in price ticks
     manipulator_background_rate: float = 0.05
+    hft_large_quote_probability: float = 0.08
+    execution_algo_start_probability: float = 1 / 450
+    institutional_crossing_cycle_rate: float = 0.01
     # Documented real cases replayed as scripted episodes (configs/case_replays.yaml):
     # [{"case": id, "script": {...}, "start_tick": int, "end_tick": int}, ...].
     # They draw from their own random stream and do not change how the other
@@ -175,6 +188,7 @@ class SimConfig:
     wash_size_jitter: float = 0.0
     wash_camouflage_rate: float = 0.0
     wash_busy_bias: float = 0.0
+    wash_cross_lag: int = 0
 
     # Pump-and-dump parameters
     pnd_burst_duration: int = 200
@@ -198,6 +212,7 @@ class SimConfig:
     layer_placement_stagger: int = 0
     layer_cover_rate: float = 0.0
     layer_cover_size: float = 0.0
+    layer_n_accounts: int = 1
 
     # Output
     data_dir: Path = Path("data")
@@ -333,6 +348,7 @@ def _build_persona(persona, ep_idx, start, end, config, sub_rngs, jitter_rng) ->
                 camouflage_rate=config.wash_camouflage_rate,
                 n_groups=n_groups,
                 busy_period_bias=busy,
+                cross_lag_ticks=int(config.wash_cross_lag),
             )
             for g_idx in range(n_groups)
         ]
@@ -361,6 +377,7 @@ def _build_persona(persona, ep_idx, start, end, config, sub_rngs, jitter_rng) ->
             frequency=float(config.layer_frequency),
             busy_period_bias=float(config.layer_busy_bias),
             placement_stagger=int(config.layer_placement_stagger),
+            n_accounts=int(config.layer_n_accounts),
             start_tick=start, end_tick=end, background_rate=bg,
         )]
     raise ValueError(f"Unknown persona {persona!r}")
@@ -428,13 +445,30 @@ def _build_agents(
         ))
 
     for i in range(config.n_hft_liquidity_providers):
-        agents.append(HFTLiquidityProvider(f"hft_{i}", next(sub_rngs)))
+        agents.append(HFTLiquidityProvider(
+            f"hft_{i}", next(sub_rngs),
+            large_quote_probability=config.hft_large_quote_probability,
+        ))
     for i in range(config.n_execution_algos):
-        agents.append(ExecutionAlgo(f"algo_{i}", next(sub_rngs)))
+        agents.append(ExecutionAlgo(
+            f"algo_{i}", next(sub_rngs),
+            start_prob=config.execution_algo_start_probability,
+        ))
+    for i in range(config.n_institutional_crossing_desks):
+        agents.append(InstitutionalCrossingDesk(
+            f"rebalance_{i}", next(sub_rngs),
+            cycle_rate=config.institutional_crossing_cycle_rate,
+        ))
     # Own random streams, so adding them does not shift the personas' streams.
     if config.n_occasional_traders:
         for i, rng in enumerate(master_rng.spawn(config.n_occasional_traders)):
             agents.append(OccasionalTrader(f"occ_{i}", rng, activity_rate=config.manipulator_background_rate))
+    n_look = config.n_quote_protecting_lps + config.n_ladder_hedgers + config.n_fund_families
+    if n_look:
+        look_rngs = iter(master_rng.spawn(n_look))
+        agents.extend(QuoteProtectingLP(f"lp_{i}", next(look_rngs)) for i in range(config.n_quote_protecting_lps))
+        agents.extend(LadderHedger(f"hedger_{i}", next(look_rngs)) for i in range(config.n_ladder_hedgers))
+        agents.extend(FundFamily(f"fund_{i}", next(look_rngs)) for i in range(config.n_fund_families))
 
     flag_map = {
         "spoofing": config.enable_spoofing,
@@ -598,6 +632,8 @@ def run_simulation(
     # Run-scoped id prefix keeps ids unique when commodities/rounds are merged.
     id_prefix = f"{config.commodity[:3]}{seed}-"
     all_accounts: list[Agent] = list(agents)
+    for actor in agents:
+        all_accounts.extend(getattr(actor, "accounts", []))
     for c in controllers:
         all_accounts.extend(c.agents if hasattr(c, "agents") else [c])
     for a in all_accounts:

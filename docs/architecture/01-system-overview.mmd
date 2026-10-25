@@ -1,0 +1,18 @@
+%%{init: {'theme':'neutral','flowchart':{'curve':'basis','padding':12}}}%%
+flowchart LR
+  CAL["Calibration<br/>Yahoo Finance + published stats"] --> SIM
+  CFG["YAML configs<br/>personas, detector, LLM"] --> SIM
+  SIM["01 Market simulator<br/>agent-based order book"] -->|"order + trade logs<br/>(Parquet)"| FE["02 Feature engine<br/>3-min windows, 30 s step"]
+  FE --> DET["03 Detector<br/>XGBoost + Isolation Forests"]
+  DET -->|"metrics + SHAP"| LOOP["04 Adversarial loop<br/>pre / retrain / post"]
+  LOOP --> STR["05 LLM strategist<br/>proposes new tactics"]
+  STR -->|"new persona<br/>parameters"| SIM
+  DET -->|"flags + SHAP"| AG["05 Case notes +<br/>analyst assistant"]
+  REP["06 Case replays<br/>13 enforcement cases"] --> DET
+  LIVE["06 Real 1-min bars<br/>bar-level model"] --> WEB
+  DET --> WEB["07 Web app<br/>FastAPI + React"]
+  AG --> WEB
+  classDef adv fill:#fbeee5,stroke:#b4531a,color:#14202b
+  classDef core fill:#e3f1f5,stroke:#0f6e8c,color:#14202b
+  class STR,LOOP adv
+  class SIM,FE,DET core

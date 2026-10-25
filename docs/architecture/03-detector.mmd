@@ -1,0 +1,14 @@
+%%{init: {'theme':'neutral'}}%%
+flowchart TB
+  X["Account-window features"] --> MKT["Market Isolation Forest<br/>regime context score"]
+  X --> ISO["Trader Isolation Forest<br/>anomaly percentile, 1% flag rate"]
+  MKT --> CLF
+  ISO --> CLF["XGBoost classifiers<br/>spoofing · layering · wash · pump<br/>+ fake-depth family"]
+  X --> CLF
+  CLF --> THR["Per-persona thresholds<br/>tuned out-of-fold"]
+  THR --> ENS{"Ensemble<br/>or-corroborated"}
+  ISO --> ENS
+  ENS -->|"classifier, or backed-up anomaly"| ALERT["Alert<br/>persona + SHAP reasons"]
+  ENS -->|"anomaly alone"| REV["Review item"]
+  classDef core fill:#e3f1f5,stroke:#0f6e8c,color:#14202b
+  class CLF,ENS core

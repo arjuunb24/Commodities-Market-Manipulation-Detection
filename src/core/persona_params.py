@@ -40,6 +40,7 @@ PERSONA_PARAM_MAP: dict[str, dict[str, tuple[str, type]]] = {
         "size_jitter": ("wash_size_jitter", float),
         "camouflage_rate": ("wash_camouflage_rate", float),
         "busy_period_bias": ("wash_busy_bias", float),
+        "cross_lag_ticks": ("wash_cross_lag", int),
     },
     "pump_and_dump": {
         "burst_duration_ticks": ("pnd_burst_duration", int),
@@ -63,6 +64,7 @@ PERSONA_PARAM_MAP: dict[str, dict[str, tuple[str, type]]] = {
         "placement_stagger": ("layer_placement_stagger", int),
         "cover_rate": ("layer_cover_rate", float),
         "cover_size": ("layer_cover_size", float),
+        "n_accounts": ("layer_n_accounts", int),
     },
 }
 ENABLE_FLAGS = {

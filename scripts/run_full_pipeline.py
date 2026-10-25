@@ -51,13 +51,13 @@ def _fmt(v) -> str:
 
 
 def _print_rows(df) -> None:
-    print(f"{'Persona':<16} {'Phase':<6} {'Precision':>9} {'Recall':>7} {'F1':>7} {'FPR':>7} {'Events':>8} {'Latency':>8} {'Effect x':>8} {'Score':>6}")
-    print("-" * 96)
+    print(f"{'Persona':<16} {'Phase':<6} {'Precision':>9} {'Recall':>7} {'F1':>7} {'FPR':>7} {'Events':>8} {'Latency':>8} {'Caught':>7} {'Effect x':>8} {'Score':>6}")
+    print("-" * 104)
     for _, row in df.sort_values(["persona", "phase"], ascending=[True, False]).iterrows():
         lat = row.get("detection_latency_ticks")
         lat_s = "  -" if lat is None or lat != lat else f"{lat:.0f}"
         print(f"{row['persona']:<16} {row['phase']:<6} {_fmt(row['precision']):>9} {_fmt(row['recall']):>7} "
-              f"{_fmt(row['f1']):>7} {_fmt(row['fpr']):>7} {int(row['events_detected'])}/{int(row['events_total']):<6} {lat_s:>8} "
+              f"{_fmt(row['f1']):>7} {_fmt(row['fpr']):>7} {int(row['events_detected'])}/{int(row['events_total']):<6} {lat_s:>8} {_fmt(row.get('caught_coverage')):>7} "
               f"{_fmt(row.get('effectiveness_ratio')):>8} {_fmt(row.get('mutation_score')) if row['phase'] == 'pre' else '':>6}")
 
 
@@ -108,7 +108,7 @@ def print_metrics_table(summary_df, current_round: int = -1):
     rounds = [current_round] if current_round >= 0 else sorted(summary_df["round"].unique())
     for r in rounds:
         print("\n" + "=" * 76)
-        print(f"ROUND {r}  (pre = detector frozen before this round's mutation, post = retrained)".center(76))
+        print(f"ROUND {r}  (pre = frozen before this mutation [headline], post = retrained, r0 = round-0 detector)".center(76))
         print("=" * 76)
         _print_rows(summary_df[summary_df["round"] == r])
     print()
@@ -183,7 +183,8 @@ def main():
     parser.add_argument("--mutations", choices=["llm", "hand"], default="llm",
                         help="llm = Adversarial Strategist (falls back to the hand-authored library on failure); "
                              "hand = hand-authored library only (no API calls; baseline for comparisons)")
-    parser.add_argument("--test-markets", type=int, default=2, help="Held-out test markets per round")
+    parser.add_argument("--test-markets", type=int, default=2,
+                        help="Held-out test markets per round (default 2; use 4 for more stable estimates at about 1.5x the simulation time)")
     parser.add_argument("--run-name", type=str, default="", help="Optional label appended to the run id")
     parser.add_argument("--no-probe", action="store_true",
                         help="Do not probe-test the strategist's alternative candidates (faster, single blind proposal)")

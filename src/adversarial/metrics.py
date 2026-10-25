@@ -86,6 +86,27 @@ WEAK_COVERAGE = 0.2   # an episode with under 20% of its windows flagged counts 
 PERSONA_FAMILY = {"spoofing": ("spoofing", "layering"), "layering": ("spoofing", "layering")}
 
 
+def family_prf(results: pd.DataFrame, y: pd.DataFrame, family: tuple[str, ...]) -> dict[str, float]:
+    """
+    Window-level precision / recall / F1 of a persona family as ONE class: truth = labelled with any
+    member, prediction = an alert labelled with any member. Spoofing and layering are one offence
+    (CEA 4c(a)(5)(C)) and mutations push them into each other's look, so their per-label scores
+    fall through label swaps that this metric does not count as errors.
+    """
+    if "final_flag" not in results.columns or "predicted_persona" not in results.columns:
+        return {}
+    members = [p for p in family if p in y.columns]
+    if not members:
+        return {}
+    truth = (y[members].to_numpy() > 0).any(axis=1)
+    pred = results["final_flag"].astype(bool).to_numpy() & results["predicted_persona"].astype(str).isin(members).to_numpy()
+    tp = int((truth & pred).sum())
+    p = tp / pred.sum() if pred.sum() else 0.0
+    r = tp / truth.sum() if truth.sum() else float("nan")
+    f1 = 2 * p * r / (p + r) if truth.sum() and (p + r) else (float("nan") if not truth.sum() else 0.0)
+    return {"family_precision": round(float(p), 4), "family_recall": round(float(r), 4), "family_f1": round(float(f1), 4)}
+
+
 def episode_coverage(results: pd.DataFrame, y: pd.DataFrame, events: pd.DataFrame, persona: str,
                      flag_col: str | None = None) -> float:
     """Mean over episodes of the flagged share of that episode's labelled rows (NaN if none)."""
@@ -157,6 +178,7 @@ def compute_round_metrics(
                 # flagged under its own label OR its family sibling's (spoofing <-> layering)
                 fam = res.assign(_family_flag=res[[f"flag_{p}" for p in family]].any(axis=1))
                 entry["family_coverage"] = episode_coverage(fam, lab, events, persona, flag_col="_family_flag")
+                entry.update(family_prf(res, lab, PERSONA_FAMILY[persona]))
             c_ev, c_det, c_lats = event_detection(res, events, persona, flag_col="final_flag")
             c_shares = episode_shares(res, lab, events, persona, flag_col="final_flag")
             entry.update({
@@ -247,15 +269,22 @@ def load_round_metrics(round_dir: Path, phase: str = "post") -> dict[str, dict[s
     return data.get("personas" if phase == "post" else "pre_retrain", {}) or {}
 
 
+PHASE_KEYS = (("post", "personas"), ("pre", "pre_retrain"), ("r0", "round0_detector"), ("bench", "benchmark"))
+
+
 def build_summary_table(all_metrics: list[dict[str, Any]]) -> pd.DataFrame:
     """
     Tidy table: one row per (round, persona, phase).
 
-    all_metrics entries: {"round": r, "personas": post_metrics, "pre_retrain": pre_metrics?}
+    all_metrics entries: {"round": r, "personas": post_metrics, "pre_retrain": pre_metrics?,
+                          "round0_detector": metrics of the round-0 detector on round r's markets?}
+    Phases: post (retrained), pre (frozen previous detector: the evasion measure), r0
+    (round-0 detector: drift from the baseline) and bench (retrained detector on the fixed
+    benchmark of unseen random variants: transfer). caught_coverage counts any alert.
     """
     rows = []
     for entry in all_metrics:
-        for phase, key in (("post", "personas"), ("pre", "pre_retrain")):
+        for phase, key in PHASE_KEYS:
             for persona, m in (entry.get(key) or {}).items():
                 rows.append({
                     "round": entry["round"],
@@ -270,6 +299,8 @@ def build_summary_table(all_metrics: list[dict[str, Any]]) -> pd.DataFrame:
                     "events_detected": m.get("events_detected", 0),
                     "detection_latency_ticks": m.get("detection_latency_ticks"),
                     "episode_coverage": m.get("episode_coverage"),
+                    "caught_coverage": m.get("caught_coverage"),
+                    "family_coverage": m.get("family_coverage"),
                     "effectiveness_ratio": (entry.get("effectiveness_ratio") or {}).get(persona),
                     "mutation_score": (entry.get("mutation_score") or {}).get(persona),
                 })
@@ -282,6 +313,7 @@ def build_summary_table(all_metrics: list[dict[str, Any]]) -> pd.DataFrame:
 
 def write_round_metrics_parquet(summary: pd.DataFrame, commodity: str, path: Path) -> None:
     """Schema-validated round_metrics.parquet (SRS §6.1 round_metrics contract)."""
+    summary = summary[summary["phase"].isin(["pre", "post"])] if not summary.empty else summary
     if summary.empty:
         return
     df = pd.DataFrame({

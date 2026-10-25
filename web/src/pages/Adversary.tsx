@@ -1,6 +1,6 @@
 import clsx from "clsx";
 import { AnimatePresence, motion } from "framer-motion";
-import { ArrowRight, Bot, ChevronDown, FlaskConical, PenLine, ShieldAlert, Undo2 } from "lucide-react";
+import { ArrowRight, Bot, ChevronDown, Dices, FlaskConical, PenLine, ShieldAlert, Undo2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { EChartsOption } from "echarts";
 import { EChart } from "@/components/charts/EChart";
@@ -14,11 +14,23 @@ import { INK, PERSONAS, PERSONA_META } from "@/lib/theme";
 
 type Lens = "score" | "ratio" | "coverage";
 
+/** Probe candidate written by the LLM (primary or alternative), not by code exploration. */
+const isLlmCandidate = (c: { source?: string | null; origin?: string | null }) => (c.source ? c.source.startsWith("llm") : !c.origin);
+
 function SourceBadge({ source }: { source: string }) {
   if (source === "agentic")
     return (
       <span className="inline-flex items-center gap-1 rounded-md border border-accent/30 bg-accent/10 px-1.5 py-0.5 text-[11px] font-medium text-accent">
         <Bot size={12} /> LLM strategist
+      </span>
+    );
+  if (source === "code_exploration")
+    return (
+      <span
+        title="Kept a random code-exploration candidate: it beat the LLM's proposals in the probe (no LLM call)"
+        className="inline-flex items-center gap-1 rounded-md border border-ink-600 bg-tint/[0.03] px-1.5 py-0.5 text-[11px] font-medium text-fg-2"
+      >
+        <Dices size={12} /> Code exploration
       </span>
     );
   if (source === "hand_authored")
@@ -137,8 +149,7 @@ function PersonaCard({ persona, d }: { persona: string; d: StrategistPersona }) 
                 return (
                   <tr key={i} className={clsx(chosen ? "text-accent" : "text-fg-2")} title={Object.entries(c.changes ?? {}).map(([k, v]) => `${k}=${fmtVal(v)}`).join(", ")}>
                     <td className="py-0.5">
-                      {i}
-                      {c.origin ? " exp" : ""}
+                      {i} {isLlmCandidate(c) ? "LLM" : "code"}
                       {chosen ? " kept" : ""}
                     </td>
                     <td className="py-0.5 text-right">{fmtPct(c.coverage)}</td>
@@ -265,6 +276,8 @@ export default function Adversary() {
 
   const all = hist.flatMap((h) => Object.entries(h.personas).map(([p, d]) => ({ round: h.round, persona: p, d })));
   const llm = all.filter((x) => x.d.source === "agentic").length;
+  const explored = all.filter((x) => x.d.source === "code_exploration").length;
+  const llmProposed = all.filter((x) => x.d.source === "agentic" || (x.d.probe?.candidates ?? []).some(isLlmCandidate)).length;
   const best = all.reduce<(typeof all)[number] | null>((b, x) => ((x.d.score ?? -1) > (b?.d.score ?? -1) ? x : b), null);
   const reverts = all.reduce((n, x) => n + x.d.guard_reverts.length, 0);
   const probed = all.filter((x) => x.d.probe && x.d.probe.candidates.length > 1).length;
@@ -286,7 +299,15 @@ export default function Adversary() {
             <ScopeNote frozenByMarket={perf.data?.frozen_by_market} />
           </div>
           <StatGrid className="grid-cols-2 lg:grid-cols-4">
-            <StatTile label="LLM mutations" value={llm} format={(v) => `${Math.round(v)} / ${all.length}`} icon={<Bot size={15} />} sub="The rest used the hand-written library" />
+            <StatTile
+              label="LLM mutations kept"
+              value={llm}
+              format={(v) => `${Math.round(v)} / ${all.length}`}
+              icon={<Bot size={15} />}
+              sub={`LLM answered for ${llmProposed} of ${all.length} · code exploration won ${explored}${
+                all.length - llm - explored ? ` · ${all.length - llm - explored} hand-written fallback` : ""
+              }`}
+            />
             <StatTile label="Best evasion score" value={best?.d.score ?? null} format={(v) => v.toFixed(3)} tone="accent" sub={best ? `${PERSONA_META[best.persona]?.label}, round ${best.round}${frozenMissing ? " · pooled" : ""}` : undefined} />
             <StatTile label="Probe-tested" value={probed} format={(v) => String(Math.round(v))} icon={<FlaskConical size={15} />} sub="Mutations chosen among several candidates" />
             <StatTile label="Guard reverts" value={reverts} format={(v) => String(Math.round(v))} icon={<ShieldAlert size={15} />} sub="Knob changes undone to keep the effect" />

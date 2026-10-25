@@ -33,7 +33,7 @@ from sklearn.preprocessing import RobustScaler
 
 logger = logging.getLogger(__name__)
 
-NON_FEATURE_COLUMNS = {"window_end", "commodity", "trader_id", "window_start"}
+NON_FEATURE_COLUMNS = {"window_end", "commodity", "trader_id", "window_start", "cv_group"}
 
 
 def behaviour_columns(X: pd.DataFrame) -> list[str]:

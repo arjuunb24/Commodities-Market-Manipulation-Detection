@@ -23,6 +23,14 @@ FAKE_DEPTH = {"spoofing", "layering"}
 CASE_PAD = 120
 
 
+def _case_rules() -> dict:
+    """alert_cases section of detector_config.yaml: minimum case length and the near-episode margin."""
+    import yaml
+    cfg = data.CONFIG_DIR / "detector_config.yaml"
+    sec = ((yaml.safe_load(cfg.read_text()) or {}).get("alert_cases") or {}) if cfg.exists() else {}
+    return {"min_windows": int(sec.get("min_windows", 2)), "edge_ticks": int(sec.get("edge_ticks", CASE_PAD))}
+
+
 def case_id(c: dict) -> str:
     return f"{c['commodity']}~{c['trader_id']}~{c['persona']}~{int(c['start_tick'])}~{int(c['end_tick'])}"
 
@@ -71,25 +79,38 @@ def _build_cases(flags: pd.DataFrame) -> list[dict]:
     return sorted(cases, key=lambda c: -c["score"])
 
 
-def _match(cases: list[dict], ev: pd.DataFrame) -> list[dict]:
-    """Attach the overlapping ground-truth episode to each case; return the missed episodes."""
+def _match(cases: list[dict], ev: pd.DataFrame, min_windows: int = 1, edge_ticks: int = 0) -> list[dict]:
+    """Attach the overlapping ground-truth episode to each case; return the episodes no case caught.
+
+    Alerts shorter than min_windows are tier "brief": they keep their status but do not count as
+    catching an episode (an episode caught only by brief alerts is missed, with brief_only=True).
+    A flag on a manipulator account within edge_ticks of its own episode, without overlapping it,
+    is "near_episode" (its quiet trading just before or after the labelled span), not a false alarm.
+    """
     matched: set[str] = set()
+    brief_hit: set[str] = set()
     evs = [] if ev.empty else ev.to_dict("records")
     for c in cases:
-        c["gt_event"] = c["gt_persona"] = None
-        for e in evs:
-            if e["commodity"] != c["commodity"] or c["trader_id"] not in set(e["trader_ids"]):
-                continue
+        c["tier"] = "case" if c["n_windows"] >= min_windows else "brief"
+        c["gt_event"] = c["gt_persona"] = c["near_event"] = None
+        mine = [e for e in evs if e["commodity"] == c["commodity"] and c["trader_id"] in set(e["trader_ids"])]
+        for e in mine:
             if c["end_tick"] < e["start_tick"] or c["start_tick"] > e["end_tick"]:
                 continue
             c["gt_event"], c["gt_persona"] = e["event_id"], e["persona"]
             if c["persona"] == e["persona"]:
-                matched.add(e["event_id"])
+                (matched if c["tier"] == "case" else brief_hit).add(e["event_id"])
             break
-        c["status"] = ("no_episode" if c["gt_event"] is None
+        if c["gt_event"] is None:
+            for e in mine:
+                if c["start_tick"] - edge_ticks <= e["end_tick"] and c["end_tick"] + edge_ticks >= e["start_tick"]:
+                    c["near_event"] = e["event_id"]
+                    break
+        c["status"] = ("near_episode" if c["near_event"] else "no_episode" if c["gt_event"] is None
                        else "confirmed" if c["gt_persona"] == c["persona"] else "other_persona")
     return [{"event_id": e["event_id"], "persona": e["persona"], "commodity": e["commodity"],
-             "start_tick": int(e["start_tick"]), "end_tick": int(e["end_tick"]), "trader_ids": list(e["trader_ids"])}
+             "start_tick": int(e["start_tick"]), "end_tick": int(e["end_tick"]), "trader_ids": list(e["trader_ids"]),
+             "brief_only": e["event_id"] in brief_hit}
             for e in evs if e["event_id"] not in matched]
 
 
@@ -101,7 +122,7 @@ def _cases_cached(run: str, rnd: int, market: str | None) -> tuple[list[dict], l
         return [], [], {"has_flags": False}
     flags = data.flags_for_market(run, rnd, market)
     cases = _build_cases(flags) if not flags.empty else []
-    missed = _match(cases, ev)
+    missed = _match(cases, ev, **_case_rules())
     meta = {"has_flags": True,
             "review_windows": int((lean["alert_tier"] == "review").sum()) if "alert_tier" in lean.columns else 0,
             "windows": int(len(lean)), "alert_windows": int(lean["final_flag"].sum())}
@@ -110,14 +131,22 @@ def _cases_cached(run: str, rnd: int, market: str | None) -> tuple[list[dict], l
 
 def summary(run: str, rnd: int, market: str | None) -> dict:
     cases, missed, meta = _cases_cached(run, rnd, market)
-    cls = [c for c in cases if c["persona"] != "anomaly"]
-    anom = [c for c in cases if c["persona"] == "anomaly"]
+    rules = _case_rules()
+    brief = [c for c in cases if c["tier"] == "brief" and c["persona"] != "anomaly"]
+    cls = [c for c in cases if c["persona"] != "anomaly" and c["tier"] == "case"]
+    anom = [c for c in cases if c["persona"] == "anomaly" and c["tier"] == "case"]
     kpi = {
         "persona_cases": len(cls),
         "confirmed": sum(c["status"] == "confirmed" for c in cls),
         "no_episode": sum(c["status"] == "no_episode" for c in cls),
         "other_persona": sum(c["status"] == "other_persona" for c in cls),
+        "near_episode": sum(c["status"] == "near_episode" for c in cls),
         "missed": len(missed),
+        "missed_brief": sum(m["brief_only"] for m in missed),
+        "brief": len(brief),
+        "brief_confirmed": sum(c["status"] == "confirmed" for c in brief),
+        "brief_no_episode": sum(c["status"] == "no_episode" for c in brief),
+        "min_case_windows": rules["min_windows"],
         "anomalies": len(anom),
         "anomalies_on_episode": sum(c["gt_event"] is not None for c in anom),
         "sibling_label": sum(c["gt_persona"] in FAKE_DEPTH and c["persona"] in FAKE_DEPTH and c["gt_persona"] != c["persona"]
@@ -125,7 +154,7 @@ def summary(run: str, rnd: int, market: str | None) -> dict:
         **{k: meta.get(k, 0) for k in ("review_windows", "windows", "alert_windows")},
     }
     slim = [{k: c[k] for k in ("id", "commodity", "trader_id", "persona", "start_tick", "end_tick", "score", "n_windows",
-                               "triggered_by", "status", "gt_event", "gt_persona")} for c in cases]
+                               "triggered_by", "status", "gt_event", "gt_persona", "tier", "near_event")} for c in cases]
     return clean({"has_flags": meta.get("has_flags", False), "kpi": kpi, "cases": slim, "missed": missed,
                   "thresholds": data.thresholds(run, rnd)})
 
@@ -168,7 +197,7 @@ def detail(run: str, rnd: int, market: str | None, cid: str) -> dict:
     shap = {k: float(v) for k, v in (c.get("top_shap_features") or {}).items() if v is not None}
     return clean({
         **{k: c[k] for k in ("id", "commodity", "trader_id", "persona", "start_tick", "end_tick", "score", "n_windows",
-                             "triggered_by", "status", "gt_event", "gt_persona", "iso_score")},
+                             "triggered_by", "status", "gt_event", "gt_persona", "iso_score", "tier", "near_event")},
         "persona_scores": c.get("persona_scores") or {},
         "thresholds": data.thresholds(run, rnd),
         "shap": sorted(({"feature": k, "value": v} for k, v in shap.items()), key=lambda d: -abs(d["value"])),

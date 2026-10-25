@@ -107,7 +107,7 @@ def test_ring_features_find_a_rotating_ring_but_not_hft_flow():
         rows.append({"win": 5, "trader_id": "hft_0", "cpty": f"noise_{k}", "bought": 30.0, "sold": 30.0})
     pw = pd.DataFrame(rows)
     f = pd.DataFrame({"win": 5, "trader_id": ring + [f"noise_{k}" for k in range(20)] + ["hft_0"]})
-    out = _engine()._add_ring_features(f, pw, median_size=10.0).set_index("trader_id")
+    out = _engine()._add_ring_features(f, pw, pd.Series({5: 10.0})).set_index("trader_id")
     assert (out.loc[ring, "ring_size"] == 6).all() and (out.loc[ring, "ring_volume_share"] > 0.99).all()
     assert (out.loc[[f"noise_{k}" for k in range(20)], "mutual_cpty_share"] == 0).all()   # HFT is not a ring partner
     assert out.loc["hft_0", "ring_size"] == 1

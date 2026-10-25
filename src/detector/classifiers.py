@@ -39,7 +39,7 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-EXCLUDED_COLUMNS = {"window_end", "commodity", "trader_id", "window_start"}
+EXCLUDED_COLUMNS = {"window_end", "commodity", "trader_id", "window_start", "cv_group"}
 
 
 class InsufficientLabelsError(ValueError):
@@ -62,7 +62,6 @@ class SupervisedDetector:
         self.min_positives = int(sup.get("min_positives", 5))
         self.require_all_personas = bool(sup.get("require_all_personas", False))
         self.cv_folds = int(sup.get("cv_folds", 3))
-        self.block_ticks = int(sup.get("cv_block_ticks", 600))
         self.threshold_bounds = tuple(sup.get("threshold_bounds", [0.25, 0.9]))
         self.threshold_plateau_tol = float(sup.get("threshold_plateau_tol", 0.005))
         self.threshold_keep_tol = float(sup.get("threshold_keep_tol", 0.01))
@@ -73,7 +72,20 @@ class SupervisedDetector:
         self.cv_negative_fraction = float(sup.get("cv_negative_fraction", 1.0))   # threshold-tuning folds
         self.negative_fraction = float(sup.get("negative_fraction", 1.0))         # final models
         self.subsample_min_rows = int(sup.get("subsample_min_rows", 50_000))      # smaller sets: never subsampled
+        # Hard negatives: benign windows of the populations built to look like a persona (look-alikes,
+        # manipulator accounts outside their episodes). Never subsampled away, and weighted up in the
+        # final models so the classifiers learn the boundary instead of the easy background.
+        hn = sup.get("hard_negatives") or {}
+        self.hard_prefixes: tuple[str, ...] = tuple(hn.get("trader_prefixes") or ())
+        self.hard_weight = float(hn.get("weight", 1.0))
         self._kept_rounds: dict[str, int] = {}   # consecutive retrains each persona's threshold was kept
+        # Family classifiers: one extra model per group of personas the law treats as one offence and
+        # the features cannot always tell apart. A split spoof looks like a ladder and multi-account
+        # layering like spoofing (run seed1001: the persona classifiers flagged each other's episodes
+        # and own-label recall fell to 0). The family model learns "fake depth" from both; which
+        # scheme it was is decided afterwards from the two persona probabilities (pipeline.score).
+        self.family_models: dict[str, list[str]] = {
+            k: list(v) for k, v in (sup.get("family_models", {"fake_depth": ["spoofing", "layering"]}) or {}).items()}
         self.default_threshold = float(config.get("ensemble", {}).get("supervised_threshold", 0.5))
         self.models: dict[str, Any] = {}
         self.thresholds: dict[str, float] = {}
@@ -105,11 +117,12 @@ class SupervisedDetector:
         )
 
     def _groups(self, X: pd.DataFrame) -> np.ndarray:
-        if "window_start" in X.index.names:
-            ws = X.index.get_level_values("window_start").to_numpy()
-        else:
-            ws = np.arange(len(X))
-        return ws // max(1, self.block_ticks)
+        if "cv_group" in X.columns:
+            return X["cv_group"].to_numpy()
+        # Without source-market identity, a time split cannot reliably keep
+        # overlapping rolling windows together. Disable OOF tuning rather than
+        # report a threshold validated on near-duplicate rows.
+        return np.zeros(len(X), dtype=np.int8)
 
     def _pick_threshold(self, grid: np.ndarray, scores: list[float], previous: float | None,
                         kept: int = 0) -> float:
@@ -133,17 +146,39 @@ class SupervisedDetector:
                 return float(previous)
         return best
 
-    def _negative_subsample(self, y: np.ndarray, fraction: float) -> tuple[np.ndarray | None, np.ndarray | None]:
-        """Row indices (all positives + `fraction` of negatives) and their 1/fraction weights; (None, None) = all rows."""
+    def _hard_mask(self, X: pd.DataFrame) -> np.ndarray | None:
+        """Rows whose account belongs to a hard-negative population (by trader-id prefix); None = off."""
+        if not self.hard_prefixes or "trader_id" not in (X.index.names or []):
+            return None
+        return np.asarray(X.index.get_level_values("trader_id").astype(str).str.startswith(self.hard_prefixes), dtype=bool)
+
+    def _negative_subsample(self, y: np.ndarray, fraction: float, hard: np.ndarray | None = None,
+                            hard_weight: float = 1.0) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """
+        Row indices (all positives, every hard negative, `fraction` of the other negatives) and their
+        weights: 1 for positives, `hard_weight` for hard negatives, 1/fraction for sampled negatives.
+        (None, None) = all rows at weight 1.
+        """
+        hard_neg = None if hard is None else (hard & (y == 0))
         if fraction >= 1.0 or len(y) < self.subsample_min_rows:
-            return None, None
+            if hard_neg is None or hard_weight == 1.0:
+                return None, None
+            return np.arange(len(y)), np.where(hard_neg, hard_weight, 1.0)
         rng = np.random.default_rng(int(self.xgb_config.get("random_state", 42)))
-        idx = np.flatnonzero((y == 1) | (rng.random(len(y)) < fraction))
-        return idx, np.where(y[idx] == 1, 1.0, 1.0 / fraction)
+        keep = (y == 1) | (rng.random(len(y)) < fraction)
+        if hard_neg is not None:
+            keep |= hard_neg
+        idx = np.flatnonzero(keep)
+        w = np.where(y[idx] == 1, 1.0, 1.0 / fraction)
+        if hard_neg is not None:
+            w = np.where(hard_neg[idx], hard_weight, w)
+        return idx, w
 
     def _tune_threshold(self, Xp: pd.DataFrame, y: np.ndarray, groups: np.ndarray, spw: float,
-                        previous: float | None = None, kept: int = 0, sample_weight: np.ndarray | None = None) -> float:
-        idx, eval_w = self._negative_subsample(y, self.cv_negative_fraction)
+                        previous: float | None = None, kept: int = 0, sample_weight: np.ndarray | None = None,
+                        hard: np.ndarray | None = None) -> float:
+        # Hard negatives are always kept here but at weight 1, so the tuned F1 stays an unbiased estimate.
+        idx, eval_w = self._negative_subsample(y, self.cv_negative_fraction, hard)
         if idx is not None:
             Xp, y, groups = Xp.iloc[idx], y[idx], groups[idx]
             sample_weight = eval_w if sample_weight is None else sample_weight[idx] * eval_w
@@ -185,12 +220,10 @@ class SupervisedDetector:
         self.feature_columns = model_columns(X)
         Xm = X[self.feature_columns]
         groups = self._groups(X)
+        hard = self._hard_mask(X)
         previous = dict(self.thresholds)   # retraining the same detector: keep thresholds steady
         self.models, self.thresholds, self._explainers = {}, {}, {}
-        for persona in self.personas:
-            if persona not in y.columns:
-                continue
-            target = y[persona].astype(int).to_numpy()
+        for persona, target in self._targets(y):
             n_pos = int(target.sum())
             n_neg = len(target) - n_pos
             if n_pos < self.min_positives or n_neg == 0:
@@ -204,16 +237,24 @@ class SupervisedDetector:
             spw = n_neg / n_pos
             logger.info("[%s] training on %d rows (%d positive, scale_pos_weight=%.1f)", persona, len(target), n_pos, spw)
             prev, kept = previous.get(persona), self._kept_rounds.get(persona, 0)
-            self.thresholds[persona] = self._tune_threshold(Xm, target, groups, spw, prev, kept, sample_weight)
+            self.thresholds[persona] = self._tune_threshold(Xm, target, groups, spw, prev, kept, sample_weight, hard)
             self._kept_rounds[persona] = kept + 1 if prev is not None and self.thresholds[persona] == prev else 0
             model = self._make_model(spw, len(target))
-            idx, sub_w = self._negative_subsample(target, self.negative_fraction)
+            idx, sub_w = self._negative_subsample(target, self.negative_fraction, hard, self.hard_weight)
             if idx is None:
                 model.fit(Xm, target, sample_weight=sample_weight)
             else:
                 w = sub_w if sample_weight is None else sample_weight[idx] * sub_w
                 model.fit(Xm.iloc[idx], target[idx], sample_weight=w)
             self.models[persona] = model
+
+    def _targets(self, y: pd.DataFrame) -> list[tuple[str, np.ndarray]]:
+        """(model name, 0/1 target): one per persona, then one per family whose members are all labelled."""
+        out = [(p, y[p].astype(int).to_numpy()) for p in self.personas if p in y.columns]
+        for fam, members in self.family_models.items():
+            if members and all(m in y.columns for m in members):
+                out.append((fam, y[members].max(axis=1).astype(int).to_numpy()))
+        return out
 
     def is_trained(self) -> bool:
         return bool(self.models)

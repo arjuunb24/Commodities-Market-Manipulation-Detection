@@ -24,6 +24,8 @@ Trader-level behavioural features, grouped by the persona they target:
                side in the same tick — Sarao-style spoof repricing)
   Spoofing     spoof_signature (share of the account's large cancelled orders
                during whose life it was filled on the opposite side),
+               linked_spoof_signature / linked_lift_log (the same bait-and-switch
+               split over two accounts, see _linked_pair_steps),
                cancel_ratio, fast_cancel_ratio, mean_cancel_lifetime,
                large_order_share, large_cancel_ratio, max_order_size_rel,
                passive_distance_bp, cancel_exec_opposition (cancels on one
@@ -49,6 +51,10 @@ NaN policy (Implementation Plan §6.1): ratios with a zero denominator are
 with activity counts (n_orders, n_trades) so models can tell "inactive" from
 "zero". Windows shorter than the full window length at the start of a run are
 dropped rather than zero-padded.
+
+Features are evaluated at completed-window time. Historical market-size
+baselines use prior steps (with a first-step cold-start fallback), and
+order-lifetime signatures never inspect fills after cancellation.
 """
 
 from __future__ import annotations
@@ -62,7 +68,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 FAST_CANCEL_TICKS = 10        # cancelled within 10 s of placement
-LARGE_ORDER_MULTIPLE = 4.0    # ≥ 4x the commodity's median order size
+LARGE_ORDER_MULTIPLE = 4.0    # ≥ 4x the pre-step median of prior order-size step medians
 PEER_Z_COLUMNS = [
     "cancel_ratio", "fast_cancel_ratio", "avg_order_size_rel", "max_order_size_rel",
     "gross_volume_share", "reciprocal_ratio", "aggressor_ratio", "large_order_share",
@@ -75,7 +81,7 @@ SELF_Z_COLUMNS = [
     "fast_cancel_ratio", "n_orders", "gross_volume_share", "layered_order_share",
 ]
 # Bumped whenever feature definitions change, so cached features.parquet files are recomputed.
-FEATURE_VERSION = 3
+FEATURE_VERSION = 5
 SELF_Z_MIN_HISTORY = 10         # past active windows (5 min) needed before a self z-score is reported
 # Minimum scales: a sparse account's history barely varies, so tiny changes became huge z-scores
 # (cancel_ratio drove most alerts on manipulator accounts outside their episodes).
@@ -99,11 +105,20 @@ SELF_Z_EVIDENCE_K = 5.0
 ACTIVITY_ROBUST = True
 ACTIVITY_TRIM_LOG = 1.5           # a window more than e^1.5 (~4.5x) above/below the baseline is unusual
 # Wash rings: a pair is "mutual" when each side is at least MUTUAL_MIN_SHARE of the other's traded
-# volume in the window and they traded at least RING_MIN_PAIR_SIZES x the median order size together.
+# volume in the window and they traded at least RING_MIN_PAIR_SIZES x the pre-window size baseline.
 # Ring partners are mutually important; a trader and a big market maker or HFT are not.
 MUTUAL_MIN_SHARE = 0.10
 RING_MIN_PAIR_SIZES = 2.0
 RING_COLUMNS = ["mutual_cpty_share", "ring_size", "ring_volume_share"]
+# Cross-account spoofing: a pair needs at least this many of A's large cancels in the window with
+# B filled on the opposite side before its score counts (one coincidence says nothing).
+LINK_MIN_EVENTS = 3
+# Evidence weighting n / (n + K) of the pair score (as for the self z-scores): an execution algo
+# cancels 2-6 large orders per window and two chance events gave it a score of 0.3-0.9; a spoof
+# campaign produces 10-20 events per window.
+LINK_EVIDENCE_K = 4.0
+LINK_PLACE_TICKS = 1   # the partner's order is placed within this many ticks of the bait
+LINK_COLUMNS = ["linked_spoof_signature", "linked_lift_log"]
 MARKET_CONTEXT_COLUMNS = [
     "mkt_return_bp", "mkt_volatility_bp", "mkt_range_bp", "mkt_volume_spike",
     "mkt_trade_imbalance", "mkt_order_imbalance", "mkt_cancel_ratio", "mkt_abnormal_return_z",
@@ -117,10 +132,11 @@ def _ticks(value: Any) -> int:
     return int(pd.to_timedelta(value).total_seconds())
 
 
-def _opposite_fill_flags(lc: pd.DataFrame, legs: pd.DataFrame, grace: int = 2) -> np.ndarray:
+def _opposite_fill_flags(lc: pd.DataFrame, legs: pd.DataFrame, grace: int = 0) -> np.ndarray:
     """
     For each large cancelled order (trader_id, side, placed_tick, tick): 1.0 if the same
     account was filled on the OPPOSITE side at a tick in [placed_tick, tick + grace].
+    The default uses no post-cancel grace period, so the feature is causal.
 
     Uses per-account sorted fill ticks and binary search, so memory grows with the number
     of orders, not orders x fills (a cross join exploded to hundreds of millions of rows
@@ -143,6 +159,89 @@ def _opposite_fill_flags(lc: pd.DataFrame, legs: pd.DataFrame, grace: int = 2) -
             n = np.searchsorted(arr, hi_all[sel], side="right") - np.searchsorted(arr, lo_all[sel], side="left")
             out[sel] = (n > 0).astype(float)
     return out
+
+
+def _expand_ranges(lo: np.ndarray, hi: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """For ranges [lo_i, hi_i): (owner index i, position) for every position in every range."""
+    n = np.maximum(hi - lo, 0)
+    owner = np.repeat(np.arange(len(lo)), n)
+    pos = lo[owner] + (np.arange(n.sum()) - np.repeat(np.cumsum(n) - n, n))
+    return owner, pos
+
+
+def _linked_pair_steps(lc: pd.DataFrame, legs: pd.DataFrame, placed: pd.DataFrame, step_ticks: int,
+                       exclude: tuple[str, ...]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Cross-account bait-and-switch. spoof_signature looks for the opposite-side fill in the SAME
+    account; spoofing and layering spread over several accounts put the large cancelled bait in
+    one account and the genuine order in another (run seed1001: 3-account spoofing reached a
+    frozen spoofing-classifier probability of 0.001). The collusion shows in the timing: the
+    partner places its opposite-side order together with the bait and is filled while the bait
+    rests. An event is a large cancelled order of account A and another account B that
+
+      * placed an opposite-side order within +-LINK_PLACE_TICKS of A's placement, and
+      * was filled on the opposite side, against a third party, while A's order rested
+      (up to its cancel; causal).
+
+    Being filled against an algo that is chasing the price is common (in seed1001 every busy
+    account was, often above its average rate); being filled on an order placed in the same
+    tick as someone else's bait, time after time, is not. Returns, per cancel step:
+
+      pairs  (step, trader_id=A, cpty=B, n_ev): A's large cancels that were events with B
+      rates  (step, trader_id, lc_buy, lc_sell, life_buy, life_sell, pt_buy, pt_sell, f_buy, f_sell):
+             large cancels and their resting ticks by side, ticks with a placement by side,
+             fills by side (for the chance level in _add_linked_features)
+    """
+    rate_cols = ["lc_buy", "lc_sell", "life_buy", "life_sell", "pt_buy", "pt_sell", "f_buy", "f_sell"]
+    empty_pairs = pd.DataFrame(columns=["step", "trader_id", "cpty", "n_ev"])
+    keep = lambda df, col="trader_id": df[~df[col].astype(str).str.startswith(exclude)]  # noqa: E731
+    lc, legs, placed = keep(lc), keep(legs), keep(placed)
+
+    fills = pd.DataFrame({"tick": legs["tick"].to_numpy(dtype=np.int64), "trader_id": legs["trader_id"].to_numpy(),
+                          "cpty": legs["cpty"].to_numpy() if "cpty" in legs else None,
+                          "side": np.where(legs["buy"].to_numpy(dtype=float) > 0, "buy", "sell")})
+    pl = placed[["trader_id", "side", "tick"]].drop_duplicates()
+    life = (lc["tick"] - lc["placed_tick"] + 1).clip(lower=1).astype(float)
+    tables = [
+        lc.assign(lc_buy=(lc["side"] == "buy").astype(float), lc_sell=(lc["side"] == "sell").astype(float),
+                  life_buy=np.where(lc["side"] == "buy", life, 0.0), life_sell=np.where(lc["side"] == "sell", life, 0.0))
+          [["step", "trader_id", "lc_buy", "lc_sell", "life_buy", "life_sell"]],
+        pl.assign(step=pl["tick"] // step_ticks, pt_buy=(pl["side"] == "buy").astype(float),
+                  pt_sell=(pl["side"] == "sell").astype(float))[["step", "trader_id", "pt_buy", "pt_sell"]],
+        fills.assign(step=fills["tick"] // step_ticks, f_buy=(fills["side"] == "buy").astype(float),
+                     f_sell=(fills["side"] == "sell").astype(float))[["step", "trader_id", "f_buy", "f_sell"]],
+    ]
+    rates = pd.concat(tables, ignore_index=True).fillna(0.0).groupby(["step", "trader_id"])[rate_cols].sum().reset_index()
+    if lc.empty or fills.empty or pl.empty:
+        return empty_pairs, rates
+
+    events = []
+    for side, opp in (("buy", "sell"), ("sell", "buy")):
+        L = lc[lc["side"] == side]
+        P = pl[pl["side"] == opp].sort_values("tick", kind="stable")
+        F = fills[fills["side"] == opp].sort_values("tick", kind="stable")
+        if L.empty or P.empty or F.empty:
+            continue
+        pt = L["placed_tick"].to_numpy(dtype=float)
+        # (bait, account placing on the opposite side within +-LINK_PLACE_TICKS)
+        i, j = _expand_ranges(np.searchsorted(P["tick"].to_numpy(), pt - LINK_PLACE_TICKS, "left"),
+                              np.searchsorted(P["tick"].to_numpy(), pt + LINK_PLACE_TICKS, "right"))
+        co = pd.DataFrame({"cid": L["cid"].to_numpy()[i], "cpty": P["trader_id"].to_numpy()[j]}).drop_duplicates()
+        # (bait, account filled on the opposite side while it rested)
+        i, j = _expand_ranges(np.searchsorted(F["tick"].to_numpy(), pt, "left"),
+                              np.searchsorted(F["tick"].to_numpy(), L["tick"].to_numpy(dtype=float), "right"))
+        fl = pd.DataFrame({"cid": L["cid"].to_numpy()[i], "cpty": F["trader_id"].to_numpy()[j]})
+        # ... against someone other than A: trading WITH the bait (an algo's resting order being
+        # hit) is a counterparty, not a partner; a genuine leg is filled by third parties.
+        fl = fl[F["cpty"].to_numpy()[j] != L["trader_id"].to_numpy()[i]].drop_duplicates()
+        ev = co.merge(fl, on=["cid", "cpty"])
+        events.append(ev.merge(L[["cid", "step", "trader_id"]], on="cid"))
+    if not events:
+        return empty_pairs, rates
+    ev = pd.concat(events, ignore_index=True)
+    ev = ev[ev["trader_id"] != ev["cpty"]]
+    pairs = ev.groupby(["step", "trader_id", "cpty"]).size().rename("n_ev").reset_index()
+    return pairs, rates
 
 
 def _safe_div(a, b, fill: float = 0.0):
@@ -267,17 +366,28 @@ class FeatureEngine:
         else:
             step_px = pd.DataFrame(index=steps, columns=["vol", "n_trades", "notional", "last", "hi", "lo", "agg_buy"], dtype=float)
         step_px[["vol", "n_trades", "notional", "agg_buy"]] = step_px[["vol", "n_trades", "notional", "agg_buy"]].fillna(0.0)
-        step_px["last"] = step_px["last"].ffill().bfill()
-        step_px["vwap"] = pd.Series(_safe_div(step_px["notional"], step_px["vol"], np.nan), index=steps).ffill().bfill()
+        step_px["last"] = step_px["last"].ffill()
+        step_px["vwap"] = pd.Series(_safe_div(step_px["notional"], step_px["vol"], np.nan), index=steps).ffill()
         step_px["ret"] = np.log(step_px["last"]).diff().fillna(0.0)
-        ref_price = step_px["last"].shift(1).fillna(step_px["last"])  # reference known before the step
+        ref_price = step_px["last"].shift(1).ffill()
 
         # ---------------- order-level enrichment ----------------
         placed = orders[orders["event_type"] == "placed"][["order_id", "trader_id", "side", "price", "quantity", "tick", "step"]].copy()
         placed["quantity"] = placed["quantity"].astype(float)
-        median_size = float(placed["quantity"].median()) if not placed.empty else 1.0
-        median_size = max(median_size, 1.0)
-        placed["is_large"] = placed["quantity"] >= LARGE_ORDER_MULTIPLE * median_size
+        # Historical thresholds use earlier steps only. At the cold start,
+        # initialize from the current step's observed median; this avoids
+        # classifying every ordinary order in the first window as "large".
+        step_size_median = placed.groupby("step")["quantity"].median().reindex(steps)
+        prior_size_baseline = (
+            step_size_median.shift(1)
+            .expanding(min_periods=1)
+            .median()
+            .ffill()
+        )
+        current_size_baseline = step_size_median.expanding(min_periods=1).median()
+        size_baseline = prior_size_baseline.fillna(current_size_baseline).ffill().fillna(1.0).clip(lower=1.0)
+        placed["size_baseline"] = placed["step"].map(size_baseline)
+        placed["is_large"] = placed["quantity"] >= LARGE_ORDER_MULTIPLE * placed["size_baseline"]
         placed["ref"] = placed["step"].map(ref_price)
         sign = np.where(placed["side"] == "buy", 1.0, -1.0)
         placed["dist_bp"] = sign * (placed["ref"] - placed["price"]) / placed["ref"] * 1e4
@@ -363,6 +473,7 @@ class FeatureEngine:
         lc_step = lc.groupby(["step", "trader_id"]).agg(
             n_large_cancel=("cid", "size"), n_large_cancel_opp=("opp_fill", "sum"),
         ).reset_index()
+        link_step, rate_step = _linked_pair_steps(lc, legs_with_tick, placed, S, self.exclude_prefixes)
 
         # ---------------- roll into windows ----------------
         p_win = _to_windows(p_step, ["trader_id"],
@@ -376,6 +487,9 @@ class FeatureEngine:
                             [], W, first_step, last_step)
         pair_win = _to_windows(pair_step, ["trader_id", "cpty"], ["bought", "sold"], [], W, first_step, last_step)
         lc_win = _to_windows(lc_step, ["trader_id"], ["n_large_cancel", "n_large_cancel_opp"], [], W, first_step, last_step)
+        link_win = _to_windows(link_step, ["trader_id", "cpty"], ["n_ev"], [], W, first_step, last_step)
+        rate_win = _to_windows(rate_step, ["trader_id"], ["lc_buy", "lc_sell", "life_buy", "life_sell",
+                                                          "pt_buy", "pt_sell", "f_buy", "f_sell"], [], W, first_step, last_step)
 
         market = self._market_features(step_px, placed, cancels, first_step, last_step)
 
@@ -399,8 +513,23 @@ class FeatureEngine:
                 tw[c] = 0.0
         tw[["top_pair", "recip", "n_cpty"]] = tw[["top_pair", "recip", "n_cpty"]].fillna(0.0)
 
-        feats = self._trader_features(tw, median_size)
-        feats = self._add_ring_features(feats, pair_win, median_size)
+        window_first_step = first_step + W - 1
+        window_starts = range(first_step, last_step - W + 2)
+        size_baseline_by_win = pd.Series(
+            [prior_size_baseline.get(step, np.nan) for step in window_starts],
+            index=range(window_first_step, last_step + 1),
+            dtype=float,
+        )
+        cold_start = size_baseline_by_win.isna()
+        size_baseline_by_win.loc[cold_start] = [
+            step_size_median.get(start, np.nan)
+            for start in np.asarray(size_baseline_by_win.index)[cold_start.to_numpy()]
+        ]
+        size_baseline_by_win = size_baseline_by_win.ffill().fillna(1.0).clip(lower=1.0)
+        tw["size_baseline"] = tw["win"].map(size_baseline_by_win).fillna(1.0)
+        feats = self._trader_features(tw)
+        feats = self._add_ring_features(feats, pair_win, size_baseline_by_win)
+        feats = self._add_linked_features(feats, link_win, rate_win)
         feats = self._add_temporal(feats)
         feats = feats.merge(market[["win", *MARKET_CONTEXT_COLUMNS, "mkt_volume"]], on="win", how="left")
         feats["gross_volume_share"] = _safe_div(feats["exec_vol"], feats["mkt_volume"])
@@ -456,15 +585,15 @@ class FeatureEngine:
     # Trader-level features
     # ------------------------------------------------------------------
 
-    def _trader_features(self, tw: pd.DataFrame, median_size: float) -> pd.DataFrame:
+    def _trader_features(self, tw: pd.DataFrame) -> pd.DataFrame:
         f = tw[["win", "trader_id"]].copy()
         exec_vol = tw["exec_buy"] + tw["exec_sell"]
         f["n_orders"] = tw["n_placed"]
         f["n_trades"] = tw["n_exec"]
         f["exec_vol"] = exec_vol
         avg_size = _safe_div(tw["placed_vol"], tw["n_placed"])
-        f["avg_order_size_rel"] = avg_size / median_size
-        f["max_order_size_rel"] = tw["placed_max"] / median_size
+        f["avg_order_size_rel"] = avg_size / tw["size_baseline"]
+        f["max_order_size_rel"] = tw["placed_max"] / tw["size_baseline"]
         f["order_size_cv"] = np.sqrt(np.clip(_safe_div(tw["placed_q2"], tw["n_placed"]) - avg_size ** 2, 0, None)) / np.where(avg_size > 0, avg_size, 1.0)
         f["large_order_share"] = _safe_div(tw["large_vol"], tw["placed_vol"])
         f["layered_order_share"] = _safe_div(tw["layer_vol"], tw["placed_vol"])
@@ -494,12 +623,69 @@ class FeatureEngine:
         f["net_qty"] = tw["exec_buy"] - tw["exec_sell"]
         return f
 
-    def _add_ring_features(self, f: pd.DataFrame, pair_win: pd.DataFrame, median_size: float) -> pd.DataFrame:
+    def _add_linked_features(self, f: pd.DataFrame, link_win: pd.DataFrame, rate_win: pd.DataFrame) -> pd.DataFrame:
+        """
+        Per (window, account), from the account pairs of _linked_pair_steps (A = bait, B = partner):
+          linked_spoof_signature  max over the account's pairs, as bait OR as partner, of
+                                  share of A's large cancels that were events with B x (1 - 1/lift)
+                                  x n / (n + LINK_EVIDENCE_K)
+          linked_lift_log         log1p of the largest lift
+        lift = min(chance lift, concentration lift). Concentration lift = (B's events with A / all
+        B's events) / (A's large cancels / all large cancels in the window). Chance lift = events /
+        chance, chance = per side, A's large cancels x P(B places on the opposite
+        side within +-LINK_PLACE_TICKS of a random tick) x P(B filled on that side during one of
+        A's resting periods), both from B's own rates in the window. A quoting firm that places
+        and trades every tick has lift ~1 with everyone; a genuine-leg account has lift >> 1 with
+        its bait account. Pairs need LINK_MIN_EVENTS events in the window.
+        """
+        for c in LINK_COLUMNS:
+            f[c] = 0.0
+        if link_win is None or link_win.empty:
+            return f
+        # Concentration: B's events with A as a share of all B's events, against A's share of all
+        # large cancels in the window. Busy accounts' events spread over every account cancelling
+        # large orders (and share the market regime with them); a partner's concentrate on A.
+        ev_b = link_win.groupby(["win", "cpty"])["n_ev"].sum().rename("ev_b")
+        lc_all = (rate_win["lc_buy"] + rate_win["lc_sell"]).groupby(rate_win["win"]).sum().rename("lc_all")
+        lw = link_win[link_win["n_ev"] >= LINK_MIN_EVENTS]
+        if lw.empty:
+            return f
+        lw = lw.join(ev_b, on=["win", "cpty"]).join(lc_all, on="win")
+        a = rate_win[["win", "trader_id", "lc_buy", "lc_sell", "life_buy", "life_sell"]]
+        b = rate_win[["win", "trader_id", "pt_buy", "pt_sell", "f_buy", "f_sell"]].rename(columns={"trader_id": "cpty"})
+        lw = lw.merge(a, on=["win", "trader_id"], how="left").merge(b, on=["win", "cpty"], how="left").fillna(0.0)
+        wt = float(max(1, self.window_ticks))
+        span = 2 * LINK_PLACE_TICKS + 1
+        expected = 0.0
+        for side, opp in (("buy", "sell"), ("sell", "buy")):
+            n_lc = lw[f"lc_{side}"]
+            p_place = np.clip(span * lw[f"pt_{opp}"] / wt, 0, 1)
+            mean_life = _safe_div(lw[f"life_{side}"], n_lc)
+            p_fill = np.clip(mean_life * lw[f"f_{opp}"] / wt, 0, 1)
+            expected = expected + n_lc * p_place * p_fill
+        n_lc_a = lw["lc_buy"] + lw["lc_sell"]
+        chance_lift = _safe_div(lw["n_ev"], np.maximum(expected, 1e-6))
+        concentration_lift = _safe_div(_safe_div(lw["n_ev"], lw["ev_b"]), _safe_div(n_lc_a, lw["lc_all"]))
+        lift = np.minimum(chance_lift, concentration_lift)   # both: above chance AND specific to A
+        share = np.clip(_safe_div(lw["n_ev"], n_lc_a), 0, 1)
+        evidence = lw["n_ev"] / (lw["n_ev"] + LINK_EVIDENCE_K)
+        lw = lw.assign(_score=share * (1 - 1 / np.maximum(lift, 1.0)) * evidence, _lift=np.log1p(lift))
+        both = pd.concat([lw[["win", "trader_id", "_score", "_lift"]],
+                          lw[["win", "cpty", "_score", "_lift"]].rename(columns={"cpty": "trader_id"})])
+        best = both.groupby(["win", "trader_id"])[["_score", "_lift"]].max()
+        key = pd.MultiIndex.from_frame(f[["win", "trader_id"]])
+        f["linked_spoof_signature"] = best["_score"].reindex(key).fillna(0.0).to_numpy()
+        f["linked_lift_log"] = best["_lift"].reindex(key).fillna(0.0).to_numpy()
+        return f
+
+    def _add_ring_features(
+        self, f: pd.DataFrame, pair_win: pd.DataFrame, size_baseline_by_win: pd.Series
+    ) -> pd.DataFrame:
         """
         Wash-ring features per (window, account), from volume traded with each counterparty:
           mutual_cpty_share  share of the account's volume with MUTUAL partners (each side at least
                              MUTUAL_MIN_SHARE of the other's volume, pair volume >= RING_MIN_PAIR_SIZES
-                             x median order size)
+                             x the pre-window median order-size baseline)
           ring_size          accounts in the connected group of mutual partners (1 = none)
           ring_volume_share  share of the account's volume traded inside that group
         Pairwise features (reciprocal_ratio, top_cpty_share) fade when washing rotates around a ring
@@ -519,8 +705,12 @@ class FeatureEngine:
         pw["share"] = _safe_div(pw["gross"], vol)
         rev = pw[["win", "trader_id", "cpty", "share"]].rename(columns={"trader_id": "cpty", "cpty": "trader_id", "share": "share_rev"})
         pw = pw.merge(rev, on=["win", "trader_id", "cpty"], how="left")
-        pw["mutual"] = (pw["share"] >= MUTUAL_MIN_SHARE) & (pw["share_rev"].fillna(0) >= MUTUAL_MIN_SHARE) \
-            & (pw["gross"] >= RING_MIN_PAIR_SIZES * median_size)
+        baseline = pw["win"].map(size_baseline_by_win).fillna(1.0)
+        pw["mutual"] = (
+            (pw["share"] >= MUTUAL_MIN_SHARE)
+            & (pw["share_rev"].fillna(0) >= MUTUAL_MIN_SHARE)
+            & (pw["gross"] >= RING_MIN_PAIR_SIZES * baseline)
+        )
         mutual_share = pw.loc[pw["mutual"]].groupby(["win", "trader_id"])["share"].sum()
 
         # Connected groups of mutual partners, per window (union-find over the few mutual edges)

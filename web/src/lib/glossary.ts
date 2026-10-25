@@ -87,5 +87,6 @@ export const confidenceLabel = (margin: number) => (margin >= 0.4 ? "Very high" 
 export const STATUS_TEXT: Record<string, { kind: "good" | "warning" | "serious"; label: string }> = {
   confirmed: { kind: "good", label: "Ground truth confirms" },
   other_persona: { kind: "warning", label: "Episode of another persona" },
+  near_episode: { kind: "warning", label: "Next to its own episode" },
   no_episode: { kind: "serious", label: "No ground-truth episode" },
 };

@@ -9,6 +9,7 @@ round_0:
     frequency: 0.3
     layer_size_multiplier: 2.0
     layer_spacing: 0.0002
+    n_accounts: 1
     n_layers: 4
     placement_stagger: 0
     size_taper: 0.0
@@ -41,6 +42,7 @@ round_0:
   wash_trading:
     busy_period_bias: 0.0
     camouflage_rate: 0.0
+    cross_lag_ticks: 0
     enabled: true
     n_groups: 1
     ring_size: 2

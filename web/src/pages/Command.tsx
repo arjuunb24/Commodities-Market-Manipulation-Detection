@@ -107,7 +107,8 @@ export default function Command() {
   const pre = (frozenMissing ? pooledSummary.data?.pre_retrain : s?.pre_retrain) ?? {};
   const avgF1 = mean(Object.values(post).map((m) => m.f1));
   const avgCov = mean(Object.values(pre).map((m) => m.caught_coverage ?? m.episode_coverage));
-  const agentic = Object.values(runInfo?.mutation_sources ?? {}).length ? runInfo?.mutation_sources?.agentic ?? 0 : 0;
+  const ms = runInfo?.mutation_sources ?? {};
+  const agentic = ms.agentic ?? 0;
   const totalMut = Object.values(runInfo?.mutation_sources ?? {}).reduce((a, b) => a + b, 0);
 
   const resilience: EChartsOption = base({
@@ -170,7 +171,7 @@ export default function Command() {
           sub={round === 0 ? "Starts at round 1" : frozenMissing ? "Pooled: not stored per market for this run" : `Caught before retraining · ${scope}`}
         />
         <StatTile label="Alert windows" value={s?.n_flags ?? null} format={(v) => fmtInt(v)} icon={<Layers3 size={15} />} sub={`Round ${round} · ${scope}`} />
-        <StatTile label="LLM mutations" value={agentic} format={(v) => `${Math.round(v)} / ${totalMut}`} icon={<Bot size={15} />} sub="Proposed by the strategist" />
+        <StatTile label="LLM mutations" value={agentic} format={(v) => `${Math.round(v)} / ${totalMut}`} icon={<Bot size={15} />} sub={`Kept after probing · ${ms.code_exploration ?? 0} won by code exploration`} />
         <StatTile label="LLM spend" value={runInfo?.llm_cost_usd ?? null} format={(v) => `$${v.toFixed(3)}`} sub={`${runInfo?.llm_calls ?? 0} calls this run`} />
       </StatGrid>
 
@@ -219,7 +220,9 @@ export default function Command() {
                       {PERSONA_META[p].label}
                     </span>
                     {src && src !== "baseline" && (
-                      <StatusBadge kind={src === "agentic" ? "neutral" : "warning"}>{src === "agentic" ? "LLM mutation" : src.replace(/_/g, " ")}</StatusBadge>
+                      <StatusBadge kind={src === "agentic" || src === "code_exploration" ? "neutral" : "warning"}>
+                        {src === "agentic" ? "LLM mutation" : src === "code_exploration" ? "Code exploration" : src.replace(/_/g, " ")}
+                      </StatusBadge>
                     )}
                   </div>
                   <div className="mt-2 grid grid-cols-2 gap-2 font-mono text-[11.5px] sm:grid-cols-4">

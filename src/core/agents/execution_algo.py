@@ -33,7 +33,7 @@ from typing import Callable
 
 import numpy as np
 
-from src.core.agents.base import Agent
+from src.core.agents.base import Agent, DepthReference
 from src.core.order_book import BookState, Order, Side
 
 
@@ -56,6 +56,7 @@ class ExecutionAlgo(Agent):
         self.max_duration = max_duration
         self.inventory_cap_depths = float(inventory_cap_depths)
         self.net_inventory = 0
+        self._depth = DepthReference()
         self._depth_ref: float | None = None
         self._is_resting: Callable[[str], bool] = lambda _oid: True
         self._side: Side | None = None
@@ -82,10 +83,9 @@ class ExecutionAlgo(Agent):
         bid, ask = state.best_bid, state.best_ask
         if bid is None or ask is None or ask <= bid:
             return []
-        # Slow average of the visible level depth (sizes follow the book as it fills in).
-        levels = state.bid_depth + state.ask_depth
-        avg = sum(q for _, q in levels) / max(1, len(levels)) if levels else 40.0
-        self._depth_ref = avg if self._depth_ref is None else 0.98 * self._depth_ref + 0.02 * avg
+        # Visible level depth, frozen after a warm-up (base.DepthReference: a live
+        # average fed back through these orders' own depth).
+        self._depth_ref = self._depth.update(state)
 
         if self._side is None:
             if self.rng.random() < self.start_prob:

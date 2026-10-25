@@ -16,8 +16,9 @@ separable.
 Mechanism (per tick, with probability `arrival_rate_lambda`):
   1. Cancel all of its still-resting quotes (cancel-and-replace).
   2. Quote both sides, starting at the touch or one tick behind it, as a
-     ladder of 1-3 levels per side with sizes of 0.2-0.6x the average visible
-     level depth (small enough not to dampen price discovery).
+     ladder of 1-4 levels per side. Most sizes are 0.2-0.6x average visible
+     depth; a configurable minority are heavy-tailed 1-4x quotes, allowing
+     legitimate liquidity to sometimes resemble large-order activity.
   3. Inventory control (cap = `inventory_cap_depths` x level depth, so it scales
      with the quote size): beyond half the cap it quotes only the
      reducing side (a one-sided ladder, like layering but without a resting
@@ -31,7 +32,7 @@ from typing import Callable
 
 import numpy as np
 
-from src.core.agents.base import Agent
+from src.core.agents.base import Agent, DepthReference
 from src.core.order_book import BookState, Order, Side
 
 
@@ -45,14 +46,17 @@ class HFTLiquidityProvider(Agent):
         ladder_prob: float = 0.5,
         inventory_cap_depths: float = 6.0,
         flatten_prob: float = 0.05,
+        large_quote_probability: float = 0.08,
     ) -> None:
         super().__init__(trader_id, rng)
         self.arrival_rate_lambda = arrival_rate_lambda
         self.ladder_prob = ladder_prob
         self.inventory_cap_depths = inventory_cap_depths
         self.flatten_prob = flatten_prob
+        self.large_quote_probability = float(np.clip(large_quote_probability, 0.0, 1.0))
         self.net_inventory = 0
         self._resting: list[str] = []
+        self._depth = DepthReference()
         self._depth_ref: float | None = None
         self._is_resting: Callable[[str], bool] = lambda _oid: True
 
@@ -76,10 +80,9 @@ class HFTLiquidityProvider(Agent):
         bid, ask = state.best_bid, state.best_ask
         if bid is None or ask is None or ask <= bid:
             return []
-        # Slow average of the visible level depth (sizes follow the book as it fills in).
-        levels = state.bid_depth + state.ask_depth
-        avg = sum(q for _, q in levels) / max(1, len(levels)) if levels else 40.0
-        self._depth_ref = avg if self._depth_ref is None else 0.98 * self._depth_ref + 0.02 * avg
+        # Visible level depth, frozen after a warm-up (base.DepthReference: a live
+        # average fed back through these orders' own depth).
+        self._depth_ref = self._depth.update(state)
 
         orders = [self._cancel(oid, tick) for oid in self._resting if self._is_resting(oid)]
         self._resting = []
@@ -91,7 +94,7 @@ class HFTLiquidityProvider(Agent):
             qty = max(5, int(abs(self.net_inventory) * 0.3))
             orders.append(self.limit(side, bid if side == Side.SELL else ask, qty, tick, ttl=2))
 
-        n_levels = int(self.rng.integers(2, 4)) if self.rng.random() < self.ladder_prob else 1
+        n_levels = int(self.rng.integers(1, 5)) if self.rng.random() < self.ladder_prob else 1
         sides = []
         if inv < 0.5:
             sides.append(Side.BUY)
@@ -108,7 +111,11 @@ class HFTLiquidityProvider(Agent):
         for side in sides:
             for k in range(offset, offset + n_levels):
                 price = base_bid - k * step if side == Side.BUY else base_ask + k * step
-                qty = max(5, int(self._depth_ref * self.rng.uniform(0.2, 0.6)))
+                if self.rng.random() < self.large_quote_probability:
+                    size_multiple = float(np.clip(self.rng.lognormal(np.log(1.5), 0.45), 1.0, 4.0))
+                else:
+                    size_multiple = float(self.rng.uniform(0.2, 0.6))
+                qty = max(5, int(self._depth_ref * size_multiple))
                 o = self.limit(side, price, qty, tick, ttl=None)
                 self._resting.append(o.order_id)
                 orders.append(o)

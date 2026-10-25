@@ -189,6 +189,16 @@ class DetectorPipeline:
     # Training
     # ------------------------------------------------------------------
 
+    @property
+    def iso_score_feature(self) -> bool:
+        """
+        Give the classifiers the trader-level anomaly percentile as an input. In run seed1001 the
+        isolation forest still raised 79% of a mutated spoofer's windows that every classifier
+        missed (probability 0.001); as an input, "unusual for this market" can back up the
+        learned patterns when a scheme moves away from what was trained on.
+        """
+        return bool(self.config.get("supervised", {}).get("iso_score_feature", True))
+
     def _with_context(self, X: pd.DataFrame) -> pd.DataFrame:
         X = X.copy()
         X["mkt_anomaly_score"] = self.market_detector.score(X).to_numpy()
@@ -200,6 +210,8 @@ class DetectorPipeline:
         self.market_detector.fit(X)
         Xc = self._with_context(X)
         self.anomaly_detector.fit(Xc)
+        if self.iso_score_feature:
+            Xc["iso_score"] = self.anomaly_detector.predict_scores(Xc).to_numpy()
         self.supervised_detector.fit(Xc, y, sample_weight=sample_weight)
         self.is_trained = True
         if save_dir is not None:
@@ -240,12 +252,28 @@ class DetectorPipeline:
         res["mkt_anomaly_score"] = Xc["mkt_anomaly_score"]
         res["iso_score"] = self.anomaly_detector.predict_scores(Xc)
         res["iso_flag"] = self.anomaly_detector.predict_labels(Xc)
+        Xc["iso_score"] = res["iso_score"].to_numpy()   # an input only for detectors trained with it
 
-        probs = self.supervised_detector.predict_proba(Xc)
-        flags = self.supervised_detector.predict_flags(probs) if not probs.empty else pd.DataFrame(index=X.index)
+        sup = self.supervised_detector
+        probs = sup.predict_proba(Xc)
+        flags = sup.predict_flags(probs) if not probs.empty else pd.DataFrame(index=X.index)
         for p in self.personas:
             res[f"prob_{p}"] = probs[p] if p in probs else 0.0
             res[f"flag_{p}"] = flags[p] if p in flags else False
+        # Family classifiers (e.g. fake_depth = spoofing | layering): a family flag is assigned to
+        # the member persona whose probability is closest to its own threshold.
+        family_member: dict = {}
+        for fam, members in (getattr(sup, "family_models", {}) or {}).items():
+            members = [m for m in members if m in self.personas]
+            if fam not in flags or not members:
+                continue
+            res[f"prob_{fam}"] = probs[fam]
+            rel = np.column_stack([res[f"prob_{m}"] / max(sup.thresholds.get(m, 1.0), 1e-6) for m in members])
+            pick = np.asarray(members, dtype=object)[np.argmax(rel, axis=1)]
+            fam_flag = flags[fam].to_numpy()
+            for m in members:
+                res[f"flag_{m}"] = res[f"flag_{m}"].to_numpy() | (fam_flag & (pick == m))
+            family_member[fam] = (fam_flag, pick)
 
         flag_cols = [f"flag_{p}" for p in self.personas]
         prob_cols = [f"prob_{p}" for p in self.personas]
@@ -259,6 +287,10 @@ class DetectorPipeline:
             res["sup_flag"], np.array(self.personas, dtype=object)[best],
             np.where(res["iso_flag"], "anomaly", None),
         )
+        for fam_flag, pick in family_member.values():
+            # flagged only through the family model: no persona margin is positive, name the member
+            only_family = fam_flag & (margins.max(axis=1) < 0)
+            res.loc[only_family, "predicted_persona"] = pick[only_family]
         e = self.config.get("ensemble", {})
         rule = e.get("combination_rule", "or")
         # An IsolationForest flag on its own is often a legitimate but unusual firm (HFT,
