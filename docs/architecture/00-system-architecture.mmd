@@ -1,0 +1,40 @@
+%%{init: {"flowchart": {"wrappingWidth": 620, "nodeSpacing": 40, "rankSpacing": 45}, "themeVariables": {"fontSize": "15px"}}}%%
+flowchart TB
+  classDef ext fill:#fff4e5,stroke:#d97706,color:#111,stroke-width:1.5px;
+  classDef store fill:#eef2ff,stroke:#4f46e5,color:#111,stroke-width:1.5px;
+  classDef stage fill:#f8fafc,stroke:#334155,color:#111,stroke-width:1.5px;
+  classDef llm fill:#fdf2f8,stroke:#db2777,color:#111,stroke-width:1.5px;
+
+  YF["<b>Yahoo Finance</b><br/>daily futures bars → calibration<br/>1-minute bars → real-data test"]:::ext
+  CFG["<b>configs/</b><br/>agents · personas · detector<br/>LLM · case replays · calibration"]:::ext
+
+  SIM["<b>1 · Market simulator</b> &nbsp;<i>src/core</i><br/>calibrated fundamental value → continuous limit order book<br/>~80 legitimate agents incl. look-alikes · 4 manipulation personas · 13 real-case replays<br/>8 commodity futures per market · seeded and reproducible"]:::stage
+
+  LOGS[("<b>Market folder</b> &nbsp;Parquet<br/>order_log · trade_log · ohlcv_bars<br/>manipulation_events = ground truth")]:::store
+
+  DET["<b>2 · Detector</b> &nbsp;<i>src/detector</i><br/>features per account × 3-minute window (63)<br/>market IsolationForest → trader IsolationForest → XGBoost per persona + fake-depth family<br/>hard-negative training · tuned thresholds · SHAP explanations · alert / review tiers"]:::stage
+
+  ADV["<b>3 · Adversarial loop</b> &nbsp;<i>src/adversarial · src/agentic</i><br/>orchestrator: train + variant + 2 test markets per round, benchmark markets<br/>scores pre (frozen) · post (retrained) · r0 · bench, then retrains on all rounds"]:::stage
+
+  STR["<b>LLM strategist</b><br/>proposes ≥4-knob mutations + 2 alternatives<br/>from metrics · SHAP · knob evidence · effect limits"]:::llm
+  PRB["<b>Probe + guards</b><br/>LLM and code-exploration candidates<br/>simulated vs the frozen detector<br/>keep best evasion × effect"]:::stage
+
+  RUNS[("<b>data/runs/&lt;run&gt;/round_N</b><br/>metrics.json · flags.parquet<br/>strategist.json · models/")]:::store
+
+  APP["<b>4 · Web app</b> &nbsp;<i>api/ (FastAPI) + web/ (React)</i><br/>Command · Markets · Surveillance · Model Lab · Adversary · Analyst<br/>AI case notes (fact-checked) · analyst chat with data-lookup tools"]:::stage
+
+  LIVE["<b>5 · Real-data checks</b> &nbsp;<i>src/live · src/replay</i><br/>bar model on real 1-minute bars + mechanism checker<br/>replay-case predictions with metrics"]:::stage
+
+  LLMP["<b>LLM provider</b><br/>Cerebras gpt-oss-120b<br/>(Gemini optional)"]:::ext
+
+  YF --> SIM
+  CFG --> SIM
+  SIM --> LOGS --> DET --> ADV --> RUNS
+  ADV -- "next round's personas" --> STR
+  STR --> PRB
+  PRB -- "mutated persona config" --> SIM
+  RUNS --> APP
+  RUNS --> LIVE
+  YF -.-> LIVE
+  STR <-.-> LLMP
+  APP <-.-> LLMP

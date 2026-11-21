@@ -253,7 +253,6 @@ sequenceDiagram
 
 - **Frontend:** React 18, TypeScript, Vite, Tailwind CSS, Apache ECharts, TanStack Query, Framer Motion.
 - **Backend:** FastAPI on Uvicorn serves the built React app and 15 JSON endpoints; TTL caches; optional password; optional Cloudflare tunnel for public access.
-- **Legacy:** Streamlit dashboard in `dashboard/` with the same data views.
 
 <details>
 <summary>Mermaid source</summary>
@@ -294,7 +293,7 @@ Metrics: precision, recall, F1 and false-positive rate per persona; episode cove
 | Simulation and data | NumPy, pandas, SciPy, PyArrow (Parquet), Pandera, YAML configs |
 | Machine learning | XGBoost, scikit-learn (Isolation Forest, GroupKFold), SHAP |
 | LLM | LiteLLM, Cerebras gpt-oss-120b, Google Gemini, Pydantic, Tenacity |
-| API and UI | FastAPI, Uvicorn, React, Vite, Tailwind, ECharts, Streamlit, Plotly |
+| API and UI | FastAPI, Uvicorn, React, Vite, Tailwind, ECharts |
 | Market data | yfinance (calibration and real 1-minute bars) |
 | Quality | pytest (197 tests), Hypothesis, Ruff, mypy, Black |
 | Reproducibility | Seeded runs, atomic writes, per-round metrics and saved models |

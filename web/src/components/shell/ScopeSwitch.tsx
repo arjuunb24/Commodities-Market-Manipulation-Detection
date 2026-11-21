@@ -17,7 +17,7 @@ export function ScopeSwitch() {
         onChange={(v) => (v === "__pooled" ? setPooled(true) : setMarket(v))}
         options={[
           ...markets.map((m) => ({ value: m.name, label: marketLabel(m.name, markets.length), title: "This test market only" })),
-          { value: "__pooled", label: <><Layers size={12} /> Both pooled</>, title: "All test markets of each round pooled (the pipeline's official numbers)" },
+          { value: "__pooled", label: <><Layers size={12} /> {markets.length === 2 ? "Both pooled" : "All pooled"}</>, title: "All test markets of each round pooled (the pipeline's official numbers)" },
         ]}
       />
     </div>
@@ -27,7 +27,7 @@ export function ScopeSwitch() {
 export function useScopeLabel() {
   const { roundInfo, market, pooled } = useSelection();
   const n = roundInfo?.markets.length ?? 1;
-  if (pooled || n < 2) return n < 2 ? "Test market" : "Both markets pooled";
+  if (pooled || n < 2) return n < 2 ? "Test market" : n === 2 ? "Both markets pooled" : `All ${n} markets pooled`;
   return market ? marketLabel(market, n) : "Test market";
 }
 

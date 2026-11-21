@@ -1,6 +1,6 @@
 # Running the Veridex web app
 
-The React web app (`web/`) shows the same runs as the Streamlit dashboard: markets, detector cases, model performance, the adversarial strategist and the analyst chat. A FastAPI server (`api/`) reads the run outputs in `data/runs/` and also serves the built app, so in normal use there is only one process and one address.
+The React web app (`web/`) shows every adversarial run: markets, detector cases, model performance, the adversarial strategist and the analyst chat. A FastAPI server (`api/`) reads the run outputs in `data/runs/` and also serves the built app, so in normal use there is only one process and one address.
 
 This guide covers three ways to run it:
 
@@ -8,7 +8,7 @@ This guide covers three ways to run it:
 2. [On your private network](#2-on-your-private-network-wi-fi) (phones and laptops on the same Wi-Fi)
 3. [On the public internet](#3-on-the-public-internet-cloudflare-tunnel) through a Cloudflare tunnel
 
-All commands are for Windows and run from the project folder (`Veridex\`). The Streamlit dashboard is separate and unaffected.
+All commands are for Windows and run from the project folder (`Veridex\`).
 
 ---
 

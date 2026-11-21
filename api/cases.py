@@ -4,7 +4,7 @@ api/cases.py
 Surveillance (Flagged Trades) views: detector flags merged into cases, matched
 against the simulator's ground truth, plus per-case evidence, SHAP, price
 context, raw orders/trades and the fact-checked AI case note.
-Logic ported from dashboard/components/tab_flags.py.
+Logic ported from the former Streamlit dashboard (removed; see git history).
 """
 
 from __future__ import annotations

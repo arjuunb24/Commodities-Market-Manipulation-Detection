@@ -1,4 +1,4 @@
-/** Plain-language meaning of every detector feature (ported from dashboard/components/tab_flags.py). */
+/** Plain-language meaning of every detector feature (ported from the former Streamlit dashboard). */
 export const FEATURES: Record<string, string> = {
   n_orders: "Number of orders the account placed in the window",
   n_trades: "Number of trades the account took part in",

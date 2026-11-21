@@ -3,7 +3,7 @@ api/performance.py
 ==================
 Model Performance views: per-round metrics (frozen vs retrained), the
 evasion/recovery headline, parameter history and the strategist's decisions.
-Logic ported from dashboard/data_loader.py and dashboard/components/tab_metrics.py.
+Logic ported from the former Streamlit dashboard (removed; see git history).
 """
 
 from __future__ import annotations

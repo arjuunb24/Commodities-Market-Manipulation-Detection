@@ -2,7 +2,7 @@
 api/data.py
 ===========
 Disk access for the web API: run / round / test-market discovery and cached
-parquet + JSON readers. Mirrors dashboard/data_loader.py without Streamlit.
+parquet + JSON readers. Replaces the former Streamlit dashboard's data loader.
 
 Every public reader validates the run name against data/runs so a request can
 never read outside it.

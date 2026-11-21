@@ -75,6 +75,20 @@ def _account_legs(trades: pd.DataFrame, trader: str) -> pd.DataFrame:
     return legs.sort_values("tick") if not legs.empty else legs
 
 
+def _cancelled_share_pct(acct: pd.DataFrame, placed: pd.DataFrame) -> float:
+    """
+    Share (%) of the volume placed in the span that the account cancelled, at any later tick.
+    Only cancels of those orders count, once per order: counting every cancel inside the span
+    also took in orders placed before it and reported over 100%.
+    """
+    placed_vol = float(placed["quantity"].sum())
+    if not placed_vol:
+        return 0.0
+    c = acct[(acct["event_type"] == "cancelled") & acct["order_id"].isin(placed["order_id"])]
+    cancelled_vol = float(c.groupby("order_id")["quantity"].first().sum())
+    return round(min(100.0, 100 * cancelled_vol / placed_vol), 1)
+
+
 def _spoofing(trader, start, end, trades, orders, px) -> dict:
     span_orders = orders[orders["tick"].between(start, end)]
     placed_all = span_orders[span_orders["event_type"] == "placed"]
@@ -100,8 +114,6 @@ def _spoofing(trader, start, end, trades, orders, px) -> dict:
         if p0 == p0 and p1 == p1:
             sign = 1.0 if o["side"] == "buy" else -1.0   # fake bids should lift the price for the genuine sell
             moves.append(sign * (p1 - p0) / p0 * 1e4)
-    placed_vol = float(placed["quantity"].sum())
-    cancel_vol = float(acct[(acct["event_type"] == "cancelled") & acct["tick"].between(start, end)]["quantity"].sum())
     small = placed[~placed["order_id"].isin(large["order_id"])]
 
     # Sarao-style repricing: a large order cancelled and a same-side order placed in the same tick.
@@ -135,7 +147,7 @@ def _spoofing(trader, start, end, trades, orders, px) -> dict:
         "large_orders_with_opposite_side_fill_while_resting": int(with_opp),
         "opposite_side_volume_filled": int(opp_vol),
         "avg_price_move_toward_filled_side_bp": round(float(np.mean(moves)), 2) if moves else 0.0,
-        "account_cancelled_volume_pct": round(100 * cancel_vol / placed_vol, 1) if placed_vol else 0.0,
+        "account_cancelled_volume_pct": _cancelled_share_pct(acct, placed),
     }
 
 
@@ -264,16 +276,15 @@ def _pump(trader, start, end, trades, px, flags) -> dict:
 
 
 def _generic(trader, start, end, trades, orders) -> dict:
-    acct = orders[(orders["trader_id"] == trader) & orders["tick"].between(start, end)]
+    acct_all = orders[orders["trader_id"] == trader]
+    acct = acct_all[acct_all["tick"].between(start, end)]
     placed = acct[acct["event_type"] == "placed"]
     legs = _account_legs(trades[trades["tick"].between(start, end)], trader)
-    pv = float(placed["quantity"].sum())
-    cv = float(acct[acct["event_type"] == "cancelled"]["quantity"].sum())
     return {
         "orders_placed": int(len(placed)),
         "median_order_size": int(placed["quantity"].median()) if len(placed) else 0,
         "largest_order": int(placed["quantity"].max()) if len(placed) else 0,
-        "cancelled_volume_pct": round(100 * cv / pv, 1) if pv else 0.0,
+        "cancelled_volume_pct": _cancelled_share_pct(acct_all, placed),
         "trades": int(len(legs)),
         "bought": int(legs[legs["side"] == "buy"]["quantity"].sum()) if len(legs) else 0,
         "sold": int(legs[legs["side"] == "sell"]["quantity"].sum()) if len(legs) else 0,

@@ -164,7 +164,7 @@ def main():
     # Output markdown report
     df_results = pd.DataFrame(results)
     
-    report_path = Path("stylized_facts_report.md")
+    report_path = Path("docs") / "stylized_facts_report.md"
     
     markdown_content = "# Stylized Facts & Market Microstructure Verification\n\n"
     markdown_content += f"**Simulation Length:** {args.ticks} ticks per commodity\n\n"
